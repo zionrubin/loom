@@ -111,13 +111,6 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 # same pipeline on OpenAI (GPT-5.4 family) + live constellation view
 OPENAI_API_KEY=sk-... go run ./examples/openai-review
 # then open http://localhost:8077
-
-# join an MCP data plane with an OpenAI reasoning plane: fetch partner
-# facets from a local Salesforce MCP server as grant-checked tools, then
-# distill + reduce them into a pre-meeting brief, with the constellation
-# view live at http://localhost:8077
-OPENAI_API_KEY=sk-... go run ./examples/salesforce-briefing "Ethos"
-go run ./examples/salesforce-briefing -mock   # offline models, real MCP
 ```
 
 ## Package map
