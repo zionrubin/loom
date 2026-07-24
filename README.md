@@ -155,4 +155,4 @@ sandboxes with grant-derived imports, streaming execution) is laid out in
 
 ## Demo
 
-[▶️ Watch the demo](assets/demo.mp4)
+[▶️ Watch the demo](./assets/demo.mp4?raw=1)
