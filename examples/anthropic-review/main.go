@@ -15,12 +15,12 @@ import (
 	"log"
 	"os"
 
-	loom "github.com/zionrubin/brian-ai/loom"
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/pipeline"
-	"github.com/zionrubin/brian-ai/loom/providers/anthropic"
-	"github.com/zionrubin/brian-ai/loom/security"
+	loom "github.com/zionrubin/loom"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/providers/anthropic"
+	"github.com/zionrubin/loom/security"
 )
 
 func main() {

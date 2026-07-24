@@ -3,7 +3,7 @@ package store
 import (
 	"testing"
 
-	"github.com/zionrubin/brian-ai/loom/core"
+	"github.com/zionrubin/loom/core"
 )
 
 func TestCASRoundTrip(t *testing.T) {

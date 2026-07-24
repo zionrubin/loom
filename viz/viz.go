@@ -29,7 +29,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/observe"
+	"github.com/zionrubin/loom/observe"
 )
 
 //go:embed ui.html

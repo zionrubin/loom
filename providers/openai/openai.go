@@ -17,9 +17,9 @@ import (
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/security"
 )
 
 // Endpoint is the API host, used for egress policy enforcement.

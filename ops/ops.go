@@ -11,12 +11,12 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/executor"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/pipeline"
-	"github.com/zionrubin/brian-ai/loom/plan"
-	"github.com/zionrubin/brian-ai/loom/task"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/task"
 )
 
 // BuildRunners constructs a runner per executable stage in the plan.

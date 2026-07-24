@@ -1,4 +1,4 @@
-module github.com/zionrubin/brian-ai/loom
+module github.com/zionrubin/loom
 
 go 1.24
 
