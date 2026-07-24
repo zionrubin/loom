@@ -307,6 +307,7 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestStartAndClose(t *testing.T) {
 	v := New()
 	url, err := v.Start("127.0.0.1:0")
 	if err != nil {

@@ -101,6 +101,13 @@ go run ./examples/triage # complete pipeline on a mock model, offline
 # failure; click any star for model, input, tokens, cost, retries, and logs
 go run ./examples/constellation   # then open http://localhost:8077
 
+# the constellation view at scale, still offline: a ~50-paper literature
+# survey (≈205 tasks, three mock model tiers, a branching DAG with two
+# reduce trees) scripted to show every visual state in one run — retries,
+# a straggler, escalations, a dead letter; see examples/research/README.md
+# for flags (budget squeeze, cache replay) and a recording storyboard
+go run ./examples/research        # then open http://localhost:8077
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
