@@ -290,7 +290,23 @@ func TestEventStream(t *testing.T) {
 	}
 }
 
-func TestStartAndClose(t *testing.T) {
+func TestMethodNotAllowed(t *testing.T) {
+	v := New()
+	srv := httptest.NewServer(v)
+	defer srv.Close()
+
+	for _, path := range []string{"/api/state", "/api/events"} {
+		res, err := http.Post(srv.URL+path, "text/plain", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("POST %s status %d, want 405", path, res.StatusCode)
+		}
+	}
+}
+
 	v := New()
 	url, err := v.Start("127.0.0.1:0")
 	if err != nil {

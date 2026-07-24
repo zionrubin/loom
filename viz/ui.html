@@ -192,7 +192,7 @@
   <span class="li"><span class="ic" style="color:var(--c-cached)">✧</span>cache replay</span>
   <span class="li"><span class="ic" style="color:var(--c-fail)">✕</span>failed</span>
   <span class="li"><span class="ic" style="color:var(--c-running)">◇</span>executor</span>
-  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ cycle · esc close</span>
+  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · esc</span>
 </div>
 
 <div id="tooltip"></div>
@@ -466,8 +466,6 @@ function lineageOf(taskId) {
   return { from: fedBy.get(taskId) || [], to: feeds.get(taskId) || [] };
 }
 
-// Per-stage settled/total, rebuilt when tasks change — avoids O(stages×tasks)
-// scans inside the animation loop.
 let stageStats = new Map(); // id -> {total, settled}
 function computeStageStats() {
   stageStats = new Map();
@@ -479,6 +477,9 @@ function computeStageStats() {
   }
   S.stageStatsDirty = false;
 }
+
+// Soft camera pan so a focused star isn't lost under the inspector / edges.
+let camX = 0, camY = 0;
 
 // ------------------------------------------------------------- painting ----
 function glow(x, y, r, color, alpha) {
@@ -635,9 +636,12 @@ function draw(tms) {
   const now = serverNow();
   const taskN = S.tasks.length;
   const heavy = taskN >= 400;
+  const panelOpen = panel.classList.contains('open');
+  const panelW = panelOpen && W >= 720 ? Math.min(380, W * 0.92) : 0;
+
   ctx.clearRect(0, 0, W, H);
 
-  // background starfield (skip animating every speck when the sky is dense)
+  // background starfield (screen-space; not panned)
   ctx.fillStyle = '#cdd3e8';
   const speckStep = heavy ? 2 : 1;
   for (let i = 0; i < specks.length; i += speckStep) {
@@ -652,8 +656,27 @@ function draw(tms) {
   for (const t of S.tasks) { t._x += (t._tx - t._x) * .15; t._y += (t._ty - t._y) * .15; }
   for (const w of S.workers) { w._x += (w._tx - w._x) * .2; w._y += (w._ty - w._y) * .2; }
 
-  // stage-to-stage constellation edges (skipping hidden stages: an edge
-  // reroutes to the nearest visible upstream ancestor)
+  // soft pan toward the focused node if it sits outside the visible sky
+  const focusObj = (selected && (selected.type === 'task' ? S.taskIx.get(selected.id)
+                    : selected.type === 'worker' ? S.workerIx.get(selected.id) : null))
+                 || hovered || null;
+  let wantX = 0, wantY = 0;
+  if (focusObj && focusObj._x != null) {
+    const left = 48, right = W - panelW - 48, top = 72, bottom = H - 88;
+    if (focusObj._x > right) wantX = right - focusObj._x;
+    else if (focusObj._x < left) wantX = left - focusObj._x;
+    if (focusObj._y > bottom) wantY = bottom - focusObj._y;
+    else if (focusObj._y < top) wantY = top - focusObj._y;
+  }
+  camX += (wantX - camX) * (reduceMotion ? 1 : 0.14);
+  camY += (wantY - camY) * (reduceMotion ? 1 : 0.14);
+  if (Math.abs(camX) < 0.05) camX = 0;
+  if (Math.abs(camY) < 0.05) camY = 0;
+
+  ctx.save();
+  ctx.translate(camX, camY);
+
+  // stage-to-stage constellation edges
   ctx.strokeStyle = 'rgba(140,160,220,.14)';
   ctx.lineWidth = 1;
   for (const st of S.stages) {
@@ -667,7 +690,7 @@ function draw(tms) {
     ctx.stroke();
   }
 
-  // intra-cluster web: faint lines joining successive stars (skip on large runs)
+  // intra-cluster web (skip on large runs)
   if (taskN < 400) {
     const perStage = new Map();
     for (const t of S.tasks) {
@@ -693,8 +716,7 @@ function draw(tms) {
     ctx.setLineDash([]);
   }
 
-  // lineage edges for the focused task: what merged in (solid), where its
-  // output went (dashed)
+  // lineage edges for the focused task
   const focusTask = (selected && selected.type === 'task' && S.taskIx.get(selected.id)) ||
                     (hovered && S.taskIx.get(hovered.id) === hovered && hovered) || null;
   if (focusTask) {
@@ -715,7 +737,7 @@ function draw(tms) {
     ctx.setLineDash([]);
   }
 
-  // stage labels (clickable — they open the stage inspector)
+  // stage labels
   labelRects.length = 0;
   ctx.textAlign = 'center';
   ctx.font = '11px system-ui, sans-serif';
@@ -731,7 +753,6 @@ function draw(tms) {
     labelRects.push({ x: lx - w / 2 - 5, y: ly - 12, w: w + 10, h: 17, stage: st });
   }
 
-  // stage selection halo
   if (selected && selected.type === 'stage') {
     const st = S.stageIx.get(selected.id);
     if (st && st._cx !== undefined) {
@@ -749,7 +770,6 @@ function draw(tms) {
   for (const t of S.tasks) drawTask(t, now, tms);
   for (const w of S.workers) drawWorker(w, tms);
 
-  // hover / selection rings
   const focus = [];
   if (hovered) focus.push([hovered, .35]);
   if (selected) {
@@ -767,6 +787,7 @@ function draw(tms) {
     ctx.globalAlpha = 1;
   }
 
+  ctx.restore();
   requestAnimationFrame(tick);
 }
 let rafRunning = false;
@@ -782,18 +803,19 @@ requestAnimationFrame(tick);
 
 // ------------------------------------------------------------ interaction --
 function hitTest(mx, my) {
+  const wx = mx - camX, wy = my - camY;
   let best = null, bestD = 13 * 13;
   for (const t of S.tasks) {
-    const d = (t._x - mx) ** 2 + (t._y - my) ** 2;
+    const d = (t._x - wx) ** 2 + (t._y - wy) ** 2;
     if (d < bestD) { bestD = d; best = { type: 'task', obj: t }; }
   }
   for (const w of S.workers) {
-    const d = (w._x - mx) ** 2 + (w._y - my) ** 2;
+    const d = (w._x - wx) ** 2 + (w._y - wy) ** 2;
     if (d < bestD) { bestD = d; best = { type: 'worker', obj: w }; }
   }
   if (!best) {
     for (const r of labelRects) {
-      if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+      if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) {
         return { type: 'stage', obj: r.stage };
       }
     }
@@ -857,8 +879,6 @@ document.addEventListener('keydown', e => {
     canvas.focus({ preventScroll: true });
     return;
   }
-  // Don't steal keys while typing isn't possible here, but skip when focus is
-  // inside an editable control (future-proof) or a details summary interaction.
   const tag = (e.target && e.target.tagName) || '';
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
 
@@ -874,6 +894,13 @@ document.addEventListener('keydown', e => {
   } else if (e.key === '[' || e.key === '{') {
     e.preventDefault();
     cycleSelection(S.stages.filter(st => st._cx !== undefined), 'stage', -1);
+  } else if (e.key === 'e' || e.key === 'E') {
+    e.preventDefault();
+    cycleSelection(S.workers, 'worker', e.shiftKey ? -1 : 1);
+  } else if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault();
+    const failed = S.tasks.filter(t => t.status === 'failed');
+    if (failed.length) cycleSelection(failed, 'task', e.shiftKey ? -1 : 1);
   }
 });
 document.getElementById('panelClose').addEventListener('click', () => {
@@ -888,7 +915,6 @@ function openPanel() {
   panel.classList.add('open');
   if (!wasOpen) {
     S.layoutDirty = true;
-    // Move keyboard focus into the inspector once when it opens.
     queueMicrotask(() => document.getElementById('panelClose').focus({ preventScroll: true }));
   }
   renderPanel();
