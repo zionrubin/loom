@@ -152,3 +152,7 @@ OPENAI_API_KEY=sk-... go run ./examples/openai-review
 The scaling path (remote worker fleets, shared object-store CAS, WASM
 sandboxes with grant-derived imports, streaming execution) is laid out in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distributed-system).
+
+## Demo
+
+[▶️ Watch the demo](./assets/demo.mp4)
