@@ -3,10 +3,10 @@ package plan
 import (
 	"testing"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/pipeline"
-	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/security"
 )
 
 func reg(t *testing.T) *model.Registry {

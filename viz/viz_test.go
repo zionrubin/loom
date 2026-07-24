@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/observe"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/observe"
 )
 
 func at(ms int64) time.Time { return time.UnixMilli(ms) }

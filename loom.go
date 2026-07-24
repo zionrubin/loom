@@ -14,17 +14,17 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/executor"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/observe"
-	"github.com/zionrubin/brian-ai/loom/ops"
-	"github.com/zionrubin/brian-ai/loom/pipeline"
-	"github.com/zionrubin/brian-ai/loom/plan"
-	"github.com/zionrubin/brian-ai/loom/runtime"
-	"github.com/zionrubin/brian-ai/loom/security"
-	"github.com/zionrubin/brian-ai/loom/store"
-	"github.com/zionrubin/brian-ai/loom/task"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
+	"github.com/zionrubin/loom/ops"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/runtime"
+	"github.com/zionrubin/loom/security"
+	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/task"
 )
 
 // Config controls a run. Build it with Options passed to Run.

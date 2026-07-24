@@ -10,9 +10,9 @@ package task
 import (
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/security"
 )
 
 // SandboxProfile selects the isolation level a task's ops run under.

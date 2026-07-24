@@ -11,8 +11,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/security"
 )
 
 // Request is a single completion request to a provider.

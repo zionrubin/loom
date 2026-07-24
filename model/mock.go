@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
+	"github.com/zionrubin/loom/core"
 )
 
 // Mock is a deterministic in-process Provider for tests, examples, and
