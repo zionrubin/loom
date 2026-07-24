@@ -1,0 +1,303 @@
+# Loom Architecture
+
+Loom is a framework for running AI-powered data processing at scale — the
+MapReduce/Spark idea rebuilt from first principles for workloads whose
+operators are model calls rather than CPU functions.
+
+This document explains the reasoning behind the design, walks through each
+component, and lays out the path from the local runtime to a distributed
+deployment.
+
+---
+
+## 1. Why AI workloads need a different framework
+
+Classic data frameworks (MapReduce, Spark, Flink) optimize for a world where
+the operator is cheap, deterministic, and CPU-bound, and where the scarce
+resources are cores, memory, and shuffle bandwidth. Every one of those
+assumptions breaks for AI processing:
+
+| Classic assumption | AI reality | Consequence for design |
+|---|---|---|
+| Operators are cheap and fast | A single operator call costs real money and hundreds of ms | Caching identical work is a first-order economic feature, not an optimization |
+| Operators are deterministic | Model output varies and can be *wrong* while the call "succeeds" | Failure handling needs a **semantic** class, with validation and escalation, not just retry |
+| Throughput bounded by cores | Throughput bounded by provider **rate limits** (RPM/TPM) | The scheduler needs admission control in provider units, not a thread pool |
+| Cost ≈ cluster time | Cost = tokens × price, per call | Budgets are a runtime enforcement concern (a governor), not a billing report |
+| Operators are trusted code | Operators execute prompts, tools, and model-derived actions | Executors need least-privilege sandboxes: explicit grants for models, secrets, tools, egress |
+| One binary, one capability | Many models with different cost/quality/limits | Model choice is a *scheduling* decision: tiers, routing, escalation ladders |
+| Reduce is associative math | Aggregation is often itself an AI operation (summarize, synthesize) | Hierarchical AI-reduce is a native operator with tree fan-in |
+
+Loom's thesis: **make every one of these differences a first-class concept**
+rather than something bolted onto a generic DAG runner.
+
+## 2. Design principles
+
+1. **Explicit provisioning, least privilege.** A task declares everything it
+   may use — model, secrets, tools, network hosts, context, budget, sandbox
+   profile — in a serializable *envelope*. Executors can do exactly what the
+   envelope grants, and every sensitive access is checked and audited at the
+   moment of use.
+2. **Determinism where it buys something.** Operation specs are fingerprinted
+   and results content-addressed, so identical work is never paid for twice
+   and any output can be traced to the op, model, and inputs that produced
+   it. Caching *is* checkpointing *is* resume.
+3. **Failure classes drive recovery.** Transient failures back off and retry;
+   semantic failures escalate to a stronger model; permanent failures fail
+   fast; budget failures stop the run with partial results. No single retry
+   loop can serve all four.
+4. **The data plane is declarative; the control plane is pluggable.** AI
+   operations are pure data (prompt templates, bindings, schemas), so they
+   can execute anywhere. The `Executor` interface is the seam where
+   distribution and isolation plug in.
+5. **Economics are runtime state.** Token usage and dollar cost flow through
+   every result, are aggregated live, and are enforced by a governor — a run
+   is bounded by dollars the same way a query is bounded by a timeout.
+
+## 3. System overview
+
+```
+        Authoring                Planning                    Execution
+  ┌──────────────────┐   ┌─────────────────────┐   ┌──────────────────────────┐
+  │ pipeline.Pipeline│   │ plan.Compile        │   │ runtime.Scheduler        │
+  │  FromRecords     │   │  validate           │   │  admission (rate limits) │
+  │  .Map/.Filter    │──▶│  fuse pure chains   │──▶│  budget governor         │
+  │  .Infer          │   │  fingerprint ops    │   │  class-aware retries     │
+  │  .ReduceAI       │   │  resolve bindings   │   │  escalation ladder       │
+  │  .Combine        │   │  build envelopes    │   └────────────┬─────────────┘
+  └──────────────────┘   └─────────────────────┘                │ task + envelope
+                                                                ▼
+  ┌─────────────────────┐   ┌───────────────────┐   ┌──────────────────────────┐
+  │ observe.Bus/Report  │◀──│ store.CAS/Cache/  │◀──│ executor.Local           │
+  │  events, metrics,   │   │ Lineage           │   │  cache short-circuit     │
+  │  latency, cost      │   │  content-addressed│   │  op runners (ops.*)      │
+  └─────────────────────┘   │  artifacts        │   │  ModelClient (grants,    │
+                            └───────────────────┘   │   egress, secrets, cost) │
+  ┌─────────────────────┐                           │  ToolSet (grant-checked) │
+  │ security.Broker/    │◀──────────────────────────│  sandbox profile         │
+  │ Audit               │      per-call resolution  └──────────────────────────┘
+  └─────────────────────┘
+```
+
+A run flows: **author** a pipeline → **compile** it into a plan (validation,
+fusion, fingerprints, envelopes) → the **driver** walks stages in
+topological order, building tasks and handing each stage's batch to the
+**scheduler** → the scheduler admits tasks under rate limits and budget and
+drives them through an **executor** with class-aware recovery → results are
+cached, lineage-tracked, observed, and flow to downstream stages.
+
+## 4. Component walkthrough
+
+### 4.1 Pipeline (authoring)
+
+`pipeline` is a declarative builder producing a DAG of stages. Two families
+of operators:
+
+- **Pure transforms** — `Map`, `Filter`, `FlatMap`, `MapTools`, `Combine`:
+  ordinary Go functions. They execute wherever the closure lives; giving
+  them a `Version` makes them cacheable.
+- **AI operators** — `Infer` (per-record model call with prompt template,
+  optional JSON parsing and validation) and `ReduceAI` (hierarchical
+  tree-aggregation with configurable fan-in). These are *fully declarative
+  and serializable*: they can execute on any worker.
+
+Datasets are handles to stage outputs; deriving twice from one dataset
+branches the DAG.
+
+### 4.2 Planner
+
+`plan.Compile` performs:
+
+- **Validation** — unique stage names, templates parse, bindings resolve —
+  authoring errors surface before any money is spent.
+- **Operator fusion** — maximal runs of adjacent pure stages with
+  single-consumer links collapse into one task boundary (the classic
+  narrow-dependency optimization; fewer serialization points).
+- **Fingerprinting** — each stage's op spec is canonically hashed. The
+  fingerprint + input content hash is the task's cache key, and the
+  fingerprint is recorded in lineage.
+- **Envelope assembly** — for each stage, the *minimal* grant set: the
+  binding's candidate models, exactly their secrets, exactly their
+  endpoints on the egress allowlist, plus explicitly requested tool grants.
+  Least privilege is the *default output of planning*, not a configuration
+  chore.
+
+### 4.3 Task envelope (the security & portability boundary)
+
+Every task carries an `Envelope`:
+
+```
+Envelope{
+  Binding   — model or tier + escalation ladder
+  Grants    — capabilities: model:*, secret:*, tool:*
+  Egress    — deny-by-default host allowlist
+  Context   — the exact context bundle (system + fragments) the task needs
+  Budget    — per-task timeout / attempts / token caps
+  Sandbox   — inline | subprocess | container | wasm
+}
+```
+
+Envelopes (and tasks) are plain JSON-serializable data — proven by test —
+which is what makes remote and sandboxed execution possible without changing
+planning or scheduling.
+
+### 4.4 Scheduler
+
+`runtime.Scheduler` executes a batch of tasks with:
+
+- **Bounded concurrency** (global or per-stage worker counts).
+- **Admission control** — per-model token buckets for requests/min *and*
+  tokens/min; work waits at the scheduler instead of burning provider 429s.
+- **Budget governor** — run-level cost/token caps enforced across all
+  concurrent tasks; on exhaustion the run stops admitting work and returns
+  partial results plus the spend so far.
+- **Class-aware recovery** —
+  - *transient* → exponential backoff + jitter, same model;
+  - *semantic* → climb the binding's escalation ladder (e.g. Haiku → Sonnet)
+    and retry — invalid output is evidence the model was too weak, so paying
+    the same price for the same failure is wasteful;
+  - *permanent* → dead-letter immediately;
+  - *budget* → abort the run.
+- **Dead letters** — with `ContinueOnError`, failing records are quarantined
+  into `Failures` instead of poisoning the run.
+
+### 4.5 Executor
+
+`executor.Executor` is one method: `Execute(ctx, task) (Result, error)`. The
+local implementation:
+
+1. rejects sandbox profiles it can't honor (fail closed);
+2. short-circuits through the content-addressed cache;
+3. dispatches to the stage's op runner with a capability-scoped `Runtime`:
+   - `ModelClient` — checks the model grant, checks the endpoint against the
+     egress allowlist, scopes secret resolution to the task's grants,
+     computes cost from registry pricing, publishes telemetry;
+   - `Tools` — grant-checked, audited tool invocation;
+4. stores results in the CAS, records lineage.
+
+Because providers resolve credentials **per call through the broker**,
+executors and ops never hold raw secrets — the same property as vault-style
+egress injection, implemented at the framework boundary.
+
+### 4.6 Model layer
+
+`model.Registry` holds every model a deployment may use: provider, pricing,
+rate limits, tier, required secret. Stages bind by explicit ID or by
+**tier** (`fast` / `balanced` / `deep`), keeping pipelines portable across
+model generations. A binding's **escalation ladder** is the ordered list of
+increasingly capable models used by semantic recovery.
+
+Three providers ship today: a deterministic `Mock` (tests, offline
+development, scripted failures), and `providers/anthropic` and
+`providers/openai` over the official SDKs (per-call broker-resolved keys,
+429/5xx → transient, 4xx → permanent, refusals → semantic).
+
+### 4.7 State: CAS, cache, lineage
+
+- **CAS** — artifacts stored by content hash, memory-first with optional
+  disk persistence.
+- **Cache** — deterministic key `hash(op fingerprint, input content)` →
+  artifact. This is simultaneously the **checkpoint/resume** mechanism: a
+  rerun (same code, same inputs) replays completed AI work with zero model
+  calls and zero cost, across process restarts when a state dir is
+  configured. Partial failures resume from where they left off for free.
+- **Lineage** — every artifact records the run, stage, op fingerprint,
+  model, and input hashes that produced it: reproducibility and audit for
+  outputs whose provenance would otherwise be "a model said so".
+
+### 4.8 Observability
+
+Every lifecycle transition — run/stage/task start and finish, every model
+call with usage/latency, every retry with its reason, every cache hit, every
+budget trip — is a typed event on `observe.Bus` (synchronous handlers for
+the built-in collector; non-blocking channels for external consumers). The
+collector folds events into a `RunReport`: per-stage task counts, failures,
+retries, cache hits, token usage, dollar cost, and latency percentiles.
+
+### 4.9 Security
+
+Four cooperating mechanisms, all exercised by tests:
+
+1. **Capability grants** (`model:*`, `secret:*`, `tool:*`) — assembled
+   minimally by the planner, checked at use.
+2. **Secret broker** — per-call, grant-scoped, audited resolution; no
+   ambient credentials.
+3. **Egress policy** — deny-by-default allowlist per task; a provider
+   endpoint not implied by the stage's binding is unreachable.
+4. **Audit log** — append-only record of every allow/deny decision with the
+   task that triggered it.
+
+### 4.10 Aggregation
+
+- `Combine` — associative Go fold for classic reductions.
+- `ReduceAI` — hierarchical tree reduce: records are grouped `FanIn` at a
+  time, each group is aggregated by a model call, and levels repeat until
+  one record remains. O(log_FanIn n) sequential depth, each level fully
+  parallel and cache-eligible.
+
+## 5. Failure taxonomy (summary)
+
+| Class | Detected by | Recovery |
+|---|---|---|
+| `transient` | 429/5xx/529, timeouts, network errors | Backoff + jitter, retry same model |
+| `semantic` | JSON parse failure, `Validate` rejection, model refusal | Escalate up the binding ladder, retry |
+| `permanent` | 4xx, missing grants, template errors, user-code bugs | Dead-letter immediately |
+| `budget` | Governor limit crossed | Stop admitting work; return partial results + spend |
+
+Unclassified errors default to *permanent*: a user-code bug should fail
+fast, not burn paid retries.
+
+## 6. Scaling path: from local runtime to distributed system
+
+The local runtime is a complete, correct single-node system. Scaling out
+does not change the programming model or the planner — it replaces the
+executor and the state backends behind existing interfaces.
+
+**Phase 1 — remote executor fleet.** Implement `Executor` as a client to a
+worker service: tasks (already serializable, envelope included) go onto a
+queue with **leases**; workers claim, execute, and report. Lease expiry
+gives at-least-once execution; the deterministic cache key makes duplicate
+execution harmless (idempotent writes into the CAS). The scheduler's
+admission control moves to a shared token-bucket service so the whole fleet
+respects provider limits collectively.
+
+**Phase 2 — shared state.** The CAS maps naturally onto object storage
+(S3/GCS) with the same hash keys; the cache index and lineage onto any
+KV/OLTP store. Nothing in the interfaces assumes locality.
+
+**Phase 3 — sandbox depth.** The envelope's sandbox profiles are implemented
+by worker runtimes: subprocess isolation for untrusted pure ops, containers
+for tool-running agents, and — the most promising direction — **WASM**
+sandboxes whose imports are generated *from the envelope's grant set*, making
+the capability model enforceable at the instruction level rather than by
+convention.
+
+**Phase 4 — streaming and dynamic scheduling.** The current driver runs
+stage barriers (simple, predictable). The planner's DAG already contains
+what's needed for pipelined execution (start downstream tasks as upstream
+records complete), speculative re-execution of stragglers, and
+cost-based model routing (route records to cheaper models and escalate only
+the hard ones — the escalation ladder generalized from recovery to policy).
+
+**Also on the roadmap:**
+- **Semantic caching** — embedding-similarity lookup in front of the exact
+  cache for near-duplicate inputs.
+- **Ensemble/quorum operators** — N samples + vote or judge as a native op
+  (today expressible as FlatMap → Infer → Combine).
+- **Data-access capabilities** — extend grants to datasets
+  (`data:read:<name>`) with broker-mediated loaders.
+- **Agentic operators** — multi-turn tool-using tasks inside the same
+  envelope/budget/sandbox machinery.
+
+## 7. What is implemented vs. designed
+
+Implemented and tested in this repository: the pipeline API, planner
+(validation, fusion, fingerprints, least-privilege envelopes), scheduler
+(admission control, governor, class-aware retries with escalation), local
+executor, capability/secret/egress/audit security, CAS + persistent cache +
+lineage, event bus + run reports, tree AI-reduce, mock, Anthropic, and
+OpenAI providers, and cross-restart cache resume.
+
+Designed but not yet implemented: remote executor backends, shared state
+stores, subprocess/container/WASM sandbox runtimes, streaming execution,
+semantic cache, ensemble operators. The interfaces above are the contract
+those implementations plug into.

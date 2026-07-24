@@ -1,0 +1,379 @@
+// Package plan compiles a pipeline's logical graph into an executable plan:
+// it validates the graph, fuses adjacent pure stages into single task
+// boundaries, resolves model bindings to candidate ladders, computes
+// deterministic operation fingerprints (the basis of caching and lineage),
+// and assembles least-privilege task envelopes.
+package plan
+
+import (
+	"fmt"
+	"text/template"
+
+	"github.com/zionrubin/brian-ai/loom/core"
+	"github.com/zionrubin/brian-ai/loom/model"
+	"github.com/zionrubin/brian-ai/loom/pipeline"
+	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/brian-ai/loom/store"
+	"github.com/zionrubin/brian-ai/loom/task"
+)
+
+// StagePlan is one executable stage.
+type StagePlan struct {
+	Stage       *pipeline.Stage
+	Fingerprint string
+	Candidates  []model.Info // resolved binding ladder for AI stages
+	Cacheable   bool
+}
+
+// Plan is the compiled pipeline.
+type Plan struct {
+	Pipeline *pipeline.Pipeline
+	Order    []*StagePlan // topological execution order
+	ByID     map[string]*StagePlan
+	Children map[string][]string // stage → downstream stage IDs
+}
+
+// Terminal returns the IDs of stages with no downstream consumers.
+func (p *Plan) Terminal() []string {
+	var out []string
+	for _, sp := range p.Order {
+		if len(p.Children[sp.Stage.ID]) == 0 {
+			out = append(out, sp.Stage.ID)
+		}
+	}
+	return out
+}
+
+func isPure(k pipeline.StageKind) bool {
+	return k == pipeline.KindMap || k == pipeline.KindFilter || k == pipeline.KindFlatMap
+}
+
+// Compile validates and optimizes the pipeline against the registry.
+func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
+	stages := p.Stages()
+	if len(stages) == 0 {
+		return nil, fmt.Errorf("pipeline %q has no stages", p.Name)
+	}
+
+	seen := map[string]*pipeline.Stage{}
+	for _, s := range stages {
+		if s.ID == "" {
+			return nil, fmt.Errorf("pipeline %q: stage with empty name", p.Name)
+		}
+		if _, dup := seen[s.ID]; dup {
+			return nil, fmt.Errorf("pipeline %q: duplicate stage name %q", p.Name, s.ID)
+		}
+		seen[s.ID] = s
+		if s.Upstream == nil && s.Kind != pipeline.KindSource {
+			return nil, fmt.Errorf("stage %q: non-source stage without upstream", s.ID)
+		}
+	}
+
+	// Child counts on the logical graph drive fusion decisions: a pure stage
+	// can absorb its successor only if it is the successor's sole consumer.
+	childCount := map[string]int{}
+	for _, s := range stages {
+		if s.Upstream != nil {
+			childCount[s.Upstream.ID]++
+		}
+	}
+
+	// Fuse maximal runs of adjacent pure stages (single-consumer links) into
+	// synthetic fused stages: fewer task boundaries, less serialization.
+	fusedInto := map[string]*pipeline.Stage{} // original stage ID → fused stage
+	var order []*pipeline.Stage
+	for _, s := range stages {
+		if fusedInto[s.ID] != nil {
+			continue // already absorbed
+		}
+		if !isPure(s.Kind) {
+			order = append(order, s)
+			continue
+		}
+		run := []*pipeline.Stage{s}
+		cur := s
+		for childCount[cur.ID] == 1 {
+			next := soleChild(stages, cur.ID)
+			if next == nil || !isPure(next.Kind) {
+				break
+			}
+			run = append(run, next)
+			cur = next
+		}
+		fused := &pipeline.Stage{
+			ID:       run[len(run)-1].ID, // fused stage keeps the last op's name
+			Kind:     pipeline.KindFused,
+			Upstream: s.Upstream,
+			Fused:    run,
+			Opts:     mergeOpts(run),
+		}
+		for _, r := range run {
+			fusedInto[r.ID] = fused
+		}
+		order = append(order, fused)
+	}
+
+	// Rewire upstream pointers that referenced absorbed stages.
+	for _, s := range order {
+		if s.Upstream != nil {
+			if f := fusedInto[s.Upstream.ID]; f != nil && f != s {
+				s.Upstream = f
+			}
+		}
+	}
+
+	pl := &Plan{
+		Pipeline: p,
+		ByID:     map[string]*StagePlan{},
+		Children: map[string][]string{},
+	}
+	for _, s := range order {
+		sp := &StagePlan{Stage: s}
+
+		switch s.Kind {
+		case pipeline.KindInfer:
+			spec := s.Infer
+			if spec.Prompt == "" {
+				return nil, fmt.Errorf("stage %q: empty prompt template", s.ID)
+			}
+			if _, err := template.New(s.ID).Option("missingkey=error").Parse(spec.Prompt); err != nil {
+				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
+			}
+			cands, err := reg.Candidates(spec.Binding)
+			if err != nil {
+				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			sp.Candidates = cands
+			sp.Cacheable = !s.Opts.NoCache
+			sp.Fingerprint, err = store.Key("infer", bindingKey(spec.Binding), spec.System,
+				spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
+				fragmentKey(spec.Context), s.Opts.Version)
+			if err != nil {
+				return nil, err
+			}
+
+		case pipeline.KindReduceAI:
+			spec := s.Reduce
+			if spec.Prompt == "" {
+				return nil, fmt.Errorf("stage %q: empty prompt template", s.ID)
+			}
+			if _, err := template.New(s.ID).Parse(spec.Prompt); err != nil {
+				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
+			}
+			cands, err := reg.Candidates(spec.Binding)
+			if err != nil {
+				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			sp.Candidates = cands
+			sp.Cacheable = !s.Opts.NoCache
+			sp.Fingerprint, err = store.Key("reduce_ai", bindingKey(spec.Binding), spec.System,
+				spec.Prompt, spec.FanIn, spec.MaxTokens, spec.ItemField, spec.OutputField,
+				s.Opts.Version)
+			if err != nil {
+				return nil, err
+			}
+
+		case pipeline.KindFused:
+			var names []string
+			for _, r := range s.Fused {
+				names = append(names, string(r.Kind)+":"+r.ID)
+			}
+			var err error
+			sp.Fingerprint, err = store.Key("fused", names, s.Opts.Version)
+			if err != nil {
+				return nil, err
+			}
+			// Go closures aren't content-addressable: only Version makes a
+			// pure stage cacheable.
+			sp.Cacheable = s.Opts.Version != "" && !s.Opts.NoCache
+
+		case pipeline.KindSource, pipeline.KindCombine:
+			sp.Cacheable = false
+
+		default:
+			return nil, fmt.Errorf("stage %q: unexpected kind %q after fusion", s.ID, s.Kind)
+		}
+
+		pl.Order = append(pl.Order, sp)
+		pl.ByID[s.ID] = sp
+	}
+
+	for _, sp := range pl.Order {
+		if up := sp.Stage.Upstream; up != nil {
+			if _, ok := pl.ByID[up.ID]; !ok {
+				return nil, fmt.Errorf("stage %q: upstream %q not found", sp.Stage.ID, up.ID)
+			}
+			pl.Children[up.ID] = append(pl.Children[up.ID], sp.Stage.ID)
+		}
+	}
+	return pl, nil
+}
+
+func soleChild(stages []*pipeline.Stage, parentID string) *pipeline.Stage {
+	for _, s := range stages {
+		if s.Upstream != nil && s.Upstream.ID == parentID {
+			return s
+		}
+	}
+	return nil
+}
+
+// mergeOpts combines fused stages' options: the strictest/last-set wins.
+func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
+	var o pipeline.StageOpts
+	for _, s := range run {
+		if s.Opts.Parallelism > 0 {
+			o.Parallelism = s.Opts.Parallelism
+		}
+		if s.Opts.BatchSize > 0 {
+			o.BatchSize = s.Opts.BatchSize
+		}
+		if s.Opts.Sandbox != "" {
+			o.Sandbox = s.Opts.Sandbox
+		}
+		if s.Opts.Version != "" {
+			o.Version += s.Opts.Version + ";"
+		}
+		if s.Opts.NoCache {
+			o.NoCache = true
+		}
+		if s.Opts.Budget.MaxDuration > 0 {
+			o.Budget.MaxDuration = s.Opts.Budget.MaxDuration
+		}
+		if s.Opts.Budget.MaxAttempts > 0 {
+			o.Budget.MaxAttempts = s.Opts.Budget.MaxAttempts
+		}
+		o.Grants = append(o.Grants, s.Opts.Grants...)
+	}
+	// A fused run is cache-consistent only if every member declared a
+	// version; a partial version string would produce wrong cache reuse
+	// when an unversioned member changes.
+	for _, s := range run {
+		if s.Opts.Version == "" {
+			o.Version = ""
+			break
+		}
+	}
+	return o
+}
+
+func bindingKey(b model.Binding) map[string]any {
+	return map[string]any{"model": b.Model, "tier": string(b.Tier), "escalation": b.Escalation}
+}
+
+func fragmentKey(frags []task.Fragment) []map[string]string {
+	out := make([]map[string]string, 0, len(frags))
+	for _, f := range frags {
+		out = append(out, map[string]string{"name": f.Name, "content": f.Content})
+	}
+	return out
+}
+
+// Envelope assembles the least-privilege envelope for one of this stage's
+// tasks: capability grants for exactly the binding's candidate models and
+// their secrets, an egress allowlist of exactly those providers' endpoints
+// (plus extraEgress for tools), the stage's context bundle, budget, and
+// sandbox profile.
+func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope {
+	s := sp.Stage
+	var caps []security.Capability
+	var hosts []string
+	var binding model.Binding
+	var ctxBundle task.ContextBundle
+
+	switch s.Kind {
+	case pipeline.KindInfer:
+		binding = s.Infer.Binding
+		ctxBundle = task.ContextBundle{System: s.Infer.System, Fragments: s.Infer.Context}
+	case pipeline.KindReduceAI:
+		binding = s.Reduce.Binding
+		ctxBundle = task.ContextBundle{System: s.Reduce.System}
+	}
+	for _, info := range sp.Candidates {
+		caps = append(caps, security.ModelCap(info.ID))
+		if info.SecretRef != "" {
+			caps = append(caps, security.SecretCap(info.SecretRef))
+		}
+		if h := info.Provider.Endpoint(); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	caps = append(caps, s.Opts.Grants...)
+
+	sandbox := s.Opts.Sandbox
+	if sandbox == "" {
+		sandbox = task.SandboxInline
+	}
+
+	return task.Envelope{
+		RunID:   runID,
+		Stage:   s.ID,
+		Binding: binding,
+		Grants:  security.NewGrantSet(caps...),
+		Egress:  security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
+		Context: ctxBundle,
+		Budget:  s.Opts.Budget,
+		Sandbox: sandbox,
+	}
+}
+
+// BuildTasks splits input records into scheduled tasks for this stage,
+// computing per-task cache keys and admission-control token estimates.
+func (sp *StagePlan) BuildTasks(runID string, input []core.Record, extraEgress []string) ([]task.Task, error) {
+	batch := sp.Stage.Opts.BatchSize
+	if batch <= 0 {
+		batch = 1
+	}
+	return sp.BuildTasksBatch(runID, input, batch, extraEgress)
+}
+
+// BuildTasksBatch is BuildTasks with an explicit batch size (used by the
+// driver for ReduceAI fan-in groups).
+func (sp *StagePlan) BuildTasksBatch(runID string, input []core.Record, batch int, extraEgress []string) ([]task.Task, error) {
+	if batch <= 0 {
+		batch = 1
+	}
+	env := sp.Envelope(runID, extraEgress)
+
+	var maxTokens int
+	switch sp.Stage.Kind {
+	case pipeline.KindInfer:
+		maxTokens = sp.Stage.Infer.MaxTokens
+	case pipeline.KindReduceAI:
+		maxTokens = sp.Stage.Reduce.MaxTokens
+	}
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+
+	var tasks []task.Task
+	seq := 0
+	for i := 0; i < len(input); i += batch {
+		end := min(i+batch, len(input))
+		group := input[i:end]
+
+		t := task.Task{
+			ID:          core.NewID("task"),
+			Seq:         seq,
+			Stage:       sp.Stage.ID,
+			Fingerprint: sp.Fingerprint,
+			Input:       group,
+			Envelope:    env,
+		}
+		if sp.Cacheable {
+			key, err := store.Key(sp.Fingerprint, group)
+			if err != nil {
+				return nil, err
+			}
+			t.CacheKey = key
+		}
+		est := maxTokens
+		for _, r := range group {
+			est += model.EstimateTokens(r.String("output")) + 64
+		}
+		t.EstTokens = est
+		tasks = append(tasks, t)
+		seq++
+	}
+	return tasks, nil
+}
