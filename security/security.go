@@ -28,6 +28,10 @@ func SecretCap(ref SecretRef) Capability { return Capability("secret:" + string(
 // ToolCap grants invocation of a tool.
 func ToolCap(name string) Capability { return Capability("tool:" + name) }
 
+// DataCap grants read access to a named run-level dataset — today, a
+// broadcast value shared across the run's tasks.
+func DataCap(name string) Capability { return Capability("data:read:" + name) }
+
 // GrantSet is an immutable set of capabilities. The zero value grants nothing.
 type GrantSet struct {
 	caps map[Capability]struct{}

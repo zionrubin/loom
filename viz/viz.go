@@ -84,6 +84,8 @@ type Node struct {
 	CallLog   []Call   `json:"callLog,omitempty"`   // full request/response per call
 	Usage     Usage    `json:"usage"`               // accumulated across attempts
 	CacheHit  bool     `json:"cacheHit,omitempty"`
+	// Broadcasts names the run-level shared values this task actually read.
+	Broadcasts []string `json:"broadcasts,omitempty"`
 	// Error intentionally has no omitempty: it clears when a retry succeeds,
 	// and clients that merge deltas must see the transition back to "".
 	Error string     `json:"error"`
@@ -99,6 +101,19 @@ type StageInfo struct {
 	Status    string `json:"status"`           // running | done
 	StartedAt int64  `json:"startedAt,omitempty"`
 	EndedAt   int64  `json:"endedAt,omitempty"`
+}
+
+// BroadcastInfo is the visualized state of one run-level shared value: what
+// it is (name, content hash, size, the value itself) and where it reached
+// (the stages and tasks observed reading it).
+type BroadcastInfo struct {
+	ID      string   `json:"id"` // the broadcast's name
+	Hash    string   `json:"hash,omitempty"`
+	Bytes   int      `json:"bytes"`
+	Preview string   `json:"preview,omitempty"` // serialized value (clipped)
+	Stages  []string `json:"stages,omitempty"`  // stages observed reading it
+	Readers int      `json:"readers"`           // tasks that read it
+	Tasks   []string `json:"tasks,omitempty"`   // reader task IDs (capped)
 }
 
 // WorkerInfo is the visualized state of one scheduler worker (executor slot).
@@ -125,26 +140,31 @@ type runHeader struct {
 // Snapshot is the complete state of the current run.
 type Snapshot struct {
 	runHeader
-	Now     int64         `json:"now"`
-	Stages  []*StageInfo  `json:"stages"`
-	Tasks   []*Node       `json:"tasks"`
-	Workers []*WorkerInfo `json:"workers"`
+	Now        int64            `json:"now"`
+	Stages     []*StageInfo     `json:"stages"`
+	Tasks      []*Node          `json:"tasks"`
+	Workers    []*WorkerInfo    `json:"workers"`
+	Broadcasts []*BroadcastInfo `json:"broadcasts"`
 }
 
 // delta is one incremental update: the run header plus whichever entities
 // the triggering event changed.
 type delta struct {
-	Now    int64       `json:"now"`
-	Reset  bool        `json:"reset,omitempty"`
-	Run    runHeader   `json:"run"`
-	Stage  *StageInfo  `json:"stage,omitempty"`
-	Task   *Node       `json:"task,omitempty"`
-	Worker *WorkerInfo `json:"worker,omitempty"`
+	Now       int64          `json:"now"`
+	Reset     bool           `json:"reset,omitempty"`
+	Run       runHeader      `json:"run"`
+	Stage     *StageInfo     `json:"stage,omitempty"`
+	Task      *Node          `json:"task,omitempty"`
+	Worker    *WorkerInfo    `json:"worker,omitempty"`
+	Broadcast *BroadcastInfo `json:"broadcast,omitempty"`
 }
 
 const (
 	maxLogEntries  = 80
 	maxCallEntries = 24
+	// Reader lists are for showing *where* a value landed, not for
+	// enumerating every task; Readers stays exact regardless.
+	maxBroadcastTasks = 24
 )
 
 type subscriber struct {
@@ -154,15 +174,17 @@ type subscriber struct {
 
 // Server folds observe events into run state and serves the constellation UI.
 type Server struct {
-	mu      sync.Mutex
-	run     runHeader
-	stages  []*StageInfo
-	stageIx map[string]*StageInfo
-	tasks   []*Node
-	taskIx  map[string]*Node
-	workers []*WorkerInfo
-	workIx  map[string]*WorkerInfo
-	subs    map[*subscriber]struct{}
+	mu       sync.Mutex
+	run      runHeader
+	stages   []*StageInfo
+	stageIx  map[string]*StageInfo
+	tasks    []*Node
+	taskIx   map[string]*Node
+	workers  []*WorkerInfo
+	workIx   map[string]*WorkerInfo
+	shared   []*BroadcastInfo
+	sharedIx map[string]*BroadcastInfo
+	subs     map[*subscriber]struct{}
 
 	viewer     chan struct{}
 	viewerOnce sync.Once
@@ -174,11 +196,12 @@ type Server struct {
 // New returns a Server with empty state.
 func New() *Server {
 	s := &Server{
-		stageIx: map[string]*StageInfo{},
-		taskIx:  map[string]*Node{},
-		workIx:  map[string]*WorkerInfo{},
-		subs:    map[*subscriber]struct{}{},
-		viewer:  make(chan struct{}),
+		stageIx:  map[string]*StageInfo{},
+		taskIx:   map[string]*Node{},
+		workIx:   map[string]*WorkerInfo{},
+		sharedIx: map[string]*BroadcastInfo{},
+		subs:     map[*subscriber]struct{}{},
+		viewer:   make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.serveUI)
@@ -363,6 +386,31 @@ func (s *Server) Handle(e observe.Event) {
 		d.Task = n
 		d.Worker = s.workerEndLocked(e.Worker, e.TaskID, now, true)
 
+	case observe.BroadcastRegistered:
+		bc := s.sharedLocked(e.Broadcast)
+		bc.Hash = e.Artifact
+		bc.Bytes = e.Bytes
+		bc.Preview = e.Detail
+		d.Broadcast = bc
+
+	case observe.BroadcastRead:
+		bc := s.sharedLocked(e.Broadcast)
+		bc.Readers++
+		if e.Stage != "" && !contains(bc.Stages, e.Stage) {
+			bc.Stages = append(bc.Stages, e.Stage)
+		}
+		if len(bc.Tasks) < maxBroadcastTasks {
+			bc.Tasks = append(bc.Tasks, e.TaskID)
+		}
+		n := s.nodeLocked(e.TaskID, e.Stage)
+		if !contains(n.Broadcasts, e.Broadcast) {
+			n.Broadcasts = append(n.Broadcasts, e.Broadcast)
+		}
+		logf(n, now, "read shared value %q (%s) — referenced, not copied",
+			e.Broadcast, shortHash(e.Artifact))
+		d.Task = n
+		d.Broadcast = bc
+
 	case observe.BudgetExceeded:
 		s.run.Note = "budget exceeded: " + e.Note
 		if e.TaskID != "" {
@@ -384,6 +432,40 @@ func (s *Server) resetLocked() {
 	s.taskIx = map[string]*Node{}
 	s.workers = nil
 	s.workIx = map[string]*WorkerInfo{}
+	s.shared = nil
+	s.sharedIx = map[string]*BroadcastInfo{}
+}
+
+// sharedLocked returns the entry for a broadcast name, creating it if a read
+// arrives before (or without) its registration event.
+func (s *Server) sharedLocked(name string) *BroadcastInfo {
+	if bc, ok := s.sharedIx[name]; ok {
+		return bc
+	}
+	bc := &BroadcastInfo{ID: name}
+	s.sharedIx[name] = bc
+	s.shared = append(s.shared, bc)
+	return bc
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// shortHash abbreviates a content hash for display.
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12] + "…"
+	}
+	if h == "" {
+		return "—"
+	}
+	return h
 }
 
 func (s *Server) stageLocked(id string) *StageInfo {
@@ -469,11 +551,12 @@ func orDash(s string) string {
 
 func (s *Server) snapshotLocked() []byte {
 	snap := Snapshot{
-		runHeader: s.run,
-		Now:       time.Now().UnixMilli(),
-		Stages:    s.stages,
-		Tasks:     s.tasks,
-		Workers:   s.workers,
+		runHeader:  s.run,
+		Now:        time.Now().UnixMilli(),
+		Stages:     s.stages,
+		Tasks:      s.tasks,
+		Workers:    s.workers,
+		Broadcasts: s.shared,
 	}
 	if snap.Stages == nil {
 		snap.Stages = []*StageInfo{}
@@ -483,6 +566,9 @@ func (s *Server) snapshotLocked() []byte {
 	}
 	if snap.Workers == nil {
 		snap.Workers = []*WorkerInfo{}
+	}
+	if snap.Broadcasts == nil {
+		snap.Broadcasts = []*BroadcastInfo{}
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
