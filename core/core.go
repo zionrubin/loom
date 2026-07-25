@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -154,4 +155,51 @@ func ClassOf(err error) FailureClass {
 // Every invocation is checked against the task's grants and audited.
 type Tools interface {
 	Invoke(ctx context.Context, tool string, args map[string]any) (any, error)
+}
+
+// Broadcaster reads the run-level broadcast values a task is granted.
+//
+// A broadcast is a value registered once for the whole run — a lookup table, a
+// taxonomy, a rubric — stored once by content hash and *referenced* by every
+// task envelope that declares it. That reference, rather than a copy, is what
+// makes a broadcast shareable across tasks and across executors: the envelope
+// stays small however large the value is, and a remote worker fetches each
+// value once instead of receiving it with every task.
+//
+// The returned value is shared by every task in the run and must be treated as
+// read-only. Use BroadcastAs for a typed, independently-owned copy.
+type Broadcaster interface {
+	Broadcast(ctx context.Context, name string) (any, error)
+}
+
+// Session is the capability-scoped surface handed to Go-function ops: tool
+// invocation plus broadcast reads. Every access is checked against the task's
+// envelope and audited.
+type Session interface {
+	Tools
+	Broadcaster
+}
+
+// BroadcastAs reads a broadcast and converts it to T. Broadcast values make a
+// JSON round trip on the way into the store, so a value registered as
+// map[string]string arrives back as map[string]any; BroadcastAs re-decodes it
+// into the type the op actually wants, yielding a copy the op owns.
+func BroadcastAs[T any](ctx context.Context, b Broadcaster, name string) (T, error) {
+	var zero T
+	v, err := b.Broadcast(ctx, name)
+	if err != nil {
+		return zero, err
+	}
+	if typed, ok := v.(T); ok {
+		return typed, nil
+	}
+	blob, err := json.Marshal(v)
+	if err != nil {
+		return zero, Permanent(fmt.Errorf("broadcast %q: %w", name, err))
+	}
+	var out T
+	if err := json.Unmarshal(blob, &out); err != nil {
+		return zero, Permanent(fmt.Errorf("broadcast %q: cannot decode as %T: %w", name, out, err))
+	}
+	return out, nil
 }
