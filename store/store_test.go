@@ -25,6 +25,92 @@ func TestCASRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBroadcastsShareOneCopy(t *testing.T) {
+	cas, err := NewCAS("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := NewBroadcasts(cas)
+
+	table := map[string]string{"US": "United States", "FR": "France"}
+	hash, err := b.Register("countries", table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash == "" || b.Hashes()["countries"] != hash {
+		t.Fatalf("Hashes() = %v, want countries → %s", b.Hashes(), hash)
+	}
+
+	// Identical content under a second name is the same blob: broadcasts are
+	// stored by content, so sharing costs one copy no matter how many
+	// references point at it.
+	same, err := b.Register("countries-alias", map[string]string{"FR": "France", "US": "United States"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same != hash {
+		t.Error("identical broadcast content must deduplicate to one artifact")
+	}
+
+	// Executors resolve by hash, never by name — that is what lets a worker
+	// holding only an envelope serve the value.
+	v, err := b.Resolve(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := v.(map[string]any)
+	if !ok || m["US"] != "United States" {
+		t.Fatalf("Resolve = %#v, want the registered table", v)
+	}
+
+	// The decode is memoized: repeated reads return the very same value.
+	again, err := b.Resolve(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, _ := again.(map[string]any)
+	if len(m2) != len(m) {
+		t.Error("repeated resolution must return the shared value")
+	}
+
+	if _, err := b.Resolve("0000"); err == nil {
+		t.Error("resolving an unknown artifact must fail")
+	}
+	if _, err := b.Register("bad", func() {}); err == nil {
+		t.Error("a non-serializable broadcast must be rejected at registration")
+	}
+	if b.Len() != 2 {
+		t.Errorf("Len = %d, want 2", b.Len())
+	}
+}
+
+// TestBroadcastsSurviveRestart proves the sharing story across processes: a
+// broadcast written by one run resolves in the next from the same state dir,
+// with nothing in memory to carry it.
+func TestBroadcastsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	first, err := NewCAS(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := NewBroadcasts(first).Register("rubric", "score 1-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := NewCAS(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := NewBroadcasts(second).Resolve(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "score 1-5" {
+		t.Errorf("resolved %#v across restart, want the original value", v)
+	}
+}
+
 func TestKeyDeterminism(t *testing.T) {
 	a1, err := Key("op", map[string]any{"b": 2, "a": 1}, []string{"x"})
 	if err != nil {

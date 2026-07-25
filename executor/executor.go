@@ -12,6 +12,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/zionrubin/brian-ai/loom/core"
@@ -31,10 +32,10 @@ type Executor interface {
 // while executing one task. Everything it exposes is checked against the
 // task's envelope.
 type Runtime struct {
-	Env    task.Envelope
-	TaskID string
-	Models *ModelClient
-	Tools  core.Tools
+	Env     task.Envelope
+	TaskID  string
+	Models  *ModelClient
+	Session core.Session // grant-checked tools and broadcast reads
 }
 
 // OpRunner executes one stage's operation for one task. Implementations live
@@ -204,17 +205,91 @@ func (b boundTools) Invoke(ctx context.Context, name string, args map[string]any
 	return tool.Invoke(ctx, args)
 }
 
+// BindBroadcasts returns the capability-checked broadcast surface for one
+// task. A read is served only when the envelope both grants the name and
+// carries its content hash; the value itself comes from shared
+// content-addressed storage, so tasks and executors reference one copy rather
+// than each carrying their own.
+//
+// Allowed reads are audited once per task and name: a broadcast read inside a
+// map over a million records would otherwise drown the audit log without
+// recording anything the first line didn't already say. Denials are always
+// audited.
+func BindBroadcasts(shared *store.Broadcasts, env task.Envelope, audit *security.AuditLog, taskID string) core.Broadcaster {
+	return &boundBroadcasts{shared: shared, env: env, audit: audit, taskID: taskID, seen: map[string]bool{}}
+}
+
+type boundBroadcasts struct {
+	shared *store.Broadcasts
+	env    task.Envelope
+	audit  *security.AuditLog
+	taskID string
+
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (b *boundBroadcasts) Broadcast(ctx context.Context, name string) (any, error) {
+	if !b.env.Grants.Has(security.DataCap(name)) {
+		b.record(name, false, "capability not granted")
+		return nil, core.Permanent(fmt.Errorf("broadcast %q: capability not granted", name))
+	}
+	hash, ok := b.env.Broadcasts[name]
+	if !ok {
+		b.record(name, false, "not present in the task envelope")
+		return nil, core.Permanent(fmt.Errorf("broadcast %q: not present in the task envelope", name))
+	}
+	if b.shared == nil {
+		b.record(name, false, "no broadcast store configured")
+		return nil, core.Permanent(fmt.Errorf("broadcast %q: no broadcast store configured", name))
+	}
+	v, err := b.shared.Resolve(hash)
+	if err != nil {
+		b.record(name, false, err.Error())
+		return nil, core.Permanent(fmt.Errorf("broadcast %q: %w", name, err))
+	}
+	b.recordOnce(name)
+	return v, nil
+}
+
+// recordOnce audits the first allowed read of name by this task.
+func (b *boundBroadcasts) recordOnce(name string) {
+	b.mu.Lock()
+	first := !b.seen[name]
+	b.seen[name] = true
+	b.mu.Unlock()
+	if first {
+		b.record(name, true, "")
+	}
+}
+
+func (b *boundBroadcasts) record(name string, allowed bool, reason string) {
+	if b.audit != nil {
+		b.audit.Record(security.AuditEntry{
+			TaskID: b.taskID, Action: "broadcast.read", Subject: name,
+			Allowed: allowed, Reason: reason,
+		})
+	}
+}
+
+// session joins the two capability-checked surfaces ops are handed.
+type session struct {
+	core.Tools
+	core.Broadcaster
+}
+
 // Local executes tasks in-process with the Inline sandbox profile. It
 // implements the cache short-circuit, per-task deadlines from the envelope
 // budget, and lineage recording.
 type Local struct {
-	Runners map[string]OpRunner
-	Client  *ModelClient
-	Tools   *ToolSet
-	Audit   *security.AuditLog
-	Cache   *store.Cache
-	Lineage *store.Lineage
-	Bus     *observe.Bus
+	Runners    map[string]OpRunner
+	Client     *ModelClient
+	Tools      *ToolSet
+	Broadcasts *store.Broadcasts
+	Audit      *security.AuditLog
+	Cache      *store.Cache
+	Lineage    *store.Lineage
+	Bus        *observe.Bus
 }
 
 // Execute implements Executor.
@@ -257,7 +332,10 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 		Env:    t.Envelope,
 		TaskID: t.ID,
 		Models: l.Client,
-		Tools:  BindTools(l.Tools, t.Envelope, l.Audit, t.ID),
+		Session: session{
+			Tools:       BindTools(l.Tools, t.Envelope, l.Audit, t.ID),
+			Broadcaster: BindBroadcasts(l.Broadcasts, t.Envelope, l.Audit, t.ID),
+		},
 	}
 
 	out, usage, modelUsed, err := runner.Run(ctx, rt, t)
@@ -271,12 +349,13 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	}
 	if l.Lineage != nil {
 		l.Lineage.Record(store.LineageEntry{
-			Artifact: artifact,
-			RunID:    t.Envelope.RunID,
-			Stage:    t.Stage,
-			Op:       t.Fingerprint,
-			Model:    modelUsed,
-			Inputs:   store.RecordHashes(t.Input),
+			Artifact:   artifact,
+			RunID:      t.Envelope.RunID,
+			Stage:      t.Stage,
+			Op:         t.Fingerprint,
+			Model:      modelUsed,
+			Inputs:     store.RecordHashes(t.Input),
+			Broadcasts: t.Envelope.Broadcasts,
 		})
 	}
 

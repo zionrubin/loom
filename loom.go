@@ -12,6 +12,8 @@ package loom
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/zionrubin/brian-ai/loom/core"
@@ -38,6 +40,7 @@ type Config struct {
 	StateDir        string
 	ContinueOnError bool
 	Tools           []executor.Tool
+	Broadcasts      map[string]any
 	EventHandler    func(observe.Event)
 }
 
@@ -84,6 +87,28 @@ func WithTools(tools ...executor.Tool) Option {
 	return func(c *Config) { c.Tools = append(c.Tools, tools...) }
 }
 
+// WithBroadcast registers a value shared by every task that declares it with
+// pipeline.WithBroadcast — a lookup table, a taxonomy, a rubric, anything the
+// whole run needs to agree on.
+//
+// The value is serialized and stored once by content hash; task envelopes
+// carry the hash rather than the bytes, so a large shared table costs one copy
+// per run instead of one per task, and the tasks stay small enough to ship to
+// a remote executor. Values must be JSON-serializable, and are read-only:
+// every reader in the run sees the same value, and mutating it is a data race.
+//
+// Because the content hash is part of each reading stage's fingerprint,
+// editing a broadcast invalidates exactly the cached results that could have
+// seen it and leaves the rest of the run's cache warm.
+func WithBroadcast(name string, value any) Option {
+	return func(c *Config) {
+		if c.Broadcasts == nil {
+			c.Broadcasts = map[string]any{}
+		}
+		c.Broadcasts[name] = value
+	}
+}
+
 // WithEventHandler attaches a synchronous observer of all run events.
 func WithEventHandler(fn func(observe.Event)) Option {
 	return func(c *Config) { c.EventHandler = fn }
@@ -99,6 +124,7 @@ type RunResult struct {
 	Failures     []runtime.Failure
 	Lineage      []store.LineageEntry
 	Audit        []security.AuditEntry
+	Broadcasts   map[string]string // shared value name → content hash
 	Spent        core.Usage
 }
 
@@ -141,7 +167,16 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 	}
 	defer cache.Close()
 
-	pl, err := plan.Compile(p, cfg.Registry)
+	// Broadcasts are stored once, before anything runs: from here on tasks
+	// carry content hashes, not copies.
+	broadcasts := store.NewBroadcasts(cas)
+	for _, name := range slices.Sorted(maps.Keys(cfg.Broadcasts)) {
+		if _, err := broadcasts.Register(name, cfg.Broadcasts[name]); err != nil {
+			return nil, err
+		}
+	}
+
+	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(broadcasts.Hashes()))
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +188,8 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 	client := &executor.ModelClient{Registry: cfg.Registry, Broker: broker, Audit: audit, Bus: bus}
 	local := &executor.Local{
 		Runners: runners, Client: client, Tools: executor.NewToolSet(cfg.Tools...),
-		Audit: audit, Cache: cache, Lineage: lineage, Bus: bus,
+		Broadcasts: broadcasts,
+		Audit:      audit, Cache: cache, Lineage: lineage, Bus: bus,
 	}
 	governor := runtime.NewGovernor(cfg.RunBudget)
 	limiter := runtime.NewRateLimiter()
@@ -180,6 +216,7 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 			Failures:     failures,
 			Lineage:      lineage.Entries(),
 			Audit:        audit.Entries(),
+			Broadcasts:   broadcasts.Hashes(),
 			Spent:        governor.Spent(),
 		}
 		if term := pl.Terminal(); len(term) == 1 {
@@ -324,6 +361,10 @@ func stageDetail(s *pipeline.Stage) string {
 		line("%s stage, applied per record", s.Kind)
 	}
 
+	if len(s.Opts.Broadcasts) > 0 {
+		names := slices.Sorted(slices.Values(s.Opts.Broadcasts))
+		line("broadcasts readable: %s", strings.Join(slices.Compact(names), ", "))
+	}
 	if s.Opts.BatchSize > 1 {
 		line("batch: %d records per task", s.Opts.BatchSize)
 	}

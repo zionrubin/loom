@@ -28,13 +28,15 @@ func BuildRunners(pl *plan.Plan) (map[string]executor.OpRunner, error) {
 		case pipeline.KindFused:
 			runners[s.ID] = &fusedRunner{stages: s.Fused}
 		case pipeline.KindInfer:
-			tmpl, err := template.New(s.ID).Option("missingkey=error").Parse(s.Infer.Prompt)
+			tmpl, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(s.Infer.Prompt)
 			if err != nil {
 				return nil, err
 			}
 			runners[s.ID] = &inferRunner{spec: s.Infer, tmpl: tmpl}
 		case pipeline.KindReduceAI:
-			tmpl, err := template.New(s.ID).Parse(s.Reduce.Prompt)
+			tmpl, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Parse(s.Reduce.Prompt)
 			if err != nil {
 				return nil, err
 			}
@@ -57,6 +59,43 @@ func resolveModel(rt *executor.Runtime, t task.Task) (string, error) {
 		return "", core.Permanent(err)
 	}
 	return info.ID, nil
+}
+
+// bindTemplate returns a template whose broadcast functions resolve against
+// the values this task's envelope grants.
+//
+// Each task gets its own clone. The runner's template is shared by every
+// concurrently executing task of the stage, so rebinding functions on it in
+// place would race; cloning is cheap next to a model call. Clone starts the
+// copy with default options, so the caller's options are re-applied here.
+func bindTemplate(ctx context.Context, tmpl *template.Template, rt *executor.Runtime, opts ...string) (*template.Template, error) {
+	if len(rt.Env.Broadcasts) == 0 {
+		return tmpl, nil
+	}
+	bound, err := tmpl.Clone()
+	if err != nil {
+		return nil, core.Permanent(fmt.Errorf("bind prompt template: %w", err))
+	}
+	for _, o := range opts {
+		bound.Option(o)
+	}
+	bound.Funcs(template.FuncMap{
+		"broadcast": func(name string) (any, error) {
+			return rt.Session.Broadcast(ctx, name)
+		},
+		"broadcastJSON": func(name string) (string, error) {
+			v, err := rt.Session.Broadcast(ctx, name)
+			if err != nil {
+				return "", err
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				return "", core.Permanent(fmt.Errorf("broadcast %q: %w", name, err))
+			}
+			return string(b), nil
+		},
+	})
+	return bound, nil
 }
 
 // contextPrefix renders envelope context fragments as a prompt preamble.
@@ -88,12 +127,16 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 		maxTokens = 1024
 	}
 	prefix := contextPrefix(rt.Env)
+	tmpl, err := bindTemplate(ctx, r.tmpl, rt, "missingkey=error")
+	if err != nil {
+		return nil, core.Usage{}, modelID, err
+	}
 
 	var usage core.Usage
 	out := make([]core.Record, 0, len(t.Input))
 	for _, rec := range t.Input {
 		var sb strings.Builder
-		if err := r.tmpl.Execute(&sb, rec.Data); err != nil {
+		if err := tmpl.Execute(&sb, rec.Data); err != nil {
 			return nil, usage, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 		}
 		resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
@@ -161,8 +204,12 @@ func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Tas
 	for _, rec := range t.Input {
 		items = append(items, rec.String(itemField))
 	}
+	tmpl, err := bindTemplate(ctx, r.tmpl, rt)
+	if err != nil {
+		return nil, core.Usage{}, modelID, err
+	}
 	var sb strings.Builder
-	if err := r.tmpl.Execute(&sb, map[string]any{"Items": items, "Count": len(items)}); err != nil {
+	if err := tmpl.Execute(&sb, map[string]any{"Items": items, "Count": len(items)}); err != nil {
 		return nil, core.Usage{}, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 	}
 	resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
@@ -194,7 +241,7 @@ func (r *fusedRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 				var out core.Record
 				var err error
 				if s.MapCtxFn != nil {
-					out, err = s.MapCtxFn(ctx, rt.Tools, rec.Clone())
+					out, err = s.MapCtxFn(ctx, rt.Session, rec.Clone())
 				} else {
 					out, err = s.MapFn(rec.Clone())
 				}

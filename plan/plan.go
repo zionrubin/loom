@@ -7,6 +7,7 @@ package plan
 
 import (
 	"fmt"
+	"sort"
 	"text/template"
 
 	"github.com/zionrubin/brian-ai/loom/core"
@@ -21,8 +22,25 @@ import (
 type StagePlan struct {
 	Stage       *pipeline.Stage
 	Fingerprint string
-	Candidates  []model.Info // resolved binding ladder for AI stages
+	Candidates  []model.Info      // resolved binding ladder for AI stages
+	Broadcasts  map[string]string // declared shared values → content hash
 	Cacheable   bool
+}
+
+// Option configures compilation.
+type Option func(*compileOpts)
+
+type compileOpts struct {
+	broadcasts map[string]string
+}
+
+// WithBroadcasts supplies the run's registered shared values as name →
+// content hash. A stage may only declare broadcasts present here (typos fail
+// compilation rather than the first model call), and every hash a stage
+// declares is folded into its fingerprint, so changing a broadcast's value
+// invalidates exactly the cached results that could have observed it.
+func WithBroadcasts(hashes map[string]string) Option {
+	return func(o *compileOpts) { o.broadcasts = hashes }
 }
 
 // Plan is the compiled pipeline.
@@ -49,7 +67,11 @@ func isPure(k pipeline.StageKind) bool {
 }
 
 // Compile validates and optimizes the pipeline against the registry.
-func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
+func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, error) {
+	var co compileOpts
+	for _, o := range opts {
+		o(&co)
+	}
 	stages := p.Stages()
 	if len(stages) == 0 {
 		return nil, fmt.Errorf("pipeline %q has no stages", p.Name)
@@ -130,13 +152,20 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
 	for _, s := range order {
 		sp := &StagePlan{Stage: s}
 
+		bcast, err := resolveBroadcasts(s, co.broadcasts)
+		if err != nil {
+			return nil, err
+		}
+		sp.Broadcasts = bcast
+
 		switch s.Kind {
 		case pipeline.KindInfer:
 			spec := s.Infer
 			if spec.Prompt == "" {
 				return nil, fmt.Errorf("stage %q: empty prompt template", s.ID)
 			}
-			if _, err := template.New(s.ID).Option("missingkey=error").Parse(spec.Prompt); err != nil {
+			if _, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(spec.Prompt); err != nil {
 				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
 			}
 			cands, err := reg.Candidates(spec.Binding)
@@ -145,7 +174,7 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = store.Key("infer", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, "infer", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
 				fragmentKey(spec.Context), s.Opts.Version)
 			if err != nil {
@@ -157,7 +186,8 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
 			if spec.Prompt == "" {
 				return nil, fmt.Errorf("stage %q: empty prompt template", s.ID)
 			}
-			if _, err := template.New(s.ID).Parse(spec.Prompt); err != nil {
+			if _, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Parse(spec.Prompt); err != nil {
 				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
 			}
 			cands, err := reg.Candidates(spec.Binding)
@@ -166,7 +196,7 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = store.Key("reduce_ai", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, "reduce_ai", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.FanIn, spec.MaxTokens, spec.ItemField, spec.OutputField,
 				s.Opts.Version)
 			if err != nil {
@@ -178,8 +208,7 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry) (*Plan, error) {
 			for _, r := range s.Fused {
 				names = append(names, string(r.Kind)+":"+r.ID)
 			}
-			var err error
-			sp.Fingerprint, err = store.Key("fused", names, s.Opts.Version)
+			sp.Fingerprint, err = fingerprint(sp, "fused", names, s.Opts.Version)
 			if err != nil {
 				return nil, err
 			}
@@ -237,6 +266,7 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 		if s.Opts.NoCache {
 			o.NoCache = true
 		}
+		o.Broadcasts = append(o.Broadcasts, s.Opts.Broadcasts...)
 		if s.Opts.Budget.MaxDuration > 0 {
 			o.Budget.MaxDuration = s.Opts.Budget.MaxDuration
 		}
@@ -269,11 +299,62 @@ func fragmentKey(frags []task.Fragment) []map[string]string {
 	return out
 }
 
+// resolveBroadcasts maps the names a stage declared to the content hashes of
+// the run's registered values, rejecting names that were never registered —
+// a typo should fail compilation, not the first model call.
+func resolveBroadcasts(s *pipeline.Stage, registered map[string]string) (map[string]string, error) {
+	if len(s.Opts.Broadcasts) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(s.Opts.Broadcasts))
+	for _, name := range s.Opts.Broadcasts {
+		hash, ok := registered[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"stage %q: broadcast %q is not registered for this run (loom.WithBroadcast)", s.ID, name)
+		}
+		out[name] = hash
+	}
+	return out, nil
+}
+
+// broadcastKey renders a stage's declared broadcasts as a deterministic
+// fingerprint component. Hashing the *values* (via their content hashes), not
+// just the names, is what makes the cache honest: edit a broadcast and the
+// stages that read it recompute, while stages that never declared it keep
+// their cached results.
+func broadcastKey(m map[string]string) []map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]map[string]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, map[string]string{"name": n, "hash": m[n]})
+	}
+	return out
+}
+
+// fingerprint hashes a stage's op spec, appending the broadcast component
+// only when the stage declares one — so adding this feature leaves the
+// fingerprints (and therefore the warm caches) of existing pipelines
+// untouched.
+func fingerprint(sp *StagePlan, parts ...any) (string, error) {
+	if bk := broadcastKey(sp.Broadcasts); bk != nil {
+		parts = append(parts, bk)
+	}
+	return store.Key(parts...)
+}
+
 // Envelope assembles the least-privilege envelope for one of this stage's
 // tasks: capability grants for exactly the binding's candidate models and
 // their secrets, an egress allowlist of exactly those providers' endpoints
-// (plus extraEgress for tools), the stage's context bundle, budget, and
-// sandbox profile.
+// (plus extraEgress for tools), the stage's context bundle, the content
+// hashes of exactly the broadcasts it declared, budget, and sandbox profile.
 func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope {
 	s := sp.Stage
 	var caps []security.Capability
@@ -300,20 +381,32 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 	}
 	caps = append(caps, s.Opts.Grants...)
 
+	// Broadcasts travel as references: the grant authorizes the name, the
+	// hash locates the bytes in content-addressed storage.
+	var bcast map[string]string
+	if len(sp.Broadcasts) > 0 {
+		bcast = make(map[string]string, len(sp.Broadcasts))
+		for name, hash := range sp.Broadcasts {
+			bcast[name] = hash
+			caps = append(caps, security.DataCap(name))
+		}
+	}
+
 	sandbox := s.Opts.Sandbox
 	if sandbox == "" {
 		sandbox = task.SandboxInline
 	}
 
 	return task.Envelope{
-		RunID:   runID,
-		Stage:   s.ID,
-		Binding: binding,
-		Grants:  security.NewGrantSet(caps...),
-		Egress:  security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
-		Context: ctxBundle,
-		Budget:  s.Opts.Budget,
-		Sandbox: sandbox,
+		RunID:      runID,
+		Stage:      s.ID,
+		Binding:    binding,
+		Grants:     security.NewGrantSet(caps...),
+		Egress:     security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
+		Context:    ctxBundle,
+		Broadcasts: bcast,
+		Budget:     s.Opts.Budget,
+		Sandbox:    sandbox,
 	}
 }
 

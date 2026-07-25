@@ -200,18 +200,115 @@ func (c *Cache) Close() error {
 	return nil
 }
 
+// Broadcasts holds a run's shared read-only values. Each value is serialized
+// and stored in the CAS once; task envelopes carry only the resulting content
+// hash. That indirection is what makes a value shareable between tasks and
+// between executors: a table read by ten thousand tasks is stored once, and a
+// remote worker fetches it once rather than receiving a copy per task.
+//
+// Values are JSON-serializable by construction, so a task that references one
+// stays shippable to another process or machine. Registration happens once,
+// before any task runs; afterwards the type is read-only and safe for
+// concurrent use.
+type Broadcasts struct {
+	cas *CAS
+
+	mu     sync.RWMutex
+	hashes map[string]string // name → content hash
+	values map[string]any    // content hash → decoded value (memoized)
+}
+
+// NewBroadcasts returns an empty broadcast set backed by cas.
+func NewBroadcasts(cas *CAS) *Broadcasts {
+	return &Broadcasts{cas: cas, hashes: map[string]string{}, values: map[string]any{}}
+}
+
+// Register serializes value, stores it in the CAS, and binds it to name,
+// returning the content hash. Registering identical content twice costs
+// nothing extra: the CAS deduplicates by hash.
+func (b *Broadcasts) Register(name string, value any) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("broadcast: empty name")
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("broadcast %q: value must be JSON-serializable: %w", name, err)
+	}
+	hash, err := b.cas.Put(blob)
+	if err != nil {
+		return "", fmt.Errorf("broadcast %q: %w", name, err)
+	}
+	b.mu.Lock()
+	b.hashes[name] = hash
+	b.mu.Unlock()
+	return hash, nil
+}
+
+// Hashes returns name → content hash for every registered broadcast. The
+// planner folds the hashes a stage declares into that stage's fingerprint, so
+// changing a broadcast's value invalidates exactly the cached results that
+// could have observed it.
+func (b *Broadcasts) Hashes() map[string]string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make(map[string]string, len(b.hashes))
+	for k, v := range b.hashes {
+		out[k] = v
+	}
+	return out
+}
+
+// Resolve decodes the value stored under a content hash, memoizing the decode
+// so repeated reads across tasks cost one map lookup. Executors resolve by
+// hash rather than by name: a worker holding nothing but an envelope can serve
+// the value straight from shared storage.
+//
+// The returned value is shared with every other reader and must not be
+// mutated.
+func (b *Broadcasts) Resolve(hash string) (any, error) {
+	b.mu.RLock()
+	v, ok := b.values[hash]
+	b.mu.RUnlock()
+	if ok {
+		return v, nil
+	}
+	blob, ok := b.cas.Get(hash)
+	if !ok {
+		return nil, fmt.Errorf("broadcast artifact %s: not found", hash)
+	}
+	var decoded any
+	if err := json.Unmarshal(blob, &decoded); err != nil {
+		return nil, fmt.Errorf("broadcast artifact %s: %w", hash, err)
+	}
+	b.mu.Lock()
+	b.values[hash] = decoded
+	b.mu.Unlock()
+	return decoded, nil
+}
+
+// Len returns the number of registered broadcasts.
+func (b *Broadcasts) Len() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.hashes)
+}
+
 // LineageEntry records how an artifact came to exist: the operation
 // fingerprint, model, and input hashes. Together with the CAS this gives
 // reproducibility and audit: any output can be traced to the exact op,
 // model, and inputs that produced it.
 type LineageEntry struct {
-	Artifact string    `json:"artifact"`
-	RunID    string    `json:"run_id"`
-	Stage    string    `json:"stage"`
-	Op       string    `json:"op"`
-	Model    string    `json:"model,omitempty"`
-	Inputs   []string  `json:"inputs,omitempty"`
-	Time     time.Time `json:"time"`
+	Artifact string   `json:"artifact"`
+	RunID    string   `json:"run_id"`
+	Stage    string   `json:"stage"`
+	Op       string   `json:"op"`
+	Model    string   `json:"model,omitempty"`
+	Inputs   []string `json:"inputs,omitempty"`
+	// Broadcasts names the run-level shared values (name → content hash) the
+	// producing task could read. They are inputs too — just ones that arrived
+	// by reference rather than in the record stream.
+	Broadcasts map[string]string `json:"broadcasts,omitempty"`
+	Time       time.Time         `json:"time"`
 }
 
 // Lineage is an append-only, concurrency-safe lineage log.

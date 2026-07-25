@@ -1,12 +1,15 @@
 package plan
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/zionrubin/brian-ai/loom/core"
 	"github.com/zionrubin/brian-ai/loom/model"
 	"github.com/zionrubin/brian-ai/loom/pipeline"
 	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/brian-ai/loom/store"
 )
 
 func reg(t *testing.T) *model.Registry {
@@ -110,6 +113,129 @@ func TestEnvelopeLeastPrivilege(t *testing.T) {
 	}
 	if env.Egress.Allowed("evil.example") {
 		t.Error("egress must deny unlisted hosts")
+	}
+}
+
+// inferWithBroadcasts compiles a one-stage pipeline whose Infer stage declares
+// the given broadcast names, against a run offering `offered`.
+func inferWithBroadcasts(t *testing.T, offered map[string]string, declared ...string) (*Plan, error) {
+	t.Helper()
+	p := pipeline.New("t")
+	src := p.FromRecords("src", nil)
+	var opts []pipeline.Option
+	if len(declared) > 0 {
+		opts = append(opts, pipeline.WithBroadcast(declared...))
+	}
+	src.Infer("classify", pipeline.InferSpec{
+		Binding: model.Binding{Model: "small"},
+		Prompt:  `Using {{broadcast "taxonomy"}}, classify {{.text}}`,
+	}, opts...)
+	return Compile(p, reg(t), WithBroadcasts(offered))
+}
+
+func TestBroadcastEnvelopeLeastPrivilege(t *testing.T) {
+	offered := map[string]string{"taxonomy": "hash-a", "salaries": "hash-secret"}
+	pl, err := inferWithBroadcasts(t, offered, "taxonomy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := pl.ByID["classify"].Envelope("run1", nil)
+
+	if !env.Grants.Has(security.DataCap("taxonomy")) {
+		t.Error("envelope must grant the declared broadcast")
+	}
+	if env.Grants.Has(security.DataCap("salaries")) {
+		t.Error("envelope must not grant a broadcast the stage never declared")
+	}
+	if env.Broadcasts["taxonomy"] != "hash-a" {
+		t.Errorf("envelope should reference the value by hash, got %v", env.Broadcasts)
+	}
+	if _, leaked := env.Broadcasts["salaries"]; leaked {
+		t.Error("undeclared broadcasts must not appear in the envelope")
+	}
+}
+
+func TestBroadcastUnregisteredFailsCompilation(t *testing.T) {
+	_, err := inferWithBroadcasts(t, map[string]string{"taxonomy": "hash-a"}, "typo")
+	if err == nil {
+		t.Fatal("declaring an unregistered broadcast must fail compilation")
+	}
+	if !strings.Contains(err.Error(), "typo") {
+		t.Errorf("error should name the offending broadcast, got %v", err)
+	}
+}
+
+// TestBroadcastValueInvalidatesCache is the correctness property that makes
+// broadcasts safe to combine with content-addressed caching: the value's hash
+// is part of the reading stage's fingerprint, so editing a broadcast
+// recomputes the stages that read it — and only those.
+func TestBroadcastValueInvalidatesCache(t *testing.T) {
+	v1, err := inferWithBroadcasts(t, map[string]string{"taxonomy": "hash-a"}, "taxonomy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := inferWithBroadcasts(t, map[string]string{"taxonomy": "hash-b"}, "taxonomy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1.ByID["classify"].Fingerprint == v2.ByID["classify"].Fingerprint {
+		t.Error("changing a broadcast's value must change the reading stage's fingerprint")
+	}
+
+	same, err := inferWithBroadcasts(t, map[string]string{"taxonomy": "hash-a"}, "taxonomy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.ByID["classify"].Fingerprint != v1.ByID["classify"].Fingerprint {
+		t.Error("an unchanged broadcast must leave the fingerprint stable")
+	}
+
+	// A stage that reads no broadcast keeps the fingerprint it had before
+	// broadcasts existed, so introducing the feature does not cold-start
+	// anyone's cache.
+	none, err := inferWithBroadcasts(t, map[string]string{"taxonomy": "hash-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := store.Key("infer",
+		map[string]any{"model": "small", "tier": "", "escalation": []string(nil)},
+		"", `Using {{broadcast "taxonomy"}}, classify {{.text}}`, 0, false, "",
+		[]map[string]string{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.ByID["classify"].Fingerprint != want {
+		t.Error("a stage declaring no broadcasts must keep its pre-existing fingerprint")
+	}
+}
+
+// TestBroadcastGrantsSurviveFusion checks that fusing pure stages unions the
+// broadcasts its members declared, rather than dropping the ones that belonged
+// to absorbed stages.
+func TestBroadcastGrantsSurviveFusion(t *testing.T) {
+	p := pipeline.New("t")
+	src := p.FromRecords("src", nil)
+	src.
+		MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+			return r, nil
+		}, pipeline.WithBroadcast("taxonomy")).
+		Filter("keep", func(r core.Record) (bool, error) { return true, nil },
+			pipeline.WithBroadcast("regions"))
+
+	pl, err := Compile(p, reg(t), WithBroadcasts(map[string]string{
+		"taxonomy": "hash-a", "regions": "hash-b",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := pl.ByID["keep"].Envelope("run1", nil)
+	for _, name := range []string{"taxonomy", "regions"} {
+		if !env.Grants.Has(security.DataCap(name)) {
+			t.Errorf("fused envelope lost the %q grant", name)
+		}
+		if env.Broadcasts[name] == "" {
+			t.Errorf("fused envelope lost the %q reference", name)
+		}
 	}
 }
 

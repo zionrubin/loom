@@ -22,10 +22,11 @@ func TestTaskSerializability(t *testing.T) {
 			Binding: model.Binding{Model: "small", Escalation: []string{"big"}},
 			Grants: security.NewGrantSet(
 				security.ModelCap("small"), security.SecretCap("key")),
-			Egress:  security.EgressPolicy{Hosts: []string{"api.example.com"}},
-			Context: ContextBundle{System: "sys", Fragments: []Fragment{{Name: "doc", Content: "body"}}},
-			Budget:  core.Budget{MaxDuration: 5 * time.Second, MaxAttempts: 2},
-			Sandbox: SandboxInline,
+			Egress:     security.EgressPolicy{Hosts: []string{"api.example.com"}},
+			Context:    ContextBundle{System: "sys", Fragments: []Fragment{{Name: "doc", Content: "body"}}},
+			Broadcasts: map[string]string{"taxonomy": "abc123"},
+			Budget:     core.Budget{MaxDuration: 5 * time.Second, MaxAttempts: 2},
+			Sandbox:    SandboxInline,
 		},
 		CacheKey: "ck", EstTokens: 100,
 	}
@@ -54,6 +55,11 @@ func TestTaskSerializability(t *testing.T) {
 	}
 	if back.Envelope.Context.Fragments[0].Content != "body" {
 		t.Error("context bundle lost in round trip")
+	}
+	// Broadcasts cross the wire as references, so a shared value costs the
+	// same on the wire whether it is a kilobyte or a gigabyte.
+	if back.Envelope.Broadcasts["taxonomy"] != "abc123" {
+		t.Error("broadcast references lost in round trip")
 	}
 	if back.Input[0].String("text") != "hello" {
 		t.Error("input records lost in round trip")
