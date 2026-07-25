@@ -91,6 +91,10 @@ makes each difference a first-class concept — see
   tokens, cost, retries, and logs; selecting a star draws its lineage (which
   tasks merged into it and where its output went), and clicking a stage name
   opens an inspector with the stage's spec, prompt template, and live stats.
+  When a run completes, a **run summary** overlay (also on `s`) recaps every
+  step — tasks, records, retries, cache hits, tokens, cost, p95 per stage —
+  what each shared value saved by being referenced instead of copied, and
+  per-executor utilization.
 - **Providers** — a deterministic mock (offline dev, scripted failures) plus
   Anthropic and OpenAI adapters over the official SDKs with per-call
   broker-resolved credentials. The `model.Provider` interface is small; add
@@ -126,6 +130,14 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 # same pipeline on OpenAI (GPT-5.4 family) + live constellation view
 OPENAI_API_KEY=sk-... go run ./examples/openai-review
 # then open http://localhost:8077
+
+# the broadcast + multi-task-executor showcase on OpenAI: shared catalog/
+# policy/voice-rubric knowledge read by reference across every task, an
+# end-of-run summary of what that saved, and selective cache invalidation
+# when the shared policy is edited (see examples/support-desk/README.md)
+LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk
+LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk  # all cached, $0
+LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -policy v2  # only policy readers recompute
 ```
 
 ## Package map
@@ -198,6 +210,11 @@ Broadcasts are read-only for the run's lifetime. For state that accumulates
 *across* records, use `Combine` or `ReduceAI` at a stage boundary — shared
 mutable state would make cached results depend on execution order, which is
 precisely what content-addressed caching assumes away.
+
+[`examples/support-desk`](./examples/support-desk) turns these properties
+into numbers on real OpenAI models: how many bytes the run avoided copying,
+which stages recompute when a shared value is edited, and a live view of
+every broadcast read.
 
 ## Design notes
 
