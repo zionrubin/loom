@@ -68,12 +68,20 @@ makes each difference a first-class concept — see
   failures back off, semantic failures (bad output) climb the model
   escalation ladder, permanent failures dead-letter, budget exhaustion
   stops the run.
+- **Broadcast values** — register a lookup table, taxonomy, or rubric once
+  per run with `loom.WithBroadcast`; stages opt in with
+  `pipeline.WithBroadcast`. The value is stored once by content hash and
+  *referenced* by every task that reads it, so sharing costs one copy per
+  run rather than one per task and the tasks stay small enough to ship to a
+  remote executor. Reads are grant-checked and audited like any other
+  capability, and the value's hash joins the reading stage's fingerprint —
+  edit a broadcast and exactly the results that saw it recompute.
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
   restarts with a state dir.
 - **Lineage & audit** — every artifact traces to the op, model, and inputs
-  that produced it; every secret/tool/egress decision is audited.
+  that produced it; every secret/tool/egress/broadcast decision is audited.
 - **Observability** — a typed event bus and per-stage run reports: tasks,
   failures, retries, cache hits, tokens, dollars, latency percentiles. Plus
   the **constellation view** (`viz`): a live, zero-dependency web UI that
@@ -138,6 +146,58 @@ OPENAI_API_KEY=sk-... go run ./examples/openai-review
 | `observe` | Event bus, metrics collector, run reports |
 | `viz` | Constellation view: live web visualization of a run (tasks and executors as stars) |
 | `task` | Task + envelope types (serializable — the distribution seam) |
+
+## Sharing data across tasks
+
+Tasks are isolated by design — each one gets its own records and its own
+envelope, which is what lets them run anywhere. When many tasks need the *same*
+side data, broadcast it: registered once per run, stored once by content hash,
+and referenced (never copied) by the tasks that ask for it.
+
+```go
+regions := map[string]string{"t1": "EMEA", "t2": "APAC"} // any JSON-serializable value
+
+src.
+    // Go ops read broadcasts through the task's capability-checked session.
+    MapTools("region", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+        table, err := core.BroadcastAs[map[string]string](ctx, s, "regions")
+        if err != nil {
+            return core.Record{}, err
+        }
+        r.Data["region"] = table[r.ID]
+        return r, nil
+    }, pipeline.WithBroadcast("regions")).                       // ← stage opts in
+
+    // Prompts read them with the broadcast/broadcastJSON template functions.
+    Infer("classify", pipeline.InferSpec{
+        Binding: model.Binding{Tier: model.TierFast},
+        Prompt: `Rubric: {{broadcast "rubric"}}
+Ticket in {{.region}}: {{.subject}}`,
+    }, pipeline.WithBroadcast("rubric"))
+
+loom.Run(ctx, p,
+    loom.WithBroadcast("regions", regions),                      // ← registered once
+    loom.WithBroadcast("rubric", rubricText),
+)
+```
+
+Three properties come from routing it through the envelope rather than a
+package-level variable:
+
+- **It scales past one process.** Envelopes carry a 64-byte hash, not the
+  bytes, so tasks stay shippable to a remote or sandboxed executor and each
+  worker fetches the value once instead of once per task.
+- **It stays least-privilege.** Registering a value for the run doesn't expose
+  it; a stage reads only what it declared, and reads are audited like any
+  other capability.
+- **It keeps the cache honest.** The value's content hash is part of the
+  reading stage's fingerprint, so editing a broadcast recomputes exactly the
+  stages that could have seen it and leaves the rest of the cache warm.
+
+Broadcasts are read-only for the run's lifetime. For state that accumulates
+*across* records, use `Combine` or `ReduceAI` at a stage boundary — shared
+mutable state would make cached results depend on execution order, which is
+precisely what content-addressed caching assumes away.
 
 ## Design notes
 

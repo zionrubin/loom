@@ -127,14 +127,22 @@ Every task carries an `Envelope`:
 
 ```
 Envelope{
-  Binding   — model or tier + escalation ladder
-  Grants    — capabilities: model:*, secret:*, tool:*
-  Egress    — deny-by-default host allowlist
-  Context   — the exact context bundle (system + fragments) the task needs
-  Budget    — per-task timeout / attempts / token caps
-  Sandbox   — inline | subprocess | container | wasm
+  Binding    — model or tier + escalation ladder
+  Grants     — capabilities: model:*, secret:*, tool:*, data:read:*
+  Egress     — deny-by-default host allowlist
+  Context    — the exact context bundle (system + fragments) the task needs
+  Broadcasts — run-level shared values, by name → content hash
+  Budget     — per-task timeout / attempts / token caps
+  Sandbox    — inline | subprocess | container | wasm
 }
 ```
+
+Note the asymmetry between `Context` and `Broadcasts`, which is deliberate.
+Context fragments are *copied* into every task: they are small, stage-specific,
+and part of the prompt. Broadcasts are *referenced* by content hash: they are
+potentially large, shared by the whole run, and fetched from content-addressed
+storage at the point of use. Copying a 10 MB taxonomy into 100,000 envelopes
+would cost a terabyte of task payload; referencing it costs 64 bytes each.
 
 Envelopes (and tasks) are plain JSON-serializable data — proven by test —
 which is what makes remote and sandboxed execution possible without changing
@@ -200,9 +208,21 @@ development, scripted failures), and `providers/anthropic` and
   rerun (same code, same inputs) replays completed AI work with zero model
   calls and zero cost, across process restarts when a state dir is
   configured. Partial failures resume from where they left off for free.
+- **Broadcasts** — run-level read-only values shared by every task that
+  declares them. Registered once before execution, serialized into the CAS,
+  and carried through envelopes as content hashes. This is how tasks and
+  executors share memory in Loom: not by pointing at the same mutable
+  object, which no distributed executor could honor, but by agreeing on a
+  hash whose bytes any worker can fetch from shared storage. Two properties
+  make them safe to combine with caching: the value's hash participates in
+  the reading stage's fingerprint (edit the value, and exactly the stages
+  that read it recompute), and the value is immutable for the run's
+  lifetime, so replaying a cached result cannot observe a different world
+  than the original execution did.
 - **Lineage** — every artifact records the run, stage, op fingerprint,
-  model, and input hashes that produced it: reproducibility and audit for
-  outputs whose provenance would otherwise be "a model said so".
+  model, input hashes, and broadcast hashes that produced it: reproducibility
+  and audit for outputs whose provenance would otherwise be "a model said
+  so".
 
 ### 4.8 Observability
 
@@ -217,8 +237,10 @@ retries, cache hits, token usage, dollar cost, and latency percentiles.
 
 Four cooperating mechanisms, all exercised by tests:
 
-1. **Capability grants** (`model:*`, `secret:*`, `tool:*`) — assembled
-   minimally by the planner, checked at use.
+1. **Capability grants** (`model:*`, `secret:*`, `tool:*`, `data:read:*`) —
+   assembled minimally by the planner, checked at use. Registering a
+   broadcast for a run does not expose it: a stage reads only what it
+   declared, so shared state does not become ambient state.
 2. **Secret broker** — per-call, grant-scoped, audited resolution; no
    ambient credentials.
 3. **Egress policy** — deny-by-default allowlist per task; a provider
@@ -283,8 +305,10 @@ the hard ones — the escalation ladder generalized from recovery to policy).
   cache for near-duplicate inputs.
 - **Ensemble/quorum operators** — N samples + vote or judge as a native op
   (today expressible as FlatMap → Infer → Combine).
-- **Data-access capabilities** — extend grants to datasets
-  (`data:read:<name>`) with broker-mediated loaders.
+- **Data-access capabilities** — `data:read:<name>` exists today for
+  broadcasts; extend it to externally-backed datasets with broker-mediated
+  loaders, so a stage can be granted a table it streams rather than one
+  materialized up front.
 - **Agentic operators** — multi-turn tool-using tasks inside the same
   envelope/budget/sandbox machinery.
 
@@ -293,9 +317,10 @@ the hard ones — the escalation ladder generalized from recovery to policy).
 Implemented and tested in this repository: the pipeline API, planner
 (validation, fusion, fingerprints, least-privilege envelopes), scheduler
 (admission control, governor, class-aware retries with escalation), local
-executor, capability/secret/egress/audit security, CAS + persistent cache +
-lineage, event bus + run reports, tree AI-reduce, mock, Anthropic, and
-OpenAI providers, and cross-restart cache resume.
+executor, capability/secret/egress/broadcast/audit security, CAS + persistent
+cache + lineage, content-hash-referenced broadcast values, event bus + run
+reports, tree AI-reduce, mock, Anthropic, and OpenAI providers, and
+cross-restart cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, streaming execution,

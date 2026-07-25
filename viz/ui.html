@@ -21,6 +21,7 @@
     --c-done: #0ca30c;
     --c-cached: #9085e9;
     --c-fail: #d03b3b;
+    --c-shared: #2ab5a6;
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -192,7 +193,8 @@
   <span class="li"><span class="ic" style="color:var(--c-cached)">✧</span>cache replay</span>
   <span class="li"><span class="ic" style="color:var(--c-fail)">✕</span>failed</span>
   <span class="li"><span class="ic" style="color:var(--c-running)">◇</span>executor</span>
-  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · esc</span>
+  <span class="li"><span class="ic" style="color:var(--c-shared)">⬡</span>shared value</span>
+  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · b shared · esc</span>
 </div>
 
 <div id="tooltip"></div>
@@ -212,12 +214,14 @@
 const COLORS = {
   pending: '#898781', running: '#3987e5', long: '#fab219',
   retry: '#ec835a', done: '#0ca30c', cached: '#9085e9', fail: '#d03b3b',
+  shared: '#2ab5a6',
 };
 const S = {
   run: { runId: '', startedAt: 0, endedAt: 0, done: false, note: '' },
   stages: [], stageIx: new Map(),
   tasks: [], taskIx: new Map(),
   workers: [], workerIx: new Map(),
+  broadcasts: [], broadcastIx: new Map(),
   offset: 0,          // Date.now() - server time
   layoutDirty: true,
   thresholdsDirty: true,
@@ -225,8 +229,9 @@ const S = {
   stageStatsDirty: true,
 };
 let selected = null;  // {type:'task'|'worker'|'stage', id}
-let hovered = null;       // task or worker object under the cursor
-let hoveredStage = null;  // stage object whose label is under the cursor
+let hovered = null;           // task or worker object under the cursor
+let hoveredStage = null;      // stage object whose label is under the cursor
+let hoveredBroadcast = null;  // shared-value node under the cursor
 let connState = 'connecting'; // connecting | live | reconnecting
 let lastPanelKey = '';
 let lastPanelHTML = '';
@@ -246,6 +251,7 @@ function clearState() {
   S.stages = []; S.stageIx = new Map();
   S.tasks = []; S.taskIx = new Map();
   S.workers = []; S.workerIx = new Map();
+  S.broadcasts = []; S.broadcastIx = new Map();
   S.layoutDirty = true; S.thresholdsDirty = true; S.lineageDirty = true; S.stageStatsDirty = true;
 }
 
@@ -254,6 +260,7 @@ function selectionStillValid(sel) {
   if (sel.type === 'task') return S.taskIx.has(sel.id);
   if (sel.type === 'worker') return S.workerIx.has(sel.id);
   if (sel.type === 'stage') return S.stageIx.has(sel.id);
+  if (sel.type === 'broadcast') return S.broadcastIx.has(sel.id);
   return false;
 }
 
@@ -274,6 +281,7 @@ function applySnapshot(snap) {
   (snap.stages || []).forEach(st => upsert(S.stages, S.stageIx, st));
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
+  (snap.broadcasts || []).forEach(b => upsert(S.broadcasts, S.broadcastIx, b));
   if (keep && !selectionStillValid(keep)) dropSelection();
   refreshChrome();
   if (selected && panel.classList.contains('open')) renderPanel();
@@ -295,6 +303,7 @@ function applyDelta(d) {
     if (t.status === 'completed' || t.status === 'failed') S.thresholdsDirty = true;
   }
   if (d.worker) upsert(S.workers, S.workerIx, d.worker);
+  if (d.broadcast) upsert(S.broadcasts, S.broadcastIx, d.broadcast);
   refreshChrome();
   if (selected && panel.classList.contains('open')) renderPanel();
 }
@@ -390,6 +399,15 @@ function computeLayout() {
     t._tx = st._cx + r * Math.cos(th);
     t._ty = st._cy + r * Math.sin(th) * 0.86;
     if (t._x === undefined) { t._x = t._tx; t._y = t._ty; }
+  });
+
+  // Shared values sit in their own band above the stage clusters: they are
+  // not tasks and belong to no cluster, and the run reads *down* from them.
+  const bn = S.broadcasts.length;
+  S.broadcasts.forEach((b, i) => {
+    b._tx = mX + usableW * ((i + 0.5) / Math.max(bn, 1));
+    b._ty = top + 16;
+    if (b._x === undefined) { b._x = b._tx; b._y = b._ty; }
   });
 
   const wk = S.workers.length;
@@ -629,6 +647,63 @@ function drawWorker(w, tms) {
   ctx.fillText(w.id, x, y + 21);
 }
 
+// A shared value: a hexagonal node in its own hue, distinct from the circular
+// task stars and diamond executors, with a dashed feed drawn down to every
+// stage cluster observed reading it. The dashes drift toward the consumer so
+// the direction of sharing is legible at a glance.
+function drawBroadcast(b, tms, focusName) {
+  const lit = focusName === b.id;
+  const x = b._x, y = b._y;
+
+  for (const sid of (b.stages || [])) {
+    const st = S.stageIx.get(sid);
+    if (!st || st._cx === undefined) continue;
+    ctx.save();
+    ctx.strokeStyle = COLORS.shared;
+    ctx.globalAlpha = lit ? 0.55 : 0.16;
+    ctx.lineWidth = lit ? 1.4 : 1;
+    ctx.setLineDash([4, 8]);
+    ctx.lineDashOffset = reduceMotion ? 0 : -(tms / 90) % 12;
+    ctx.beginPath();
+    ctx.moveTo(x, y + 9);
+    ctx.quadraticCurveTo((x + st._cx) / 2, (y + st._cy) / 2 - 18, st._cx, st._cy - st._rMax * 0.55);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const r = 7;
+  if (lit) glow(x, y, 26, COLORS.shared, 0.30);
+  ctx.save();
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 3;
+    const px = x + r * Math.cos(a), py = y + r * Math.sin(a);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.closePath();
+  ctx.strokeStyle = COLORS.shared;
+  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = lit ? 1 : 0.85;
+  ctx.stroke();
+  ctx.fillStyle = COLORS.shared;
+  ctx.globalAlpha = lit ? 0.42 : 0.20;
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = '10px ui-monospace, Menlo, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = COLORS.shared;
+  ctx.globalAlpha = lit ? 1 : 0.72;
+  ctx.fillText(b.id, x, y - 13);
+  if (b.readers) {
+    ctx.globalAlpha = lit ? 0.85 : 0.5;
+    ctx.fillStyle = '#c3c2b7';
+    ctx.fillText(`${b.readers} reader${b.readers === 1 ? '' : 's'}`, x, y + 21);
+  }
+  ctx.restore();
+}
+
 function draw(tms) {
   if (S.layoutDirty) computeLayout();
   if (S.thresholdsDirty) computeThresholds();
@@ -655,6 +730,7 @@ function draw(tms) {
   // ease nodes toward layout targets
   for (const t of S.tasks) { t._x += (t._tx - t._x) * .15; t._y += (t._ty - t._y) * .15; }
   for (const w of S.workers) { w._x += (w._tx - w._x) * .2; w._y += (w._ty - w._y) * .2; }
+  for (const b of S.broadcasts) { b._x += (b._tx - b._x) * .2; b._y += (b._ty - b._y) * .2; }
 
   // soft pan toward the focused node if it sits outside the visible sky
   const focusObj = (selected && (selected.type === 'task' ? S.taskIx.get(selected.id)
@@ -767,6 +843,14 @@ function draw(tms) {
     }
   }
 
+  // Shared values draw beneath the stars so their feeds never obscure a task.
+  if (S.broadcasts.length) {
+    const focusB = (selected && selected.type === 'broadcast' ? selected.id : null)
+                || (hoveredBroadcast && hoveredBroadcast.id)
+                || null;
+    for (const b of S.broadcasts) drawBroadcast(b, tms, focusB);
+  }
+
   for (const t of S.tasks) drawTask(t, now, tms);
   for (const w of S.workers) drawWorker(w, tms);
 
@@ -813,6 +897,11 @@ function hitTest(mx, my) {
     const d = (w._x - wx) ** 2 + (w._y - wy) ** 2;
     if (d < bestD) { bestD = d; best = { type: 'worker', obj: w }; }
   }
+  for (const b of S.broadcasts) {
+    if (b._x === undefined) continue;
+    const d = (b._x - wx) ** 2 + (b._y - wy) ** 2;
+    if (d < bestD) { bestD = d; best = { type: 'broadcast', obj: b }; }
+  }
   if (!best) {
     for (const r of labelRects) {
       if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) {
@@ -826,8 +915,9 @@ function hitTest(mx, my) {
 const tooltip = document.getElementById('tooltip');
 canvas.addEventListener('mousemove', e => {
   const hit = hitTest(e.clientX, e.clientY);
-  hovered = hit && hit.type !== 'stage' ? hit.obj : null;
+  hovered = hit && (hit.type === 'task' || hit.type === 'worker') ? hit.obj : null;
   hoveredStage = hit && hit.type === 'stage' ? hit.obj : null;
+  hoveredBroadcast = hit && hit.type === 'broadcast' ? hit.obj : null;
   canvas.style.cursor = hit ? 'pointer' : 'default';
   if (hit) {
     tooltip.style.display = 'block';
@@ -842,6 +932,10 @@ canvas.addEventListener('mousemove', e => {
     } else if (hit.type === 'worker') {
       const w = hit.obj;
       tooltip.innerHTML = `<b>executor ${esc(w.id)}</b><br>${w.current ? 'busy · ' + esc(w.current) : 'idle'}`;
+    } else if (hit.type === 'broadcast') {
+      const b = hit.obj;
+      tooltip.innerHTML = `<b>shared value ${esc(b.id)}</b><br>` +
+        `${fmtBytes(b.bytes)} · stored once · ${b.readers || 0} task${b.readers === 1 ? '' : 's'} read it`;
     } else {
       const st = hit.obj;
       tooltip.innerHTML = `<b>stage ${esc(st.id)}</b> · ${esc(st.kind || 'stage')}<br>click to inspect`;
@@ -854,7 +948,10 @@ canvas.addEventListener('mousemove', e => {
     tooltip.style.display = 'none';
   }
 });
-canvas.addEventListener('mouseleave', () => { hovered = null; hoveredStage = null; tooltip.style.display = 'none'; });
+canvas.addEventListener('mouseleave', () => {
+  hovered = null; hoveredStage = null; hoveredBroadcast = null;
+  tooltip.style.display = 'none';
+});
 canvas.addEventListener('click', e => {
   const hit = hitTest(e.clientX, e.clientY);
   if (hit) { selected = { type: hit.type, id: hit.obj.id }; openPanel(); }
@@ -901,6 +998,9 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     const failed = S.tasks.filter(t => t.status === 'failed');
     if (failed.length) cycleSelection(failed, 'task', e.shiftKey ? -1 : 1);
+  } else if (e.key === 'b' || e.key === 'B') {
+    e.preventDefault();
+    cycleSelection(S.broadcasts, 'broadcast', e.shiftKey ? -1 : 1);
   }
 });
 document.getElementById('panelClose').addEventListener('click', () => {
@@ -960,6 +1060,13 @@ function fmtTok(n) {
   if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
   return String(n);
 }
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
 function fmtCost(c) {
   if (!c) return '$0';
   if (c < 0.0001) return '<$0.0001';
@@ -1018,6 +1125,7 @@ function renderPanel() {
   }
 
   if (selected.type === 'stage') { renderStagePanel(title, body); return; }
+  if (selected.type === 'broadcast') { renderBroadcastPanel(title, body); return; }
 
   const t = S.taskIx.get(selected.id);
   if (!t) return;
@@ -1038,6 +1146,9 @@ function renderPanel() {
     ['cost', fmtCost((t.usage && t.usage.cost) || 0)],
     ['cache', t.cacheHit ? '⚡ replayed from cache' : 'no'],
   ];
+  if ((t.broadcasts || []).length) {
+    rows.push(['shared values', t.broadcasts.map(n => jumpBtn('broadcast', n)).join(' ')]);
+  }
   let html = `<span class="status-chip" style="color:${statusColor(t)};border-color:${statusColor(t)}55">${statusLabel(t)}</span>`;
   html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
 
@@ -1094,6 +1205,56 @@ function renderPanel() {
   setPanelHTML(body, html);
 }
 
+// The shared-value inspector answers both halves of the question: *what* was
+// shared (name, content hash, size, the value itself) and *where* it went
+// (which stages declared it, which tasks actually read it).
+function renderBroadcastPanel(title, body) {
+  const b = S.broadcastIx.get(selected.id);
+  if (!b) return;
+  title.textContent = 'shared value ' + b.id;
+
+  const stages = b.stages || [];
+  const tasks = b.tasks || [];
+  const copiesSaved = b.readers > 1 ? fmtBytes(b.bytes * (b.readers - 1)) : null;
+
+  const rows = [
+    ['content hash', b.hash ? `<span class="mono">${esc(b.hash.slice(0, 16))}…</span>` : '—'],
+    ['size', fmtBytes(b.bytes)],
+    ['stored', '1 copy for the whole run'],
+    ['tasks that read it', String(b.readers || 0)],
+  ];
+  if (copiesSaved) rows.push(['payload avoided', `${copiesSaved} not copied into task envelopes`]);
+
+  let html = `<span class="status-chip" style="color:${COLORS.shared};border-color:${COLORS.shared}55">◇ shared value</span>`;
+  html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
+
+  html += `<h4>read by stages</h4><div class="lineage">` +
+    (stages.length
+      ? stages.map(sid => jumpBtn('stage', sid)).join('')
+      : `<span class="none">registered for the run, not yet read</span>`) +
+    '</div>';
+
+  html += `<h4>read by tasks · ${b.readers || 0}</h4><div class="lineage">` +
+    (tasks.length
+      ? tasks.map(tid => {
+          const t = S.taskIx.get(tid);
+          return jumpBtn('task', tid, `${tid}${t ? ' · ' + t.stage : ''}`);
+        }).join('') + (b.readers > tasks.length
+          ? `<span class="none">+${b.readers - tasks.length} more</span>` : '')
+      : `<span class="none">no reads yet</span>`) +
+    '</div>';
+
+  if (b.preview) {
+    html += `<h4>value</h4><details open><summary>${esc(fmtBytes(b.bytes))} of JSON` +
+      `</summary><pre>${esc(b.preview)}</pre></details>`;
+  }
+  html += `<h4>why this is a broadcast</h4><div class="lineage"><span class="none">` +
+    `registered once per run and referenced by content hash — task envelopes carry the ` +
+    `hash, not the bytes, so every reader shares one copy and tasks stay small enough ` +
+    `to ship to a remote executor</span></div>`;
+  setPanelHTML(body, html);
+}
+
 function summarizeIDs(ids) {
   if (!ids || !ids.length) return 'records';
   const shown = ids.slice(0, 6).join(', ');
@@ -1143,6 +1304,10 @@ function renderStagePanel(title, body) {
     ['cost', fmtCost(cost)],
     ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
   ];
+  const reads = S.broadcasts.filter(b => (b.stages || []).includes(st.id));
+  if (reads.length) {
+    rows.push(['shared values', reads.map(b => jumpBtn('broadcast', b.id)).join(' ')]);
+  }
   let html = `<span class="status-chip" style="color:${st.status === 'done' ? COLORS.done : COLORS.running}">${statusTxt}</span>`;
   html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
   if (st.detail) html += `<h4>what this stage does</h4><pre>${esc(st.detail)}</pre>`;
@@ -1211,7 +1376,8 @@ function refreshChrome() {
     stat(String(retries), 'retries') +
     stat(String(cache), 'cached') +
     stat(fmtTok(tok), 'tokens') +
-    stat(fmtCost(cost), 'cost');
+    stat(fmtCost(cost), 'cost') +
+    (S.broadcasts.length ? stat(String(S.broadcasts.length), 'shared') : '');
   const statsEl = document.getElementById('stats');
   if (statsEl.dataset.html !== statsHTML) {
     statsEl.innerHTML = statsHTML;
