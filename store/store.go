@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -284,6 +285,41 @@ func (b *Broadcasts) Resolve(hash string) (any, error) {
 	b.values[hash] = decoded
 	b.mu.Unlock()
 	return decoded, nil
+}
+
+// BroadcastEntry describes one registered shared value: its name, the content
+// hash tasks reference it by, and the serialized bytes that hash resolves to.
+type BroadcastEntry struct {
+	Name  string
+	Hash  string
+	Bytes int
+	JSON  string // the serialized value
+}
+
+// Entries lists the registered broadcasts sorted by name. Observability
+// consumers use it to report what a run agreed to share before any task
+// reads it.
+func (b *Broadcasts) Entries() []BroadcastEntry {
+	b.mu.RLock()
+	hashes := make(map[string]string, len(b.hashes))
+	names := make([]string, 0, len(b.hashes))
+	for n, h := range b.hashes {
+		names = append(names, n)
+		hashes[n] = h
+	}
+	b.mu.RUnlock()
+
+	sort.Strings(names)
+	out := make([]BroadcastEntry, 0, len(names))
+	for _, n := range names {
+		e := BroadcastEntry{Name: n, Hash: hashes[n]}
+		if blob, ok := b.cas.Get(e.Hash); ok {
+			e.Bytes = len(blob)
+			e.JSON = string(blob)
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // Len returns the number of registered broadcasts.

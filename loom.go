@@ -204,6 +204,17 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 	runID := core.NewID("run")
 	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID})
 
+	// Announce the shared values after the run header (which resets observer
+	// state) and before any task runs, so a viewer sees what the run agreed to
+	// share before it sees anything read it.
+	for _, e := range broadcasts.Entries() {
+		bus.Publish(observe.Event{
+			Type: observe.BroadcastRegistered, RunID: runID,
+			Broadcast: e.Name, Artifact: e.Hash, Bytes: e.Bytes,
+			Detail: observe.Clip(e.JSON),
+		})
+	}
+
 	outputs := map[string][]core.Record{}
 	var failures []runtime.Failure
 

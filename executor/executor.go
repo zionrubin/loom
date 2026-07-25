@@ -215,14 +215,18 @@ func (b boundTools) Invoke(ctx context.Context, name string, args map[string]any
 // map over a million records would otherwise drown the audit log without
 // recording anything the first line didn't already say. Denials are always
 // audited.
-func BindBroadcasts(shared *store.Broadcasts, env task.Envelope, audit *security.AuditLog, taskID string) core.Broadcaster {
-	return &boundBroadcasts{shared: shared, env: env, audit: audit, taskID: taskID, seen: map[string]bool{}}
+func BindBroadcasts(shared *store.Broadcasts, env task.Envelope, audit *security.AuditLog, bus *observe.Bus, taskID string) core.Broadcaster {
+	return &boundBroadcasts{
+		shared: shared, env: env, audit: audit, bus: bus,
+		taskID: taskID, seen: map[string]bool{},
+	}
 }
 
 type boundBroadcasts struct {
 	shared *store.Broadcasts
 	env    task.Envelope
 	audit  *security.AuditLog
+	bus    *observe.Bus
 	taskID string
 
 	mu   sync.Mutex
@@ -252,14 +256,24 @@ func (b *boundBroadcasts) Broadcast(ctx context.Context, name string) (any, erro
 	return v, nil
 }
 
-// recordOnce audits the first allowed read of name by this task.
+// recordOnce audits and publishes the first allowed read of name by this
+// task. Once per task and name is the useful granularity for both: it is the
+// fact that this task reached this shared value that matters, not how many
+// records it then applied it to.
 func (b *boundBroadcasts) recordOnce(name string) {
 	b.mu.Lock()
 	first := !b.seen[name]
 	b.seen[name] = true
 	b.mu.Unlock()
-	if first {
-		b.record(name, true, "")
+	if !first {
+		return
+	}
+	b.record(name, true, "")
+	if b.bus != nil {
+		b.bus.Publish(observe.Event{
+			Type: observe.BroadcastRead, RunID: b.env.RunID, Stage: b.env.Stage,
+			TaskID: b.taskID, Broadcast: name, Artifact: b.env.Broadcasts[name],
+		})
 	}
 }
 
@@ -334,7 +348,7 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 		Models: l.Client,
 		Session: session{
 			Tools:       BindTools(l.Tools, t.Envelope, l.Audit, t.ID),
-			Broadcaster: BindBroadcasts(l.Broadcasts, t.Envelope, l.Audit, t.ID),
+			Broadcaster: BindBroadcasts(l.Broadcasts, t.Envelope, l.Audit, l.Bus, t.ID),
 		},
 	}
 
