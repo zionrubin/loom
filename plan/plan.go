@@ -10,12 +10,12 @@ import (
 	"sort"
 	"text/template"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/pipeline"
-	"github.com/zionrubin/brian-ai/loom/security"
-	"github.com/zionrubin/brian-ai/loom/store"
-	"github.com/zionrubin/brian-ai/loom/task"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/security"
+	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/task"
 )
 
 // StagePlan is one executable stage.

@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/observe"
-	"github.com/zionrubin/brian-ai/loom/task"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
+	"github.com/zionrubin/loom/task"
 )
 
 func TestRetryPolicyDelay(t *testing.T) {

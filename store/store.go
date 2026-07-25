@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
+	"github.com/zionrubin/loom/core"
 )
 
 // Hash returns the hex SHA-256 of data.

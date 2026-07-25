@@ -15,12 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/observe"
-	"github.com/zionrubin/brian-ai/loom/security"
-	"github.com/zionrubin/brian-ai/loom/store"
-	"github.com/zionrubin/brian-ai/loom/task"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
+	"github.com/zionrubin/loom/security"
+	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/task"
 )
 
 // Executor executes a single task to completion (or classified failure).

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
+	"github.com/zionrubin/loom/core"
 )
 
 // EventType enumerates lifecycle events.

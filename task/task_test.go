@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zionrubin/brian-ai/loom/core"
-	"github.com/zionrubin/brian-ai/loom/model"
-	"github.com/zionrubin/brian-ai/loom/security"
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/security"
 )
 
 // TestTaskSerializability proves the distribution seam: a task — including
