@@ -199,8 +199,8 @@ func TestToolCapabilityEnforcement(t *testing.T) {
 		}
 		p := pipeline.New("tools")
 		src := p.FromRecords("in", []core.Record{core.NewRecord("r", map[string]any{"id": "42"})})
-		src.MapTools("enrich", func(ctx context.Context, tools core.Tools, r core.Record) (core.Record, error) {
-			v, err := tools.Invoke(ctx, "lookup", map[string]any{"id": r.String("id")})
+		src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+			v, err := s.Invoke(ctx, "lookup", map[string]any{"id": r.String("id")})
 			if err != nil {
 				return core.Record{}, err
 			}
@@ -234,6 +234,247 @@ func TestToolCapabilityEnforcement(t *testing.T) {
 	}
 	if !denied {
 		t.Error("denial must appear in the audit log")
+	}
+}
+
+// TestBroadcastSharedAcrossTasks exercises the whole path: one value
+// registered per run, referenced by every task that declared it, and read from
+// both a prompt template and a Go op.
+func TestBroadcastSharedAcrossTasks(t *testing.T) {
+	reg := model.NewRegistry()
+	// The mock echoes the rendered prompt back, so the assertions can see
+	// exactly what each task was handed.
+	if _, err := model.RegisterMock(reg, "m", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) {
+			return req.Prompt, nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enough records to keep every worker busy: the runner's prompt template
+	// and the decoded broadcast are both shared across concurrent tasks, so
+	// this is the case `go test -race` needs to see.
+	var recs []core.Record
+	regions := map[string]string{}
+	for i := range 32 {
+		id := fmt.Sprintf("t%d", i)
+		recs = append(recs, core.NewRecord(id, map[string]any{"subject": "ticket " + id}))
+		regions[id] = []string{"EMEA", "APAC", "AMER"}[i%3]
+	}
+
+	p := pipeline.New("broadcast")
+	src := p.FromRecords("in", recs)
+	src.
+		MapTools("region", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+			table, err := core.BroadcastAs[map[string]string](ctx, s, "regions")
+			if err != nil {
+				return core.Record{}, err
+			}
+			r.Data["region"] = table[r.ID]
+			return r, nil
+		}, pipeline.WithBroadcast("regions")).
+		Infer("classify", pipeline.InferSpec{
+			Binding: model.Binding{Model: "m"},
+			Prompt:  `Rubric: {{broadcast "rubric"}}. Ticket in {{.region}}: {{.subject}}`,
+		}, pipeline.WithBroadcast("rubric"))
+
+	res, err := loom.Run(context.Background(), p,
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
+		loom.WithBroadcast("regions", regions),
+		loom.WithBroadcast("rubric", "urgency 1-5"))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(res.Output) != len(recs) {
+		t.Fatalf("want %d outputs, got %d", len(recs), len(res.Output))
+	}
+	// Every task saw the same shared values, whichever record it held.
+	for _, r := range res.Output {
+		got := r.String("output")
+		if !strings.Contains(got, "Rubric: urgency 1-5") {
+			t.Errorf("prompt did not receive the broadcast: %q", got)
+		}
+		if !strings.Contains(got, regions[r.ID]) {
+			t.Errorf("record %s lost its broadcast-derived region: %q", r.ID, got)
+		}
+	}
+
+	// The value is stored once and referenced by hash, not copied per task.
+	if res.Broadcasts["rubric"] == "" || res.Broadcasts["regions"] == "" {
+		t.Errorf("run should report broadcast content hashes, got %v", res.Broadcasts)
+	}
+	for _, e := range res.Lineage {
+		if e.Stage == "classify" && e.Broadcasts["rubric"] != res.Broadcasts["rubric"] {
+			t.Error("lineage must record which shared values a task could read")
+		}
+	}
+	var allowed int
+	for _, e := range res.Audit {
+		if e.Action == "broadcast.read" && e.Allowed {
+			allowed++
+		}
+	}
+	if allowed == 0 {
+		t.Error("allowed broadcast reads must be audited")
+	}
+}
+
+// TestBroadcastInReduceAI covers the other AI operator: tree aggregation
+// renders its own template, at every level of the reduce.
+func TestBroadcastInReduceAI(t *testing.T) {
+	reg := model.NewRegistry()
+	if _, err := model.RegisterMock(reg, "m", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) {
+			if !strings.Contains(req.Prompt, "house style: terse") {
+				return "", fmt.Errorf("reduce prompt lost the broadcast: %q", req.Prompt)
+			}
+			return "ok", nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+
+	p := pipeline.New("reduce-broadcast")
+	src := p.FromRecords("in", tickets())
+	src.ReduceAI("brief", pipeline.ReduceAISpec{
+		Binding:   model.Binding{Model: "m"},
+		Prompt:    `Style: {{broadcast "style"}}. Summarize {{.Count}}:{{range .Items}} {{.}}{{end}}`,
+		FanIn:     2,
+		ItemField: "subject",
+	}, pipeline.WithBroadcast("style"))
+
+	res, err := loom.Run(context.Background(), p,
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
+		loom.WithBroadcast("style", "house style: terse"))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(res.Output) != 1 || res.Output[0].String("output") != "ok" {
+		t.Fatalf("tree reduce should collapse to one record: %+v", res.Output)
+	}
+}
+
+// TestBroadcastKeepsStrictTemplates guards a sharp edge: binding a task's
+// broadcasts clones the runner's prompt template, and text/template's Clone
+// starts the copy with default options — so a stage that reads a broadcast
+// would silently start rendering "<no value>" for missing record fields
+// instead of failing, unless missingkey=error is re-applied to the clone.
+func TestBroadcastKeepsStrictTemplates(t *testing.T) {
+	reg := model.NewRegistry()
+	if _, err := model.RegisterMock(reg, "m", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) { return req.Prompt, nil })); err != nil {
+		t.Fatal(err)
+	}
+
+	p := pipeline.New("strict")
+	src := p.FromRecords("in", tickets()[:1])
+	src.Infer("classify", pipeline.InferSpec{
+		Binding: model.Binding{Model: "m"},
+		Prompt:  `{{broadcast "rubric"}}: {{.nonexistent}}`,
+	}, pipeline.WithBroadcast("rubric"))
+
+	_, err := loom.Run(context.Background(), p,
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
+		loom.WithBroadcast("rubric", "v1"))
+	if err == nil {
+		t.Fatal("a missing record field must still fail a broadcast-reading stage")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("error should name the missing field, got %v", err)
+	}
+}
+
+// TestBroadcastCapabilityEnforcement: a broadcast the stage never declared is
+// unreachable, exactly like an ungranted tool or secret.
+func TestBroadcastCapabilityEnforcement(t *testing.T) {
+	build := func(declare bool) *pipeline.Pipeline {
+		var opts []pipeline.Option
+		if declare {
+			opts = append(opts, pipeline.WithBroadcast("secrets"))
+		}
+		p := pipeline.New("deny")
+		src := p.FromRecords("in", []core.Record{core.NewRecord("r", nil)})
+		src.MapTools("peek", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+			v, err := s.Broadcast(ctx, "secrets")
+			if err != nil {
+				return core.Record{}, err
+			}
+			r.Data["peeked"] = v
+			return r, nil
+		}, opts...)
+		return p
+	}
+
+	// Declared: the read succeeds.
+	res, err := loom.Run(context.Background(), build(true),
+		loom.WithRetry(quickRetry()), loom.WithBroadcast("secrets", "classified"))
+	if err != nil {
+		t.Fatalf("granted run: %v", err)
+	}
+	if res.Output[0].String("peeked") != "classified" {
+		t.Fatalf("declared broadcast should be readable: %+v", res.Output[0].Data)
+	}
+
+	// Undeclared: registering the value for the run is not enough — the stage
+	// must ask for it, and the denial is audited.
+	res, err = loom.Run(context.Background(), build(false),
+		loom.WithRetry(quickRetry()), loom.WithBroadcast("secrets", "classified"))
+	if err == nil {
+		t.Fatal("reading an undeclared broadcast must fail the run")
+	}
+	var denied bool
+	for _, e := range res.Audit {
+		if e.Action == "broadcast.read" && !e.Allowed {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Error("denial must appear in the audit log")
+	}
+}
+
+// TestBroadcastChangeInvalidatesCache: a rerun with an edited broadcast must
+// recompute the stages that read it instead of replaying stale results.
+func TestBroadcastChangeInvalidatesCache(t *testing.T) {
+	reg := model.NewRegistry()
+	m, err := model.RegisterMock(reg, "m", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) { return req.Prompt, nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateDir := t.TempDir()
+	run := func(rubric string) *loom.RunResult {
+		t.Helper()
+		p := pipeline.New("cache")
+		src := p.FromRecords("in", tickets()[:1])
+		src.Infer("classify", pipeline.InferSpec{
+			Binding: model.Binding{Model: "m"},
+			Prompt:  `{{broadcast "rubric"}}: {{.subject}}`,
+		}, pipeline.WithBroadcast("rubric"))
+		res, err := loom.Run(context.Background(), p,
+			loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
+			loom.WithStateDir(stateDir), loom.WithBroadcast("rubric", rubric))
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return res
+	}
+
+	run("v1")
+	if m.Calls() != 1 {
+		t.Fatalf("first run made %d calls, want 1", m.Calls())
+	}
+	run("v1")
+	if m.Calls() != 1 {
+		t.Errorf("an unchanged broadcast must replay from cache, got %d calls", m.Calls())
+	}
+	res := run("v2")
+	if m.Calls() != 2 {
+		t.Errorf("an edited broadcast must recompute, got %d calls total", m.Calls())
+	}
+	if !strings.HasPrefix(res.Output[0].String("output"), "v2:") {
+		t.Errorf("output should reflect the new broadcast: %q", res.Output[0].String("output"))
 	}
 }
 

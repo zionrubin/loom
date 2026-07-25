@@ -87,6 +87,11 @@ func main() {
 		loom.WithContinueOnError(),
 		loom.WithRunBudget(core.Budget{MaxCostUSD: *budget}),
 		loom.WithEventHandler(v.Handle),
+		// Registered once for the whole run; stages opt in with
+		// pipeline.WithBroadcast and read by reference.
+		loom.WithBroadcast("inclusion-criteria", inclusionCriteria),
+		loom.WithBroadcast("venue-tiers", venueTiers),
+		loom.WithBroadcast("evidence-rubric", evidenceRubric),
 	}
 	if dir := os.Getenv("LOOM_STATE"); dir != "" {
 		opts = append(opts, loom.WithStateDir(dir))
@@ -114,6 +119,53 @@ func main() {
 	fmt.Printf("\nrun finished — still serving %s (Ctrl-C to exit)\n", url)
 	<-ctx.Done()
 	_ = v.Close()
+}
+
+// --- shared values ----------------------------------------------------------
+
+// Three things every task in this survey has to agree on: what counts as
+// in-scope, how venues rank, and what an evidence grade means. Registering
+// them as broadcasts stores each once by content hash and hands the reading
+// stages a reference — the alternative, stamping them onto all ~50 records or
+// pasting them into three prompt templates, would copy the same bytes into
+// every task envelope and put the rubric out of reach of the Go stages.
+//
+// In the constellation view these appear as hexagonal nodes above the sky,
+// each feeding the stage clusters that read it.
+
+// inclusionCriteria is read by the screening stage's prompt. It deliberately
+// avoids naming the six survey areas verbatim — the mock screener keys on
+// those phrases appearing in a paper's abstract, and repeating them in the
+// shared criteria would make every paper look in-scope.
+var inclusionCriteria = map[string]any{
+	"include_if": []string{
+		"the work studies systems that improve their own behavior over time",
+		"results are empirical: ablations, replications, or deployment data",
+		"the venue is peer-reviewed or a citable preprint",
+	},
+	"exclude_if": []string{
+		"no connection to machine learning or agent systems",
+		"position paper with no abstract to screen",
+	},
+	"reviewer_note": "when the abstract is ambiguous, prefer inclusion and let the grading stage sort it out",
+}
+
+// venueTiers is read by a Go stage, not a prompt — the broadcast-join case:
+// a lookup table every task needs, none of them should carry.
+var venueTiers = map[string]string{
+	"NeurIPS": "A*", "ICML": "A*", "ICLR": "A*", "IEEE S&P": "A*",
+	"USENIX Security": "A*", "SOSP": "A*", "CoRL": "A", "AAMAS": "A",
+	"arXiv": "preprint", "preprint": "preprint",
+}
+
+// evidenceRubric is read by the grading stage's prompt, so all ~40 grading
+// tasks score against one scale rather than each improvising.
+var evidenceRubric = map[string]any{
+	"5": "replicated independently, effect stable across scales and seeds",
+	"4": "single-lab result with ablations and a held-out evaluation",
+	"3": "single result with a credible baseline comparison",
+	"2": "suggestive: small sample, weak or missing baseline",
+	"1": "anecdotal or projected beyond the tested regime",
 }
 
 // --- corpus -----------------------------------------------------------------
@@ -240,13 +292,27 @@ func buildPipeline() *pipeline.Pipeline {
 	src := p.FromRecords("papers", records())
 
 	// Two adjacent pure stages: the planner fuses them into one task
-	// boundary (stage kind "fused" in the stage inspector).
-	normalized := src.Map("normalize", func(r core.Record) (core.Record, error) {
+	// boundary (stage kind "fused" in the stage inspector), and the fused
+	// envelope unions what its members declared — so the venue table stays
+	// readable after fusion.
+	normalized := src.MapTools("normalize", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+		// A broadcast join: one shared table, read by every task in the
+		// stage, carried by none of them.
+		tiers, err := core.BroadcastAs[map[string]string](ctx, s, "venue-tiers")
+		if err != nil {
+			return core.Record{}, err
+		}
+		tier, ok := tiers[r.String("venue")]
+		if !ok {
+			tier = "unranked"
+		}
 		out := r.Clone()
 		out.Data["title"] = strings.TrimSpace(r.String("title"))
+		out.Data["venue_tier"] = tier
 		out.Data["cite"] = fmt.Sprintf("%s, %s (%v)", r.String("title"), r.String("venue"), r.Data["year"])
 		return out, nil
-	}, pipeline.WithVersion("v1"), pipeline.WithBatchSize(4))
+	}, pipeline.WithVersion("v2"), pipeline.WithBatchSize(4),
+		pipeline.WithBroadcast("venue-tiers"))
 	screenable := normalized.Filter("screenable", func(r core.Record) (bool, error) {
 		return r.String("abstract") != "", nil // drop preprint stubs
 	}, pipeline.WithVersion("v1"), pipeline.WithBatchSize(4))
@@ -257,11 +323,16 @@ func buildPipeline() *pipeline.Pipeline {
 			Escalation: []string{"mock-oracle"}, // garbled output climbs here
 		},
 		System: "You are the screening reviewer for a systematic survey of self-improving AI agents.",
+		// The shared criteria are interpolated into every screening prompt
+		// while living in exactly one place.
 		Prompt: "Screen this paper for inclusion in the survey.\n" +
-			"Title: {{.title}}\nVenue: {{.venue}} ({{.year}})\nAbstract: {{.abstract}}\n" +
+			"Inclusion criteria (shared by every reviewer in this run):\n" +
+			"{{broadcastJSON \"inclusion-criteria\"}}\n" +
+			"Title: {{.title}}\nVenue: {{.venue}} ({{.year}}, tier {{.venue_tier}})\n" +
+			"Abstract: {{.abstract}}\n" +
 			"Return JSON: {\"relevant\": bool, \"topic\": string}.",
 		ParseJSON: true,
-	})
+	}, pipeline.WithBroadcast("inclusion-criteria"))
 
 	relevant := screened.Filter("relevant-only", func(r core.Record) (bool, error) {
 		b, _ := r.Data["relevant"].(bool)
@@ -289,6 +360,7 @@ func buildPipeline() *pipeline.Pipeline {
 		},
 		System: "You grade the strength of evidence behind research findings.",
 		Prompt: "Grade the strength of evidence for: {{.headline}}\nFindings: {{.findings}}\n" +
+			"Grade against this shared rubric:\n{{broadcastJSON \"evidence-rubric\"}}\n" +
 			"Return JSON: {\"evidence\": 1-5, \"rationale\": string}.",
 		ParseJSON: true,
 		Validate: func(r core.Record) error {
@@ -298,7 +370,7 @@ func buildPipeline() *pipeline.Pipeline {
 			}
 			return nil
 		},
-	})
+	}, pipeline.WithBroadcast("evidence-rubric"))
 
 	strong := graded.Filter("strong-evidence", func(r core.Record) (bool, error) {
 		v, _ := r.Data["evidence"].(float64)

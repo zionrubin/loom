@@ -54,8 +54,15 @@ type Envelope struct {
 	Grants  security.GrantSet     `json:"grants"`
 	Egress  security.EgressPolicy `json:"egress"`
 	Context ContextBundle         `json:"context"`
-	Budget  core.Budget           `json:"budget"`
-	Sandbox SandboxProfile        `json:"sandbox"`
+	// Broadcasts maps each run-level shared value this task may read to the
+	// content hash of that value. Broadcasts are referenced, never copied:
+	// the envelope stays small however large the shared value is, and an
+	// executor fetches each value once from content-addressed storage instead
+	// of once per task. Reads additionally require the matching
+	// security.DataCap grant.
+	Broadcasts map[string]string `json:"broadcasts,omitempty"`
+	Budget     core.Budget       `json:"budget"`
+	Sandbox    SandboxProfile    `json:"sandbox"`
 }
 
 // Task is one schedulable unit: a batch of input records plus the envelope

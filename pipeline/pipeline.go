@@ -11,6 +11,8 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
+	"text/template"
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
@@ -41,7 +43,8 @@ type StageOpts struct {
 	Budget      core.Budget
 	Sandbox     task.SandboxProfile
 	Grants      []security.Capability
-	Version     string // content-version for Go-func stages; enables caching
+	Broadcasts  []string // run-level shared values this stage may read
+	Version     string   // content-version for Go-func stages; enables caching
 	NoCache     bool
 }
 
@@ -66,9 +69,37 @@ func WithGrants(caps ...security.Capability) Option {
 	return func(o *StageOpts) { o.Grants = append(o.Grants, caps...) }
 }
 
+// WithBroadcast declares which run-level shared values (registered with
+// loom.WithBroadcast) this stage's tasks may read. Least privilege applies as
+// it does to models, secrets, and tools: a stage sees only the broadcasts it
+// names, reading an undeclared one is a permanent failure, and the declared
+// values' content hashes join the stage fingerprint so a changed broadcast
+// invalidates the cached results that saw it.
+func WithBroadcast(names ...string) Option {
+	return func(o *StageOpts) { o.Broadcasts = append(o.Broadcasts, names...) }
+}
+
 // WithVersion declares a content version for Go-function stages, enabling
 // caching: bump it when the function's behavior changes.
 func WithVersion(v string) Option { return func(o *StageOpts) { o.Version = v } }
+
+// TemplateFuncs returns the functions available inside Infer and ReduceAI
+// prompt templates:
+//
+//	{{broadcast "name"}}      the shared value (index it for structured data)
+//	{{broadcastJSON "name"}}  the shared value rendered as indented JSON
+//
+// The implementations returned here are parse-time placeholders, so templates
+// can be validated at compile time before anything is provisioned. The
+// executor rebinds them per task to exactly the broadcasts that task's
+// envelope grants.
+func TemplateFuncs() template.FuncMap {
+	unbound := func(name string) (any, error) {
+		return nil, fmt.Errorf("broadcast %q: not bound to this task "+
+			"(declare it with pipeline.WithBroadcast)", name)
+	}
+	return template.FuncMap{"broadcast": unbound, "broadcastJSON": unbound}
+}
 
 // WithNoCache disables caching for this stage.
 func WithNoCache() Option { return func(o *StageOpts) { o.NoCache = true } }
@@ -130,7 +161,7 @@ type Stage struct {
 	SourceFn      func(ctx context.Context) ([]core.Record, error)
 
 	MapFn     func(r core.Record) (core.Record, error)
-	MapCtxFn  func(ctx context.Context, tools core.Tools, r core.Record) (core.Record, error)
+	MapCtxFn  func(ctx context.Context, s core.Session, r core.Record) (core.Record, error)
 	FilterFn  func(r core.Record) (bool, error)
 	FlatMapFn func(r core.Record) ([]core.Record, error)
 
@@ -192,9 +223,12 @@ func (d Dataset) Map(name string, fn func(core.Record) (core.Record, error), opt
 	return d.p.add(&Stage{ID: name, Kind: KindMap, Upstream: d.stage, MapFn: fn, Opts: applyOpts(opts)})
 }
 
-// MapTools applies a transformation with access to capability-checked tools;
-// grant the needed tools via WithGrants(security.ToolCap("...")).
-func (d Dataset) MapTools(name string, fn func(ctx context.Context, tools core.Tools, r core.Record) (core.Record, error), opts ...Option) Dataset {
+// MapTools applies a transformation with access to the task's capability-
+// checked session: tool invocation, granted via
+// WithGrants(security.ToolCap("...")), and broadcast reads, granted via
+// WithBroadcast("..."). This is the pure-transform escape hatch for anything
+// that needs more than the record in front of it.
+func (d Dataset) MapTools(name string, fn func(ctx context.Context, s core.Session, r core.Record) (core.Record, error), opts ...Option) Dataset {
 	return d.p.add(&Stage{ID: name, Kind: KindMap, Upstream: d.stage, MapCtxFn: fn, Opts: applyOpts(opts)})
 }
 
