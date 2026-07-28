@@ -51,6 +51,14 @@ execute model-derived behavior that shouldn't be ambiently trusted. Loom
 makes each difference a first-class concept — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
+The closest prior art isn't another data framework — it's the inference
+serving engines (vLLM, SGLang), which solve the same problem one level down:
+many expensive, variable-latency model calls that share structure, under a
+hard resource ceiling. Loom borrows their two central mechanisms — prefix
+cache sharing and continuous batching — and
+[docs/INFERENCE.md](docs/INFERENCE.md) maps the rest of that playbook onto
+this one, including what is deliberately left out.
+
 ## What you get
 
 - **Declarative pipelines** — `Map` / `Filter` / `FlatMap` / `Combine` plus
@@ -76,6 +84,22 @@ makes each difference a first-class concept — see
   remote executor. Reads are grant-checked and audited like any other
   capability, and the value's hash joins the reading stage's fingerprint —
   edit a broadcast and exactly the results that saw it recompute.
+- **Shared prompt prefixes** — the stage-stable head of a prompt (a rubric, a
+  taxonomy, few-shot examples) goes in `InferSpec.Prefix`, a template with no
+  record data in scope. It renders once per task instead of once per record,
+  and providers receive it as a cacheable prefix — an explicit `cache_control`
+  breakpoint on Anthropic, stable leading bytes for OpenAI's automatic prefix
+  cache. Broadcasts share the *bytes* across tasks; this shares the *work the
+  model does on them*. The planner turns it on only when a stage issues more
+  than one call, which is exactly when a cache write earns itself back, and
+  the run report states what it cost and what it saved.
+- **Pipelined execution** — `loom.WithStreaming()` replaces the stage barrier
+  with continuous batching: a record moves downstream when its own task
+  finishes, not when its whole stage does, and every stage draws from one
+  global pool of execution slots. Stages overlap, a straggler no longer idles
+  the workers behind it, and aggregates (`Combine`, `ReduceAI`) remain the
+  natural barriers they have to be. The trade is ordering — records flow in
+  completion order — so the barrier driver stays the default.
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
@@ -216,6 +240,30 @@ into numbers on real OpenAI models: how many bytes the run avoided copying,
 which stages recompute when a shared value is edited, and a live view of
 every broadcast read.
 
+### Sharing the work, not just the bytes
+
+A broadcast shares a value across tasks. It does not stop the *model* from
+reprocessing that value on every call: a rubric sent to a thousand tasks is
+read by the provider a thousand times. Put it in the stage's `Prefix` and
+that stops being true.
+
+```go
+Infer("classify", pipeline.InferSpec{
+    Binding: model.Binding{Tier: model.TierFast},
+    System:  "You classify support tickets.",
+    Prefix:  `Rubric:\n{{broadcast "rubric"}}`,    // once per task, cached provider-side
+    Prompt:  "Classify this ticket: {{.subject}}", // once per record
+}, pipeline.WithBroadcast("rubric"))
+```
+
+`Prefix` is a template with no record data in scope, which is the whole
+mechanism: a template that cannot see the record cannot vary by record, so
+every call in the stage opens with identical bytes and the provider's prompt
+cache serves them. The prefix joins the stage fingerprint, so editing the
+rubric recomputes exactly the stages that could have seen it — and a stage
+without a prefix fingerprints exactly as it did before, leaving existing
+caches warm.
+
 ## Design notes
 
 - AI operators are pure data and tasks are JSON-serializable (tested), so
@@ -226,9 +274,15 @@ every broadcast read.
 - Unclassified errors are treated as permanent so user-code bugs fail fast
   instead of burning paid retries; providers classify their own errors.
 
+- Both drivers execute tasks through the same `Scheduler.RunTask`, so retry,
+  escalation, admission control, and the budget governor cannot drift between
+  barrier and streaming execution.
+
 The scaling path (remote worker fleets, shared object-store CAS, WASM
-sandboxes with grant-derived imports, streaming execution) is laid out in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distributed-system).
+sandboxes with grant-derived imports) is laid out in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distributed-system),
+and the inference-engine lineage — what Loom borrows from vLLM/SGLang and
+what it deliberately leaves out — in [docs/INFERENCE.md](docs/INFERENCE.md).
 
 ## Demo
 

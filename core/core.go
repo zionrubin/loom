@@ -68,23 +68,53 @@ func NewID(prefix string) string {
 }
 
 // Usage accumulates token and cost accounting across model calls.
+//
+// The three prompt-side counters are disjoint: InputTokens counts only the
+// prompt tokens the provider processed at full price, while CacheReadTokens
+// and CacheWriteTokens count the prompt tokens served from, and written to,
+// the provider's prompt-prefix cache. Providers normalize to this split, so
+// PromptTokens is always the size of the prompt that was actually sent.
 type Usage struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	Requests     int     `json:"requests"`
-	CostUSD      float64 `json:"cost_usd"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	// CacheReadTokens are prompt tokens the provider served from its
+	// prefix cache instead of recomputing — the shared-prefix hit.
+	CacheReadTokens int `json:"cache_read_tokens,omitempty"`
+	// CacheWriteTokens are prompt tokens the provider stored in its prefix
+	// cache on this call, so later calls with the same prefix can read them.
+	CacheWriteTokens int     `json:"cache_write_tokens,omitempty"`
+	Requests         int     `json:"requests"`
+	CostUSD          float64 `json:"cost_usd"`
 }
 
 // Add accumulates another usage into u.
 func (u *Usage) Add(o Usage) {
 	u.InputTokens += o.InputTokens
 	u.OutputTokens += o.OutputTokens
+	u.CacheReadTokens += o.CacheReadTokens
+	u.CacheWriteTokens += o.CacheWriteTokens
 	u.Requests += o.Requests
 	u.CostUSD += o.CostUSD
 }
 
-// TotalTokens returns input + output tokens.
-func (u Usage) TotalTokens() int { return u.InputTokens + u.OutputTokens }
+// PromptTokens returns every prompt token the provider processed, whether
+// billed at the full, cache-write, or cache-read rate.
+func (u Usage) PromptTokens() int {
+	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+}
+
+// TotalTokens returns prompt + output tokens.
+func (u Usage) TotalTokens() int { return u.PromptTokens() + u.OutputTokens }
+
+// CacheHitRate is the share of prompt tokens served from the provider's
+// prefix cache (0 when nothing was cached).
+func (u Usage) CacheHitRate() float64 {
+	p := u.PromptTokens()
+	if p == 0 {
+		return 0
+	}
+	return float64(u.CacheReadTokens) / float64(p)
+}
 
 // Budget bounds what a run, stage, or task may spend. Zero values mean
 // "no limit" for that dimension.

@@ -20,6 +20,11 @@ type Mock struct {
 	mu       sync.Mutex
 	calls    int
 	failures []error
+	// prefixes simulates the provider-side prompt cache: the first request
+	// carrying a given (model, system, prefix) writes an entry, later ones
+	// read it. Modelling it here is what lets offline development see the
+	// same cache accounting — and the same savings — as a real provider.
+	prefixes map[string]bool
 }
 
 // MockOption configures a Mock.
@@ -49,7 +54,7 @@ func WithFailures(errs ...error) MockOption {
 
 // NewMock builds a mock provider.
 func NewMock(name string, opts ...MockOption) *Mock {
-	m := &Mock{name: name}
+	m := &Mock{name: name, prefixes: map[string]bool{}}
 	for _, o := range opts {
 		o(m)
 	}
@@ -79,6 +84,7 @@ func (m *Mock) Complete(ctx context.Context, call CallContext, req Request) (Res
 		scripted = m.failures[0]
 		m.failures = m.failures[1:]
 	}
+	cached := m.admitPrefixLocked(req)
 	m.mu.Unlock()
 
 	if m.latency > 0 {
@@ -95,15 +101,44 @@ func (m *Mock) Complete(ctx context.Context, call CallContext, req Request) (Res
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{
-		Text:  text,
-		Model: req.Model,
-		Usage: core.Usage{
-			InputTokens:  estimateTokens(req.System) + estimateTokens(req.Prompt),
-			OutputTokens: estimateTokens(text),
-			Requests:     1,
-		},
-	}, nil
+	usage := core.Usage{
+		InputTokens:  estimateTokens(req.Prompt),
+		OutputTokens: estimateTokens(text),
+		Requests:     1,
+	}
+	shared := estimateTokens(req.System) + estimateTokens(req.Prefix)
+	switch {
+	case cached == prefixRead:
+		usage.CacheReadTokens = shared
+	case cached == prefixWrite:
+		usage.CacheWriteTokens = shared
+	default:
+		usage.InputTokens += shared
+	}
+	return Response{Text: text, Model: req.Model, Usage: usage}, nil
+}
+
+// prefixState is how a call interacted with the simulated prompt cache.
+type prefixState int
+
+const (
+	prefixUncached prefixState = iota
+	prefixWrite
+	prefixRead
+)
+
+// admitPrefixLocked reports whether this request writes or reads the
+// simulated prefix cache. Callers hold m.mu.
+func (m *Mock) admitPrefixLocked(req Request) prefixState {
+	if !req.CachePrefix || (req.System == "" && req.Prefix == "") {
+		return prefixUncached
+	}
+	key := req.Model + "\x00" + req.System + "\x00" + req.Prefix
+	if m.prefixes[key] {
+		return prefixRead
+	}
+	m.prefixes[key] = true
+	return prefixWrite
 }
 
 // RegisterMock creates a mock provider, registers it under id/tier, and

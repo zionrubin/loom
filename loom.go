@@ -15,6 +15,8 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
@@ -42,6 +44,8 @@ type Config struct {
 	Tools           []executor.Tool
 	Broadcasts      map[string]any
 	EventHandler    func(observe.Event)
+	Streaming       bool
+	BatchWait       time.Duration
 }
 
 // Option configures a run.
@@ -108,6 +112,31 @@ func WithBroadcast(name string, value any) Option {
 		c.Broadcasts[name] = value
 	}
 }
+
+// WithStreaming replaces the stage-barrier driver with pipelined execution:
+// a record becomes eligible for the next stage the moment its own task
+// completes, instead of when its whole stage does.
+//
+// The pipeline, planner, envelopes, caching, and recovery are identical —
+// only the driver changes. What changes observably is occupancy and latency:
+// downstream stages start while upstream ones are still running, so a slow
+// task no longer idles the workers behind it, and the first end-to-end result
+// arrives without waiting for the widest stage to drain.
+//
+// The tradeoff is ordering. Records flow in completion order rather than
+// input order, so a stage's outputs are no longer guaranteed to line up with
+// its inputs positionally. Stages that must see the whole dataset — Combine
+// and ReduceAI — remain natural barriers and still do. Use the default
+// barrier driver when output order is part of the contract.
+func WithStreaming() Option { return func(c *Config) { c.Streaming = true } }
+
+// WithBatchWait bounds how long a streaming stage with WithBatchSize waits
+// for a partial batch to fill before sending it anyway (default 25ms).
+//
+// It is the knob that keeps batching from reintroducing the barrier it was
+// meant to remove: without a deadline, the last few records of a stream would
+// wait indefinitely for a group that will never arrive.
+func WithBatchWait(d time.Duration) Option { return func(c *Config) { c.BatchWait = d } }
 
 // WithEventHandler attaches a synchronous observer of all run events.
 func WithEventHandler(fn func(observe.Event)) Option {
@@ -215,66 +244,125 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 		})
 	}
 
-	outputs := map[string][]core.Record{}
-	var failures []runtime.Failure
-
-	finish := func(runErr error) (*RunResult, error) {
-		bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID})
-		res := &RunResult{
-			RunID:        runID,
-			StageOutputs: outputs,
-			Report:       collector.Report(),
-			Failures:     failures,
-			Lineage:      lineage.Entries(),
-			Audit:        audit.Entries(),
-			Broadcasts:   broadcasts.Hashes(),
-			Spent:        governor.Spent(),
-		}
-		if term := pl.Terminal(); len(term) == 1 {
-			res.Output = outputs[term[0]]
-		}
-		return res, runErr
+	d := &driver{
+		plan: pl, runID: runID, cfg: cfg, sched: sched, bus: bus,
+		outputs: map[string][]core.Record{},
 	}
 
-	for _, sp := range pl.Order {
+	run := d.barrier
+	if cfg.Streaming {
+		run = d.stream
+	}
+	runErr := run(ctx)
+
+	bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID})
+	res := &RunResult{
+		RunID:        runID,
+		StageOutputs: d.outputs,
+		Report:       collector.Report(),
+		Failures:     d.failures,
+		Lineage:      lineage.Entries(),
+		Audit:        audit.Entries(),
+		Broadcasts:   broadcasts.Hashes(),
+		Spent:        governor.Spent(),
+	}
+	if term := pl.Terminal(); len(term) == 1 {
+		res.Output = d.outputs[term[0]]
+	}
+	return res, runErr
+}
+
+// driver holds the state a run's execution strategy accumulates. Both
+// strategies — the stage-barrier driver below and the streaming driver in
+// stream.go — fill the same fields from the same plan, scheduler, and event
+// bus, so which one ran is invisible to everything downstream of Run.
+type driver struct {
+	plan  *plan.Plan
+	runID string
+	cfg   Config
+	sched runtime.Scheduler
+	bus   *observe.Bus
+
+	mu       sync.Mutex
+	outputs  map[string][]core.Record
+	failures []runtime.Failure
+}
+
+func (d *driver) record(stage string, recs []core.Record) {
+	d.mu.Lock()
+	d.outputs[stage] = recs
+	d.mu.Unlock()
+}
+
+func (d *driver) fail(fails ...runtime.Failure) {
+	if len(fails) == 0 {
+		return
+	}
+	d.mu.Lock()
+	d.failures = append(d.failures, fails...)
+	d.mu.Unlock()
+}
+
+// stageStarted publishes the stage header every driver owes observers.
+func (d *driver) stageStarted(s *pipeline.Stage) {
+	e := observe.Event{Type: observe.StageStarted, RunID: d.runID, Stage: s.ID,
+		Kind: string(s.Kind), Detail: stageDetail(s)}
+	if s.Upstream != nil {
+		e.Upstream = s.Upstream.ID
+	}
+	d.bus.Publish(e)
+}
+
+func (d *driver) stageFinished(s *pipeline.Stage) {
+	d.bus.Publish(observe.Event{Type: observe.StageFinished, RunID: d.runID, Stage: s.ID})
+}
+
+// source materializes a source stage's records.
+func (d *driver) source(ctx context.Context, s *pipeline.Stage) ([]core.Record, error) {
+	if s.SourceFn == nil {
+		return s.SourceRecords, nil
+	}
+	recs, err := s.SourceFn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("source %q: %w", s.ID, err)
+	}
+	return recs, nil
+}
+
+// barrier runs the plan one stage at a time: every task of a stage completes
+// before the next stage starts. Simple, order-preserving, and the default.
+func (d *driver) barrier(ctx context.Context) error {
+	for _, sp := range d.plan.Order {
 		if ctx.Err() != nil {
-			return finish(ctx.Err())
+			return ctx.Err()
 		}
 		s := sp.Stage
-		started := observe.Event{Type: observe.StageStarted, RunID: runID, Stage: s.ID,
-			Kind: string(s.Kind), Detail: stageDetail(s)}
-		if s.Upstream != nil {
-			started.Upstream = s.Upstream.ID
-		}
-		bus.Publish(started)
+		d.stageStarted(s)
 
 		var input []core.Record
 		if s.Upstream != nil {
-			input = outputs[s.Upstream.ID]
+			input = d.outputs[s.Upstream.ID]
 		}
 
-		stageSched := sched
+		stageSched := d.sched
 		if s.Opts.Parallelism > 0 {
 			stageSched.Workers = s.Opts.Parallelism
 		}
 
 		switch s.Kind {
 		case pipeline.KindSource:
-			recs := s.SourceRecords
-			if s.SourceFn != nil {
-				recs, err = s.SourceFn(ctx)
-				if err != nil {
-					return finish(fmt.Errorf("source %q: %w", s.ID, err))
-				}
+			recs, err := d.source(ctx, s)
+			if err != nil {
+				return err
 			}
-			outputs[s.ID] = recs
+			d.record(s.ID, recs)
 
 		case pipeline.KindCombine:
 			folded, err := foldCombine(s, input)
 			if err != nil {
-				return finish(fmt.Errorf("combine %q: %w", s.ID, err))
+				return fmt.Errorf("combine %q: %w", s.ID, err)
 			}
-			outputs[s.ID] = folded
+			d.record(s.ID, folded)
 
 		case pipeline.KindReduceAI:
 			cur := input
@@ -283,40 +371,39 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 				fanIn = 8
 			}
 			for len(cur) > 0 {
-				tasks, err := sp.BuildTasksBatch(runID, cur, fanIn, cfg.EgressAllow)
+				tasks, err := sp.BuildTasksBatch(d.runID, cur, fanIn, d.cfg.EgressAllow)
 				if err != nil {
-					return finish(err)
+					return err
 				}
 				results, fails, execErr := stageSched.ExecuteAll(ctx, tasks)
-				failures = append(failures, fails...)
+				d.fail(fails...)
 				cur = flatten(results)
 				if execErr != nil {
-					outputs[s.ID] = cur
-					return finish(execErr)
+					d.record(s.ID, cur)
+					return execErr
 				}
 				if len(tasks) == 1 {
 					break // final aggregation level completed
 				}
 			}
-			outputs[s.ID] = cur
+			d.record(s.ID, cur)
 
 		default: // fused pure stages and infer
-			tasks, err := sp.BuildTasks(runID, input, cfg.EgressAllow)
+			tasks, err := sp.BuildTasks(d.runID, input, d.cfg.EgressAllow)
 			if err != nil {
-				return finish(err)
+				return err
 			}
 			results, fails, execErr := stageSched.ExecuteAll(ctx, tasks)
-			failures = append(failures, fails...)
-			outputs[s.ID] = flatten(results)
+			d.fail(fails...)
+			d.record(s.ID, flatten(results))
 			if execErr != nil {
-				return finish(execErr)
+				return execErr
 			}
 		}
 
-		bus.Publish(observe.Event{Type: observe.StageFinished, RunID: runID, Stage: s.ID})
+		d.stageFinished(s)
 	}
-
-	return finish(nil)
+	return nil
 }
 
 // stageDetail renders a human-readable description of a stage's declaration
@@ -352,6 +439,9 @@ func stageDetail(s *pipeline.Stage) string {
 		if s.Infer.Validate != nil {
 			line("validated: semantic gate on each produced record")
 		}
+		if s.Infer.Prefix != "" {
+			line("shared prefix (rendered once per task, cacheable):\n%s", s.Infer.Prefix)
+		}
 		line("prompt template:\n%s", s.Infer.Prompt)
 	case pipeline.KindReduceAI:
 		fanIn := s.Reduce.FanIn
@@ -365,6 +455,9 @@ func stageDetail(s *pipeline.Stage) string {
 		line("hierarchical AI reduce · %s", bindingDetail(s.Reduce.Binding))
 		line("fan-in: %d records per aggregation call, repeated until one remains", fanIn)
 		line("aggregates field %q from each input record", itemField)
+		if s.Reduce.Prefix != "" {
+			line("shared prefix (rendered once per task, cacheable):\n%s", s.Reduce.Prefix)
+		}
 		line("prompt template:\n%s", s.Reduce.Prompt)
 	case pipeline.KindCombine:
 		line("pairwise fold over all records (driver-executed)")
@@ -384,6 +477,9 @@ func stageDetail(s *pipeline.Stage) string {
 	}
 	if s.Opts.NoCache {
 		line("caching disabled")
+	}
+	if s.Opts.NoPrefixCache {
+		line("prompt-prefix caching disabled")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

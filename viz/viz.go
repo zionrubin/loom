@@ -37,8 +37,11 @@ var uiFS embed.FS
 
 // Usage is per-node token/cost accounting (JSON-shaped for the UI).
 type Usage struct {
-	InputTokens  int     `json:"in"`
-	OutputTokens int     `json:"out"`
+	InputTokens  int `json:"in"`
+	OutputTokens int `json:"out"`
+	// CachedTokens are prompt tokens the provider served from the shared
+	// prefix cache rather than reprocessing.
+	CachedTokens int     `json:"cached"`
 	Requests     int     `json:"req"`
 	CostUSD      float64 `json:"cost"`
 }
@@ -337,10 +340,17 @@ func (s *Server) Handle(e observe.Event) {
 		} else {
 			n.Usage.InputTokens += e.Usage.InputTokens
 			n.Usage.OutputTokens += e.Usage.OutputTokens
+			n.Usage.CachedTokens += e.Usage.CacheReadTokens
 			n.Usage.Requests += e.Usage.Requests
 			n.Usage.CostUSD += e.Usage.CostUSD
-			logf(n, now, "model call %s: %d in / %d out tokens, $%.5f, %s",
-				orDash(e.Model), e.Usage.InputTokens, e.Usage.OutputTokens,
+			shared := ""
+			if e.Usage.CacheReadTokens > 0 {
+				shared = fmt.Sprintf(" (+%d from shared prefix)", e.Usage.CacheReadTokens)
+			} else if e.Usage.CacheWriteTokens > 0 {
+				shared = fmt.Sprintf(" (+%d written to shared prefix)", e.Usage.CacheWriteTokens)
+			}
+			logf(n, now, "model call %s: %d in%s / %d out tokens, $%.5f, %s",
+				orDash(e.Model), e.Usage.InputTokens, shared, e.Usage.OutputTokens,
 				e.Usage.CostUSD, e.Latency.Round(time.Millisecond))
 		}
 		d.Task = n

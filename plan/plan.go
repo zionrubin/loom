@@ -172,11 +172,18 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
 			}
+			if spec.Prefix != "" {
+				if _, err := template.New(s.ID + ".prefix").Funcs(pipeline.TemplateFuncs()).
+					Parse(spec.Prefix); err != nil {
+					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
+				}
+			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = fingerprint(sp, "infer", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix,
+				"infer", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
-				fragmentKey(spec.Context), s.Opts.Version)
+				fragmentKey(spec.Context), s.Opts.Version)...)
 			if err != nil {
 				return nil, err
 			}
@@ -190,15 +197,22 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 				Parse(spec.Prompt); err != nil {
 				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
 			}
+			if spec.Prefix != "" {
+				if _, err := template.New(s.ID + ".prefix").Funcs(pipeline.TemplateFuncs()).
+					Parse(spec.Prefix); err != nil {
+					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
+				}
+			}
 			cands, err := reg.Candidates(spec.Binding)
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = fingerprint(sp, "reduce_ai", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix,
+				"reduce_ai", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.FanIn, spec.MaxTokens, spec.ItemField, spec.OutputField,
-				s.Opts.Version)
+				s.Opts.Version)...)
 			if err != nil {
 				return nil, err
 			}
@@ -339,6 +353,17 @@ func broadcastKey(m map[string]string) []map[string]string {
 	return out
 }
 
+// prefixKey appends the shared prompt prefix to a stage's fingerprint
+// components, and only when the stage declares one — a stage without a prefix
+// hashes exactly as it did before the feature existed, so adopting prefix
+// caching elsewhere in a pipeline leaves untouched stages' caches warm.
+func prefixKey(prefix string, parts ...any) []any {
+	if prefix == "" {
+		return parts
+	}
+	return append(parts, map[string]string{"prefix": prefix})
+}
+
 // fingerprint hashes a stage's op spec, appending the broadcast component
 // only when the stage declares one — so adding this feature leaves the
 // fingerprints (and therefore the warm caches) of existing pipelines
@@ -427,6 +452,16 @@ func (sp *StagePlan) BuildTasksBatch(runID string, input []core.Record, batch in
 		batch = 1
 	}
 	env := sp.Envelope(runID, extraEgress)
+
+	// Prompt-prefix caching pays for itself from the second call onward: the
+	// entry costs a write premium and every later hit is a fraction of a
+	// fresh input token. A stage that issues a single call would pay the
+	// premium and never read it back, so the break-even test is simply
+	// whether this stage has more than one task to share the prefix across.
+	if !sp.Stage.Opts.NoPrefixCache && !env.Binding.IsZero() {
+		calls := (len(input) + batch - 1) / batch
+		env.CachePrefix = calls > 1
+	}
 
 	var maxTokens int
 	switch sp.Stage.Kind {
