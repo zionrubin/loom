@@ -61,8 +61,13 @@ type Envelope struct {
 	// of once per task. Reads additionally require the matching
 	// security.DataCap grant.
 	Broadcasts map[string]string `json:"broadcasts,omitempty"`
-	Budget     core.Budget       `json:"budget"`
-	Sandbox    SandboxProfile    `json:"sandbox"`
+	// CachePrefix authorizes the executor to ask the provider to cache this
+	// stage's shared prompt prefix. The planner sets it only when the stage
+	// issues more than one model call, so a cache entry is never written
+	// without a second call to read it.
+	CachePrefix bool           `json:"cache_prefix,omitempty"`
+	Budget      core.Budget    `json:"budget"`
+	Sandbox     SandboxProfile `json:"sandbox"`
 }
 
 // Task is one schedulable unit: a batch of input records plus the envelope

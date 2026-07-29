@@ -46,6 +46,8 @@ type StageOpts struct {
 	Broadcasts  []string // run-level shared values this stage may read
 	Version     string   // content-version for Go-func stages; enables caching
 	NoCache     bool
+	// NoPrefixCache opts the stage out of provider prompt-prefix caching.
+	NoPrefixCache bool
 }
 
 // Option configures a stage.
@@ -104,6 +106,15 @@ func TemplateFuncs() template.FuncMap {
 // WithNoCache disables caching for this stage.
 func WithNoCache() Option { return func(o *StageOpts) { o.NoCache = true } }
 
+// WithoutPrefixCache opts an AI stage out of provider prompt-prefix caching.
+//
+// The planner enables prefix caching whenever a stage issues more than one
+// model call, because a written cache entry pays for itself on its second
+// read. Use this to opt out where that reasoning doesn't hold — a provider
+// whose cache you don't want to populate, or a prefix you know is unique per
+// task despite the stage shape.
+func WithoutPrefixCache() Option { return func(o *StageOpts) { o.NoPrefixCache = true } }
+
 // InferSpec declares a per-record model operation.
 type InferSpec struct {
 	// Binding declares which model (or tier) to use, with an optional
@@ -111,6 +122,16 @@ type InferSpec struct {
 	Binding model.Binding
 	// System is the system prompt.
 	System string
+	// Prefix is an optional shared prompt head, rendered once per task
+	// instead of once per record and placed ahead of every rendered Prompt.
+	//
+	// It is a text/template with no record data in scope — only the broadcast
+	// functions — which is precisely what makes it shared: every call this
+	// stage issues sends the same leading bytes, so the provider's prompt
+	// cache serves the prefix instead of reprocessing it per record. Put the
+	// rubric, taxonomy, or few-shot examples here and keep Prompt down to
+	// what actually varies.
+	Prefix string
 	// Prompt is a text/template rendered against each record's Data
 	// (e.g. "Classify: {{.subject}}").
 	Prompt string
@@ -137,6 +158,11 @@ type InferSpec struct {
 type ReduceAISpec struct {
 	Binding model.Binding
 	System  string
+	// Prefix is an optional shared prompt head rendered once per aggregation
+	// task and placed ahead of Prompt — the same shared-prefix mechanism as
+	// InferSpec.Prefix, and worth using for the aggregation rubric that every
+	// level of the reduce tree repeats.
+	Prefix string
 	// Prompt is a text/template over {"Items": []string, "Count": int}.
 	Prompt string
 	// FanIn is the group size per aggregation call (default 8).

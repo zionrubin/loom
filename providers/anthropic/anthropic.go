@@ -71,10 +71,16 @@ func (p *Provider) Complete(ctx context.Context, call model.CallContext, req mod
 	params := sdk.MessageNewParams{
 		Model:     sdk.Model(req.Model),
 		MaxTokens: int64(req.MaxTokens),
-		Messages:  []sdk.MessageParam{sdk.NewUserMessage(sdk.NewTextBlock(req.Prompt))},
+		Messages:  []sdk.MessageParam{sdk.NewUserMessage(promptBlocks(req)...)},
 	}
 	if req.System != "" {
-		params.System = []sdk.TextBlockParam{{Text: req.System}}
+		sys := sdk.TextBlockParam{Text: req.System}
+		// With no shared prefix block to mark, the system prompt is the last
+		// stable content and carries the breakpoint itself.
+		if req.CachePrefix && req.Prefix == "" {
+			sys.CacheControl = sdk.NewCacheControlEphemeralParam()
+		}
+		params.System = []sdk.TextBlockParam{sys}
 	}
 
 	client := p.client(key)
@@ -99,11 +105,34 @@ func (p *Provider) Complete(ctx context.Context, call model.CallContext, req mod
 		Text:  text,
 		Model: string(msg.Model),
 		Usage: core.Usage{
-			InputTokens:  int(msg.Usage.InputTokens),
-			OutputTokens: int(msg.Usage.OutputTokens),
-			Requests:     1,
+			// input_tokens already excludes both cache classes, which is
+			// exactly core.Usage's disjoint split — no adjustment needed.
+			InputTokens:      int(msg.Usage.InputTokens),
+			OutputTokens:     int(msg.Usage.OutputTokens),
+			CacheReadTokens:  int(msg.Usage.CacheReadInputTokens),
+			CacheWriteTokens: int(msg.Usage.CacheCreationInputTokens),
+			Requests:         1,
 		},
 	}, nil
+}
+
+// promptBlocks splits the prompt into a shared prefix block and the
+// per-record remainder. Anthropic renders tools → system → messages, so a
+// breakpoint at the end of the prefix block caches everything ahead of the
+// varying content — the whole stage-stable head, once, for every task in the
+// stage that sends the same bytes.
+func promptBlocks(req model.Request) []sdk.ContentBlockParamUnion {
+	if req.Prefix == "" {
+		return []sdk.ContentBlockParamUnion{sdk.NewTextBlock(req.Prompt)}
+	}
+	prefix := sdk.TextBlockParam{Text: req.Prefix}
+	if req.CachePrefix {
+		prefix.CacheControl = sdk.NewCacheControlEphemeralParam()
+	}
+	return []sdk.ContentBlockParamUnion{
+		{OfText: &prefix},
+		sdk.NewTextBlock(req.Prompt),
+	}
 }
 
 // classify maps SDK errors onto Loom's failure taxonomy.
