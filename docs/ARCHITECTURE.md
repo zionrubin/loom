@@ -219,6 +219,15 @@ development, scripted failures), and `providers/anthropic` and
   that read it recompute), and the value is immutable for the run's
   lifetime, so replaying a cached result cannot observe a different world
   than the original execution did.
+- **Prompt prefixes** — the second layer of sharing, and the one that
+  reaches the model rather than the worker. A broadcast makes every task
+  reference the same bytes; a stage's `Prefix` makes every task send those
+  bytes in the same leading position, so the provider's prompt cache serves
+  the prefix instead of reprocessing it per record. The planner enables it
+  only when a stage issues more than one call — the point at which a cache
+  write can be earned back — and the prefix joins the stage fingerprint on
+  the same terms a broadcast hash does. See
+  [INFERENCE.md](./INFERENCE.md#shared-memory-prefix-caching).
 - **Lineage** — every artifact records the run, stage, op fingerprint,
   model, input hashes, and broadcast hashes that produced it: reproducibility
   and audit for outputs whose provenance would otherwise be "a model said
@@ -293,12 +302,17 @@ sandboxes whose imports are generated *from the envelope's grant set*, making
 the capability model enforceable at the instruction level rather than by
 convention.
 
-**Phase 4 — streaming and dynamic scheduling.** The current driver runs
-stage barriers (simple, predictable). The planner's DAG already contains
-what's needed for pipelined execution (start downstream tasks as upstream
-records complete), speculative re-execution of stragglers, and
-cost-based model routing (route records to cheaper models and escalate only
-the hard ones — the escalation ladder generalized from recovery to policy).
+**Phase 4 — streaming and dynamic scheduling.** Pipelined execution is
+implemented: `loom.WithStreaming()` runs every stage concurrently against one
+global pool of execution slots, moving each record downstream as its own task
+completes rather than at a stage barrier (see
+[INFERENCE.md](./INFERENCE.md#asynchronous-agents-continuous-batching)). The
+barrier driver remains the default because streaming trades input ordering
+for occupancy. Still open in this phase: speculative re-execution of
+stragglers — now worth adding, since a straggler delays only its own record —
+and cost-based model routing (route records to cheaper models and escalate
+only the hard ones, the escalation ladder generalized from recovery to
+policy).
 
 **Also on the roadmap:**
 - **Semantic caching** — embedding-similarity lookup in front of the exact
@@ -318,11 +332,13 @@ Implemented and tested in this repository: the pipeline API, planner
 (validation, fusion, fingerprints, least-privilege envelopes), scheduler
 (admission control, governor, class-aware retries with escalation), local
 executor, capability/secret/egress/broadcast/audit security, CAS + persistent
-cache + lineage, content-hash-referenced broadcast values, event bus + run
-reports, tree AI-reduce, mock, Anthropic, and OpenAI providers, and
-cross-restart cache resume.
+cache + lineage, content-hash-referenced broadcast values, shared prompt
+prefixes with provider prompt-cache accounting, streaming (continuously
+batched) execution alongside the barrier driver, event bus + run reports,
+tree AI-reduce, mock, Anthropic, and OpenAI providers, and cross-restart
+cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
-stores, subprocess/container/WASM sandbox runtimes, streaming execution,
-semantic cache, ensemble operators. The interfaces above are the contract
-those implementations plug into.
+stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
+operators, priority/preemptive scheduling, and result-cache eviction. The
+interfaces above are the contract those implementations plug into.

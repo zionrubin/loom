@@ -87,9 +87,9 @@ func (m *ModelClient) Call(ctx context.Context, env task.Envelope, taskID, model
 
 	// The full rendered request, for observability consumers (e.g. the
 	// constellation view's per-call drill-down).
-	rendered := req.Prompt
+	rendered := req.FullPrompt()
 	if req.System != "" {
-		rendered = "[system] " + req.System + "\n\n" + req.Prompt
+		rendered = "[system] " + req.System + "\n\n" + rendered
 	}
 	rendered = observe.Clip(rendered)
 
@@ -118,6 +118,9 @@ func (m *ModelClient) Call(ctx context.Context, env task.Envelope, taskID, model
 			Type: observe.ModelCalled, RunID: env.RunID, Stage: env.Stage,
 			TaskID: taskID, Model: resp.Model, Usage: resp.Usage, Latency: latency,
 			Prompt: rendered, Response: observe.Clip(resp.Text),
+			// Pricing lives in the registry, so the saving a prefix cache hit
+			// produced is computed here, where both usage and rates are known.
+			Saved: info.Pricing.Saved(resp.Usage),
 		})
 	}
 	return resp, nil
