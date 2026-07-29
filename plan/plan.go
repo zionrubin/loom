@@ -8,6 +8,7 @@ package plan
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"text/template"
 
 	"github.com/zionrubin/loom/core"
@@ -25,6 +26,14 @@ type StagePlan struct {
 	Candidates  []model.Info      // resolved binding ladder for AI stages
 	Broadcasts  map[string]string // declared shared values → content hash
 	Cacheable   bool
+
+	// built counts the tasks this stage has produced across every call to
+	// BuildTasks. It is what makes the prefix-cache break-even test work
+	// under both drivers: the barrier driver hands over a stage's whole
+	// input at once, while a streaming driver arrives with a couple of
+	// records at a time, and only a running total can tell the difference
+	// between "this stage makes one call" and "this stage is being fed".
+	built atomic.Int64
 }
 
 // Option configures compilation.
@@ -172,11 +181,18 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
 			}
+			if spec.Prefix != "" {
+				if _, err := template.New(s.ID + ".prefix").Funcs(pipeline.TemplateFuncs()).
+					Parse(spec.Prefix); err != nil {
+					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
+				}
+			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = fingerprint(sp, "infer", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix,
+				"infer", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
-				fragmentKey(spec.Context), s.Opts.Version)
+				fragmentKey(spec.Context), s.Opts.Version)...)
 			if err != nil {
 				return nil, err
 			}
@@ -190,15 +206,22 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 				Parse(spec.Prompt); err != nil {
 				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
 			}
+			if spec.Prefix != "" {
+				if _, err := template.New(s.ID + ".prefix").Funcs(pipeline.TemplateFuncs()).
+					Parse(spec.Prefix); err != nil {
+					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
+				}
+			}
 			cands, err := reg.Candidates(spec.Binding)
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = fingerprint(sp, "reduce_ai", bindingKey(spec.Binding), spec.System,
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix,
+				"reduce_ai", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.FanIn, spec.MaxTokens, spec.ItemField, spec.OutputField,
-				s.Opts.Version)
+				s.Opts.Version)...)
 			if err != nil {
 				return nil, err
 			}
@@ -339,6 +362,17 @@ func broadcastKey(m map[string]string) []map[string]string {
 	return out
 }
 
+// prefixKey appends the shared prompt prefix to a stage's fingerprint
+// components, and only when the stage declares one — a stage without a prefix
+// hashes exactly as it did before the feature existed, so adopting prefix
+// caching elsewhere in a pipeline leaves untouched stages' caches warm.
+func prefixKey(prefix string, parts ...any) []any {
+	if prefix == "" {
+		return parts
+	}
+	return append(parts, map[string]string{"prefix": prefix})
+}
+
 // fingerprint hashes a stage's op spec, appending the broadcast component
 // only when the stage declares one — so adding this feature leaves the
 // fingerprints (and therefore the warm caches) of existing pipelines
@@ -427,6 +461,26 @@ func (sp *StagePlan) BuildTasksBatch(runID string, input []core.Record, batch in
 		batch = 1
 	}
 	env := sp.Envelope(runID, extraEgress)
+
+	// Prompt-prefix caching pays for itself from the second call onward: the
+	// entry costs a write premium and every later hit is a fraction of a
+	// fresh input token. A stage that only ever issues one call would pay
+	// the premium and never read it back, so the test is whether this stage
+	// has more than one task to share the prefix across — counted across the
+	// stage's whole life, not just this batch, since a streaming driver
+	// builds a stage's tasks a few at a time.
+	//
+	// A driver that hands over a stage's whole input at once therefore caches
+	// from the first task. A driver that streams records in learns the prefix
+	// is shared only when the second task arrives, so it writes the entry
+	// there and reads it from the third on — one call of warm-up, whatever
+	// the stage's eventual size. That is the price of never writing an entry
+	// nothing will read, and it is the cheaper side of the trade.
+	nTasks := (len(input) + batch - 1) / batch
+	total := sp.built.Add(int64(nTasks))
+	if !sp.Stage.Opts.NoPrefixCache && !env.Binding.IsZero() {
+		env.CachePrefix = total > 1
+	}
 
 	var maxTokens int
 	switch sp.Stage.Kind {

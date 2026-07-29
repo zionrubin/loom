@@ -69,9 +69,16 @@ func (p *Provider) Complete(ctx context.Context, call model.CallContext, req mod
 		return model.Response{}, core.Permanent(err)
 	}
 
-	messages := make([]sdk.ChatCompletionMessageParamUnion, 0, 2)
+	// OpenAI caches prompt prefixes automatically, with no breakpoint to
+	// mark: what it needs is for the stage-stable content to occupy the same
+	// leading bytes on every call. Sending the shared prefix as its own
+	// message ahead of the varying record keeps that head contiguous.
+	messages := make([]sdk.ChatCompletionMessageParamUnion, 0, 3)
 	if req.System != "" {
 		messages = append(messages, sdk.SystemMessage(req.System))
+	}
+	if req.Prefix != "" {
+		messages = append(messages, sdk.SystemMessage(req.Prefix))
 	}
 	messages = append(messages, sdk.UserMessage(req.Prompt))
 	params := sdk.ChatCompletionNewParams{
@@ -103,12 +110,30 @@ func (p *Provider) Complete(ctx context.Context, call model.CallContext, req mod
 	return model.Response{
 		Text:  choice.Message.Content,
 		Model: completion.Model,
-		Usage: core.Usage{
-			InputTokens:  int(completion.Usage.PromptTokens),
-			OutputTokens: int(completion.Usage.CompletionTokens),
-			Requests:     1,
-		},
+		Usage: usageOf(completion.Usage),
 	}, nil
+}
+
+// usageOf normalizes OpenAI's usage into core.Usage's disjoint prompt-token
+// split. OpenAI reports prompt_tokens as the whole prompt with the cached and
+// written counts as breakdowns of it, so the cache classes are subtracted out
+// to leave InputTokens holding only the full-price remainder. The subtraction
+// is clamped: a provider that ever reports a breakdown exceeding the total
+// should cost nothing negative.
+func usageOf(u sdk.CompletionUsage) core.Usage {
+	read := int(u.PromptTokensDetails.CachedTokens)
+	written := int(u.PromptTokensDetails.CacheWriteTokens)
+	input := int(u.PromptTokens) - read - written
+	if input < 0 {
+		input = 0
+	}
+	return core.Usage{
+		InputTokens:      input,
+		OutputTokens:     int(u.CompletionTokens),
+		CacheReadTokens:  read,
+		CacheWriteTokens: written,
+		Requests:         1,
+	}
 }
 
 // classify maps SDK errors onto Loom's failure taxonomy.

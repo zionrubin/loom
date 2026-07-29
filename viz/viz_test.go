@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -103,23 +104,14 @@ func TestStateMachine(t *testing.T) {
 	if a.Status != "completed" || a.Retries != 1 || a.Attempts != 2 {
 		t.Errorf("task_a = status %q retries %d attempts %d", a.Status, a.Retries, a.Attempts)
 	}
-	if a.Worker != "w1" || a.Model != "mock-fast" || a.Records != 2 || a.Input == "" {
+	if a.Worker != "w1" || a.Model != "mock-fast" || a.Records != 2 {
 		t.Errorf("task_a details = %+v", a)
 	}
 	if a.Usage.InputTokens != 100 || a.Usage.CostUSD != 0.002 || a.Calls != 2 {
 		t.Errorf("task_a usage = %+v calls %d", a.Usage, a.Calls)
 	}
-	if len(a.CallLog) != 2 {
-		t.Fatalf("task_a call log = %+v", a.CallLog)
-	}
-	if a.CallLog[0].Err == "" || a.CallLog[0].Prompt == "" {
-		t.Errorf("first call should record the failed request: %+v", a.CallLog[0])
-	}
-	if a.CallLog[1].Response != `{"urgent":true}` || a.CallLog[1].In != 100 {
-		t.Errorf("second call = %+v", a.CallLog[1])
-	}
-	if a.Output == "" || len(a.OutputIDs) != 2 || len(a.InputIDs) != 2 {
-		t.Errorf("task_a payloads = output %q inputIds %v outputIds %v", a.Output, a.InputIDs, a.OutputIDs)
+	if len(a.OutputIDs) != 2 || len(a.InputIDs) != 2 {
+		t.Errorf("task_a lineage = inputIds %v outputIds %v", a.InputIDs, a.OutputIDs)
 	}
 	if a.StartedAt != 1010 || a.EndedAt != 1090 || a.LatencyMS != 35 {
 		t.Errorf("task_a timing = start %d end %d latency %d", a.StartedAt, a.EndedAt, a.LatencyMS)
@@ -127,8 +119,11 @@ func TestStateMachine(t *testing.T) {
 	if a.Error != "" {
 		t.Errorf("completed task should clear error, got %q", a.Error)
 	}
-	if len(a.Log) == 0 {
-		t.Error("task_a should have a log")
+	// The heavy payloads deliberately do not ride the snapshot; they are
+	// fetched per task. Their *existence* is advertised so the UI can show
+	// sizes without paying for the bytes.
+	if a.Input != "" || a.Output != "" || len(a.CallLog) != 0 || len(a.Log) != 0 {
+		t.Error("snapshot carried heavy task payloads; they belong on /api/task")
 	}
 	if b.Status != "failed" || b.Error != "permanent: boom" {
 		t.Errorf("task_b = status %q err %q", b.Status, b.Error)
@@ -182,9 +177,113 @@ func TestLogCap(t *testing.T) {
 		v.Handle(observe.Event{Type: observe.ModelCalled, RunID: "r", Stage: "s",
 			TaskID: "t1", Model: "m", Usage: core.Usage{Requests: 1}, Time: at(int64(i + 2))})
 	}
-	snap := snapshot(t, v)
-	if got := len(snap.Tasks[0].Log); got != maxLogEntries {
+	v.mu.Lock()
+	got := len(v.taskIx["t1"].Log)
+	v.mu.Unlock()
+	if got != maxLogEntries {
 		t.Fatalf("log length = %d, want %d", got, maxLogEntries)
+	}
+}
+
+// TestSnapshotOmitsHeavyPayloads is the performance contract. A task's
+// rendered prompts, responses, and record JSON can run to hundreds of
+// kilobytes; multiplied by every task and re-sent on every event, that is
+// what made large runs unusable. The wire form must stay small no matter how
+// much detail a node accumulates.
+func TestSnapshotOmitsHeavyPayloads(t *testing.T) {
+	v := New()
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "r", Time: at(1)})
+
+	huge := strings.Repeat("x", 40_000)
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("t%d", i)
+		v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "r", Stage: "s",
+			TaskID: id, Records: 1, Input: huge, Time: at(2)})
+		v.Handle(observe.Event{Type: observe.ModelCalled, RunID: "r", Stage: "s",
+			TaskID: id, Model: "m", Prompt: huge, Response: huge,
+			Usage: core.Usage{Requests: 1}, Time: at(3)})
+		v.Handle(observe.Event{Type: observe.TaskCompleted, RunID: "r", Stage: "s",
+			TaskID: id, Output: huge, Time: at(4)})
+	}
+
+	v.mu.Lock()
+	b := v.snapshotLocked()
+	v.mu.Unlock()
+
+	// 50 tasks × ~160KB of payload would be ~8MB if it all shipped.
+	if len(b) > 100_000 {
+		t.Errorf("snapshot = %d bytes; heavy payloads are riding the wire", len(b))
+	}
+	if strings.Contains(string(b), huge) {
+		t.Error("snapshot contains a full payload verbatim")
+	}
+
+	// The sizes still travel, so the UI can describe what it has not fetched.
+	var snap struct {
+		Tasks []struct {
+			ID         string `json:"id"`
+			InputBytes int    `json:"inBytes"`
+			CallCount  int    `json:"callN"`
+			Rev        int    `json:"rev"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(b, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Tasks) != 50 {
+		t.Fatalf("tasks = %d, want 50", len(snap.Tasks))
+	}
+	if snap.Tasks[0].InputBytes != len(huge) || snap.Tasks[0].CallCount != 1 {
+		t.Errorf("detail sizes missing: %+v", snap.Tasks[0])
+	}
+	if snap.Tasks[0].Rev == 0 {
+		t.Error("rev should advance as detail accumulates, so clients can spot staleness")
+	}
+}
+
+// TestServeTaskDetail covers the lazy half: the payloads the snapshot skipped
+// must be retrievable for the one task a viewer opens.
+func TestServeTaskDetail(t *testing.T) {
+	v := New()
+	feedLifecycle(v)
+	srv := httptest.NewServer(v)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/api/task?id=task_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("GET /api/task status %d", res.StatusCode)
+	}
+	var d TaskDetail
+	if err := json.NewDecoder(res.Body).Decode(&d); err != nil {
+		t.Fatal(err)
+	}
+	if d.ID != "task_a" || d.Input == "" || d.Output == "" {
+		t.Errorf("detail = %+v", d)
+	}
+	if len(d.Calls) != 2 {
+		t.Fatalf("call log = %+v", d.Calls)
+	}
+	if d.Calls[0].Err == "" || d.Calls[0].Prompt == "" {
+		t.Errorf("first call should record the failed request: %+v", d.Calls[0])
+	}
+	if d.Calls[1].Response != `{"urgent":true}` || d.Calls[1].In != 100 {
+		t.Errorf("second call = %+v", d.Calls[1])
+	}
+	if len(d.Log) == 0 {
+		t.Error("detail should carry the event log")
+	}
+
+	missing, err := http.Get(srv.URL + "/api/task?id=nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown task status = %d, want 404", missing.StatusCode)
 	}
 }
 

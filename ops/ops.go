@@ -33,14 +33,22 @@ func BuildRunners(pl *plan.Plan) (map[string]executor.OpRunner, error) {
 			if err != nil {
 				return nil, err
 			}
-			runners[s.ID] = &inferRunner{spec: s.Infer, tmpl: tmpl}
+			prefix, err := parsePrefix(s.ID, s.Infer.Prefix)
+			if err != nil {
+				return nil, err
+			}
+			runners[s.ID] = &inferRunner{spec: s.Infer, tmpl: tmpl, prefix: prefix}
 		case pipeline.KindReduceAI:
 			tmpl, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
 				Parse(s.Reduce.Prompt)
 			if err != nil {
 				return nil, err
 			}
-			runners[s.ID] = &reduceRunner{spec: s.Reduce, tmpl: tmpl}
+			prefix, err := parsePrefix(s.ID, s.Reduce.Prefix)
+			if err != nil {
+				return nil, err
+			}
+			runners[s.ID] = &reduceRunner{spec: s.Reduce, tmpl: tmpl, prefix: prefix}
 		case pipeline.KindSource, pipeline.KindCombine:
 			// Executed by the driver, not the scheduler.
 		}
@@ -112,9 +120,42 @@ func contextPrefix(env task.Envelope) string {
 	return b.String()
 }
 
+// parsePrefix compiles a stage's shared prompt-prefix template, or returns
+// nil when the stage declares none.
+func parsePrefix(stageID, prefix string) (*template.Template, error) {
+	if prefix == "" {
+		return nil, nil
+	}
+	return template.New(stageID + ".prefix").Funcs(pipeline.TemplateFuncs()).Parse(prefix)
+}
+
+// sharedPrefix assembles the part of the prompt every call in this stage
+// sends identically: the envelope's context fragments followed by the
+// stage's rendered prefix template.
+//
+// It is rendered once per task, not once per record — both because the
+// result cannot vary by record (no record data is in scope) and because that
+// is what makes it a prefix the provider can cache across the whole stage.
+func sharedPrefix(ctx context.Context, tmpl *template.Template, rt *executor.Runtime) (string, error) {
+	prefix := contextPrefix(rt.Env)
+	if tmpl == nil {
+		return prefix, nil
+	}
+	bound, err := bindTemplate(ctx, tmpl, rt)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	if err := bound.Execute(&sb, nil); err != nil {
+		return "", core.Permanent(fmt.Errorf("render prompt prefix: %w", err))
+	}
+	return prefix + sb.String(), nil
+}
+
 type inferRunner struct {
-	spec *pipeline.InferSpec
-	tmpl *template.Template
+	spec   *pipeline.InferSpec
+	tmpl   *template.Template
+	prefix *template.Template
 }
 
 func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task) ([]core.Record, core.Usage, string, error) {
@@ -126,7 +167,10 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 	if maxTokens <= 0 {
 		maxTokens = 1024
 	}
-	prefix := contextPrefix(rt.Env)
+	prefix, err := sharedPrefix(ctx, r.prefix, rt)
+	if err != nil {
+		return nil, core.Usage{}, modelID, err
+	}
 	tmpl, err := bindTemplate(ctx, r.tmpl, rt, "missingkey=error")
 	if err != nil {
 		return nil, core.Usage{}, modelID, err
@@ -140,9 +184,11 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 			return nil, usage, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 		}
 		resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
-			System:    rt.Env.Context.System,
-			Prompt:    prefix + sb.String(),
-			MaxTokens: maxTokens,
+			System:      rt.Env.Context.System,
+			Prefix:      prefix,
+			Prompt:      sb.String(),
+			MaxTokens:   maxTokens,
+			CachePrefix: rt.Env.CachePrefix,
 		})
 		if err != nil {
 			return nil, usage, modelID, err
@@ -178,8 +224,9 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 }
 
 type reduceRunner struct {
-	spec *pipeline.ReduceAISpec
-	tmpl *template.Template
+	spec   *pipeline.ReduceAISpec
+	tmpl   *template.Template
+	prefix *template.Template
 }
 
 func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task) ([]core.Record, core.Usage, string, error) {
@@ -204,6 +251,10 @@ func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Tas
 	for _, rec := range t.Input {
 		items = append(items, rec.String(itemField))
 	}
+	prefix, err := sharedPrefix(ctx, r.prefix, rt)
+	if err != nil {
+		return nil, core.Usage{}, modelID, err
+	}
 	tmpl, err := bindTemplate(ctx, r.tmpl, rt)
 	if err != nil {
 		return nil, core.Usage{}, modelID, err
@@ -213,9 +264,11 @@ func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Tas
 		return nil, core.Usage{}, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 	}
 	resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
-		System:    rt.Env.Context.System,
-		Prompt:    sb.String(),
-		MaxTokens: maxTokens,
+		System:      rt.Env.Context.System,
+		Prefix:      prefix,
+		Prompt:      sb.String(),
+		MaxTokens:   maxTokens,
+		CachePrefix: rt.Env.CachePrefix,
 	})
 	if err != nil {
 		return nil, core.Usage{}, modelID, err
