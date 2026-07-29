@@ -118,7 +118,12 @@ this one, including what is deliberately left out.
   When a run completes, a **run summary** overlay (also on `s`) recaps every
   step — tasks, records, retries, cache hits, tokens, cost, p95 per stage —
   what each shared value saved by being referenced instead of copied, and
-  per-executor utilization.
+  per-executor utilization. The header names the driver that ran, stage and
+  task inspectors carry the shared prefix's cache economics, and under
+  streaming the executors are the engine's slots, so overlapping stages and
+  shared occupancy are visible as they happen. Heavy per-node payloads
+  (rendered prompts, responses, record JSON) load only for the node you open,
+  which is what keeps the view responsive on runs with thousands of tasks.
 - **Providers** — a deterministic mock (offline dev, scripted failures) plus
   Anthropic and OpenAI adapters over the official SDKs with per-call
   broker-resolved credentials. The `model.Provider` interface is small; add

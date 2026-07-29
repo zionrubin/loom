@@ -15,8 +15,14 @@
 //
 // The server folds the event stream into the state of the current run (a
 // new run.started event resets it), serves the embedded single-file UI at
-// /, a JSON snapshot at /api/state, and a live delta stream at /api/events
-// (server-sent events). It has no dependencies beyond the standard library.
+// /, a JSON snapshot at /api/state, a live delta stream at /api/events
+// (server-sent events), and one task's full detail at /api/task?id=…. It has
+// no dependencies beyond the standard library.
+//
+// Snapshots and deltas carry only what the constellation draws. A task's
+// heavy payloads — rendered prompts and responses, full record JSON — are
+// fetched per node, because a viewer reads one node at a time and shipping
+// every node's prompts on every event is what makes a large run unwatchable.
 package viz
 
 import (
@@ -67,6 +73,17 @@ type Call struct {
 }
 
 // Node is the visualized state of one task.
+//
+// A node holds two very different kinds of data. The light fields — status,
+// stage, timings, counters — are what the constellation draws, and they are
+// small enough to broadcast on every change. The heavy fields (Input, Output,
+// CallLog, Log) hold full rendered prompts, responses, and record JSON, and
+// can run to hundreds of kilobytes per task.
+//
+// Only the light fields go on the wire in snapshots and deltas; see
+// MarshalJSON. The heavy ones are served per task from /api/task, because a
+// viewer can only read one node's prompts at a time and paying to ship every
+// node's prompts on every event is what made large runs unusable.
 type Node struct {
 	ID        string   `json:"id"`
 	Stage     string   `json:"stage"`
@@ -92,7 +109,47 @@ type Node struct {
 	// Error intentionally has no omitempty: it clears when a retry succeeds,
 	// and clients that merge deltas must see the transition back to "".
 	Error string     `json:"error"`
-	Log   []LogEntry `json:"log"`
+	Log   []LogEntry `json:"log,omitempty"`
+
+	// rev increments whenever a heavy field changes. It rides along on the
+	// light wire form so a client displaying one node's detail can tell
+	// whether its copy is stale without refetching to find out.
+	rev int
+}
+
+// MarshalJSON emits the light form of a node: everything the constellation
+// needs to draw and rank it, plus the size of the detail it is not carrying.
+// The heavy payloads are fetched per node from /api/task.
+func (n *Node) MarshalJSON() ([]byte, error) {
+	type light Node // sheds the method, so this does not recurse
+	out := struct {
+		light
+		InputBytes  int `json:"inBytes,omitempty"`
+		OutputBytes int `json:"outBytes,omitempty"`
+		CallCount   int `json:"callN,omitempty"`
+		LogCount    int `json:"logN,omitempty"`
+		Rev         int `json:"rev,omitempty"`
+	}{
+		light:       light(*n),
+		InputBytes:  len(n.Input),
+		OutputBytes: len(n.Output),
+		CallCount:   len(n.CallLog),
+		LogCount:    len(n.Log),
+		Rev:         n.rev,
+	}
+	out.Input, out.Output, out.CallLog, out.Log = "", "", nil, nil
+	return json.Marshal(out)
+}
+
+// TaskDetail is the heavy half of a node, served on demand for the one task
+// a viewer is actually inspecting.
+type TaskDetail struct {
+	ID     string     `json:"id"`
+	Rev    int        `json:"rev"`
+	Input  string     `json:"input,omitempty"`
+	Output string     `json:"output,omitempty"`
+	Calls  []Call     `json:"callLog,omitempty"`
+	Log    []LogEntry `json:"log,omitempty"`
 }
 
 // StageInfo is the visualized state of one stage.
@@ -104,6 +161,14 @@ type StageInfo struct {
 	Status    string `json:"status"`           // running | done
 	StartedAt int64  `json:"startedAt,omitempty"`
 	EndedAt   int64  `json:"endedAt,omitempty"`
+	// Prefix-cache accounting for the stage's shared prompt head: tokens the
+	// provider served from it, tokens spent establishing it, and what the
+	// difference was worth. A stage is where these belong — the prefix is
+	// shared by the stage's tasks, so the saving is a property of the stage
+	// rather than of any one task.
+	CachedTokens  int     `json:"cachedTokens,omitempty"`
+	WrittenTokens int     `json:"writtenTokens,omitempty"`
+	SavedUSD      float64 `json:"savedUsd,omitempty"`
 }
 
 // BroadcastInfo is the visualized state of one run-level shared value: what
@@ -138,6 +203,9 @@ type runHeader struct {
 	EndedAt   int64  `json:"endedAt,omitempty"`
 	Done      bool   `json:"done"`
 	Note      string `json:"note,omitempty"`
+	// Driver names the execution strategy: "barrier" runs a stage at a time,
+	// "streaming" pipelines them across one shared pool of executors.
+	Driver string `json:"driver,omitempty"`
 }
 
 // Snapshot is the complete state of the current run.
@@ -210,6 +278,7 @@ func New() *Server {
 	mux.HandleFunc("/", s.serveUI)
 	mux.HandleFunc("/api/state", s.serveState)
 	mux.HandleFunc("/api/events", s.serveEvents)
+	mux.HandleFunc("/api/task", s.serveTask)
 	s.mux = mux
 	return s
 }
@@ -278,7 +347,7 @@ func (s *Server) Handle(e observe.Event) {
 	switch e.Type {
 	case observe.RunStarted:
 		s.resetLocked()
-		s.run = runHeader{RunID: e.RunID, StartedAt: now}
+		s.run = runHeader{RunID: e.RunID, StartedAt: now, Driver: e.Kind}
 		d.Reset = true
 
 	case observe.RunFinished:
@@ -352,6 +421,15 @@ func (s *Server) Handle(e observe.Event) {
 			logf(n, now, "model call %s: %d in%s / %d out tokens, $%.5f, %s",
 				orDash(e.Model), e.Usage.InputTokens, shared, e.Usage.OutputTokens,
 				e.Usage.CostUSD, e.Latency.Round(time.Millisecond))
+			// Roll the prefix-cache economics up to the stage that owns the
+			// shared prompt head.
+			if e.Stage != "" && (e.Usage.CacheReadTokens > 0 || e.Usage.CacheWriteTokens > 0) {
+				st := s.stageLocked(e.Stage)
+				st.CachedTokens += e.Usage.CacheReadTokens
+				st.WrittenTokens += e.Usage.CacheWriteTokens
+				st.SavedUSD += e.Saved
+				d.Stage = st
+			}
 		}
 		d.Task = n
 
@@ -543,6 +621,7 @@ func logf(n *Node, at int64, format string, args ...any) {
 	if len(n.Log) > maxLogEntries {
 		n.Log = n.Log[len(n.Log)-maxLogEntries:]
 	}
+	n.rev++
 }
 
 func plural(n int) string {
@@ -630,6 +709,44 @@ func (s *Server) serveState(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	b := s.snapshotLocked()
 	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(b)
+}
+
+// serveTask returns one task's heavy detail: full input and output records,
+// every rendered model call, and the event log. This is the lazy half of the
+// constellation — the UI asks for it when a node is opened, not before.
+func (s *Server) serveTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	n, ok := s.taskIx[id]
+	var b []byte
+	if ok {
+		var err error
+		b, err = json.Marshal(TaskDetail{
+			ID: n.ID, Rev: n.rev, Input: n.Input, Output: n.Output,
+			Calls: n.CallLog, Log: n.Log,
+		})
+		if err != nil {
+			ok = false
+		}
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		http.Error(w, "unknown task", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")

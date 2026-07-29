@@ -231,7 +231,14 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 
 	// --- Drive stages in topological order ------------------------------
 	runID := core.NewID("run")
-	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID})
+	driverName := "barrier"
+	if cfg.Streaming {
+		driverName = "streaming"
+	}
+	// The driver is part of what a viewer is looking at: the same pipeline
+	// under streaming shows overlapping stages and shared execution slots,
+	// and that is only legible if the view knows which one ran.
+	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID, Kind: driverName})
 
 	// Announce the shared values after the run header (which resets observer
 	// state) and before any task runs, so a viewer sees what the run agreed to

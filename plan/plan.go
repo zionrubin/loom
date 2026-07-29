@@ -8,6 +8,7 @@ package plan
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"text/template"
 
 	"github.com/zionrubin/loom/core"
@@ -25,6 +26,14 @@ type StagePlan struct {
 	Candidates  []model.Info      // resolved binding ladder for AI stages
 	Broadcasts  map[string]string // declared shared values → content hash
 	Cacheable   bool
+
+	// built counts the tasks this stage has produced across every call to
+	// BuildTasks. It is what makes the prefix-cache break-even test work
+	// under both drivers: the barrier driver hands over a stage's whole
+	// input at once, while a streaming driver arrives with a couple of
+	// records at a time, and only a running total can tell the difference
+	// between "this stage makes one call" and "this stage is being fed".
+	built atomic.Int64
 }
 
 // Option configures compilation.
@@ -455,12 +464,22 @@ func (sp *StagePlan) BuildTasksBatch(runID string, input []core.Record, batch in
 
 	// Prompt-prefix caching pays for itself from the second call onward: the
 	// entry costs a write premium and every later hit is a fraction of a
-	// fresh input token. A stage that issues a single call would pay the
-	// premium and never read it back, so the break-even test is simply
-	// whether this stage has more than one task to share the prefix across.
+	// fresh input token. A stage that only ever issues one call would pay
+	// the premium and never read it back, so the test is whether this stage
+	// has more than one task to share the prefix across — counted across the
+	// stage's whole life, not just this batch, since a streaming driver
+	// builds a stage's tasks a few at a time.
+	//
+	// A driver that hands over a stage's whole input at once therefore caches
+	// from the first task. A driver that streams records in learns the prefix
+	// is shared only when the second task arrives, so it writes the entry
+	// there and reads it from the third on — one call of warm-up, whatever
+	// the stage's eventual size. That is the price of never writing an entry
+	// nothing will read, and it is the cheaper side of the trade.
+	nTasks := (len(input) + batch - 1) / batch
+	total := sp.built.Add(int64(nTasks))
 	if !sp.Stage.Opts.NoPrefixCache && !env.Binding.IsZero() {
-		calls := (len(input) + batch - 1) / batch
-		env.CachePrefix = calls > 1
+		env.CachePrefix = total > 1
 	}
 
 	var maxTokens int

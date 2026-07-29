@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -27,7 +28,12 @@ import (
 // task cannot tell which driver submitted it.
 type Engine struct {
 	sched *Scheduler
-	slots chan struct{}
+	// slots holds the names of the free execution slots. Taking a slot is
+	// both the admission gate and the assignment of an identity: the name
+	// travels with the task as its executor, so occupancy is observable —
+	// which slot ran what, and how busy each one stayed — exactly as it is
+	// for the batch path's named workers.
+	slots chan string
 
 	wg sync.WaitGroup
 }
@@ -37,7 +43,11 @@ func NewEngine(sched *Scheduler, n int) *Engine {
 	if n <= 0 {
 		n = 8
 	}
-	return &Engine{sched: sched, slots: make(chan struct{}, n)}
+	slots := make(chan string, n)
+	for i := 1; i <= n; i++ {
+		slots <- fmt.Sprintf("e%d", i)
+	}
+	return &Engine{sched: sched, slots: slots}
 }
 
 // Submit claims a slot and runs t, invoking done with the outcome when it
@@ -57,8 +67,9 @@ func (e *Engine) Submit(ctx context.Context, t task.Task, done func(task.Result,
 		Stage: t.Stage, TaskID: t.ID, Records: len(t.Input),
 		Input: recordsJSON(t.Input), InputIDs: recordIDs(t.Input)})
 
+	var slot string
 	select {
-	case e.slots <- struct{}{}:
+	case slot = <-e.slots:
 	case <-ctx.Done():
 		done(task.Result{}, core.Transient(ctx.Err()))
 		return
@@ -66,8 +77,8 @@ func (e *Engine) Submit(ctx context.Context, t task.Task, done func(task.Result,
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		res, _, err := e.sched.RunTask(ctx, t, "engine")
-		<-e.slots
+		res, _, err := e.sched.RunTask(ctx, t, slot)
+		e.slots <- slot
 		done(res, err)
 	}()
 }

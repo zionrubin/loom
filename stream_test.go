@@ -418,3 +418,47 @@ func TestStreamingRespectsStageParallelism(t *testing.T) {
 		t.Errorf("peak concurrency = %d, want 2 — the cap throttled below its limit", peak)
 	}
 }
+
+// TestStreamingSharesPrefixCache pins the interaction that streaming broke
+// once already: the planner's break-even test counts a stage's tasks, and a
+// streaming stage builds them a few records at a time. Counting per batch
+// instead of per stage made every streaming stage look like a one-call stage,
+// silently disabling prefix caching for the whole run.
+func TestStreamingSharesPrefixCache(t *testing.T) {
+	run := func(opts ...loom.Option) core.Usage {
+		t.Helper()
+		reg, _ := prefixRegistry(t)
+		base := []loom.Option{loom.WithRegistry(reg), loom.WithRetry(quickRetry())}
+		res, err := loom.Run(context.Background(), prefixPipeline(rubric),
+			append(base, opts...)...)
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return res.Report.Totals()
+	}
+
+	streamed := run(loom.WithStreaming())
+	if streamed.CacheReadTokens == 0 {
+		t.Fatal("streaming run never read the shared prefix from cache")
+	}
+
+	// Both drivers write exactly one entry per stage and read it thereafter.
+	// They differ by one call's worth of warm-up, and necessarily so: the
+	// barrier driver is handed a stage's whole input and can tell on task one
+	// that the prefix will be shared, while a streaming stage only learns it
+	// is being fed when its second task arrives. The rule that never writes
+	// an entry nothing will read is what costs that first call, and it is
+	// bounded to one call however long the stage runs.
+	barriered := run()
+	if streamed.CacheWriteTokens != barriered.CacheWriteTokens {
+		t.Errorf("prefix writes: streaming %d, barrier %d — each driver should "+
+			"establish the entry exactly once",
+			streamed.CacheWriteTokens, barriered.CacheWriteTokens)
+	}
+	perCall := barriered.CacheWriteTokens // one call's worth of prefix
+	if gap := barriered.CacheReadTokens - streamed.CacheReadTokens; gap != perCall {
+		t.Errorf("prefix reads: streaming %d, barrier %d (gap %d) — want exactly "+
+			"one call of warm-up (%d)",
+			streamed.CacheReadTokens, barriered.CacheReadTokens, gap, perCall)
+	}
+}
