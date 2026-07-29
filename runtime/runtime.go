@@ -291,6 +291,18 @@ func (s *Scheduler) ExecuteAll(ctx context.Context, tasks []task.Task) ([]task.R
 	return results, failures, nil
 }
 
+// RunTask executes one task through its full recovery lifecycle — admission
+// control, budget check, class-aware retry and escalation — and reports the
+// result along with how many attempts it took.
+//
+// It is the single execution path both drivers share: ExecuteAll calls it
+// from a fixed worker pool per stage batch, and Engine calls it from a
+// continuously-fed slot pool. Recovery semantics therefore cannot drift
+// between batch and streaming execution.
+func (s *Scheduler) RunTask(ctx context.Context, t task.Task, worker string) (task.Result, int, error) {
+	return s.runTask(ctx, t, worker)
+}
+
 // runTask executes one task through its full recovery lifecycle.
 func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (task.Result, int, error) {
 	maxAttempts := s.Retry.MaxAttempts

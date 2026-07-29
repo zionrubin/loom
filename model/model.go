@@ -16,12 +16,35 @@ import (
 )
 
 // Request is a single completion request to a provider.
+//
+// The prompt is split into two parts on purpose. Prefix is the portion every
+// task in a stage renders identically — system-adjacent context, a rubric, a
+// taxonomy — and Prompt is the per-record remainder. Providers send
+// System + Prefix + Prompt in that order, so the shared head occupies a
+// stable byte range across the stage's calls and the provider's prompt cache
+// can serve it instead of recomputing it. See CachePrefix.
 type Request struct {
-	Model     string `json:"model"`
-	System    string `json:"system,omitempty"`
+	Model  string `json:"model"`
+	System string `json:"system,omitempty"`
+	// Prefix is the stage-stable head of the prompt, rendered once per task
+	// rather than once per record. Empty means the whole prompt varies.
+	Prefix    string `json:"prefix,omitempty"`
 	Prompt    string `json:"prompt"`
 	MaxTokens int    `json:"max_tokens"`
+	// CachePrefix asks the provider to cache everything through System +
+	// Prefix. Providers that need an explicit marker (Anthropic) place a
+	// cache breakpoint there; providers that cache prefixes automatically
+	// (OpenAI) need only the stable ordering the split already guarantees.
+	//
+	// A provider-side minimum applies (~1k tokens, model-dependent): a prefix
+	// below it is silently not cached and costs nothing extra, so setting this
+	// on a short prefix is harmless rather than wasteful.
+	CachePrefix bool `json:"cache_prefix,omitempty"`
 }
+
+// FullPrompt returns the prompt as the model sees it: shared prefix first,
+// per-record remainder second.
+func (r Request) FullPrompt() string { return r.Prefix + r.Prompt }
 
 // Response is a provider's completion result. CostUSD on Usage is filled in
 // by the framework from the registry's pricing, not by providers.
@@ -52,15 +75,65 @@ type Provider interface {
 	Complete(ctx context.Context, call CallContext, req Request) (Response, error)
 }
 
-// Pricing is per-million-token cost.
+// Prompt-cache rate multipliers applied when a Pricing leaves the cache
+// rates unset. They are the prevailing first-party economics: a cache read
+// costs a fraction of a fresh input token, and writing an entry carries a
+// modest premium over one. Two reads of a written prefix therefore already
+// beat paying full price twice, which is why the planner turns prefix
+// caching on only for stages that issue more than one call.
+const (
+	DefaultCacheReadMultiplier  = 0.10
+	DefaultCacheWriteMultiplier = 1.25
+)
+
+// Pricing is per-million-token cost. The cache rates are optional: leave
+// them zero and they derive from InputPerMTok via the default multipliers.
 type Pricing struct {
 	InputPerMTok  float64
 	OutputPerMTok float64
+	// CacheReadPerMTok prices prompt tokens served from the provider's
+	// prefix cache (zero = DefaultCacheReadMultiplier × InputPerMTok).
+	CacheReadPerMTok float64
+	// CacheWritePerMTok prices prompt tokens written into that cache
+	// (zero = DefaultCacheWriteMultiplier × InputPerMTok).
+	CacheWritePerMTok float64
 }
 
-// Cost computes the dollar cost of a usage under this pricing.
+// CacheReadRate returns the effective per-MTok price of a cache read.
+func (p Pricing) CacheReadRate() float64 {
+	if p.CacheReadPerMTok > 0 {
+		return p.CacheReadPerMTok
+	}
+	return p.InputPerMTok * DefaultCacheReadMultiplier
+}
+
+// CacheWriteRate returns the effective per-MTok price of a cache write.
+func (p Pricing) CacheWriteRate() float64 {
+	if p.CacheWritePerMTok > 0 {
+		return p.CacheWritePerMTok
+	}
+	return p.InputPerMTok * DefaultCacheWriteMultiplier
+}
+
+// Cost computes the dollar cost of a usage under this pricing, billing each
+// class of prompt token at its own rate.
 func (p Pricing) Cost(u core.Usage) float64 {
-	return float64(u.InputTokens)*p.InputPerMTok/1e6 + float64(u.OutputTokens)*p.OutputPerMTok/1e6
+	return (float64(u.InputTokens)*p.InputPerMTok +
+		float64(u.CacheReadTokens)*p.CacheReadRate() +
+		float64(u.CacheWriteTokens)*p.CacheWriteRate() +
+		float64(u.OutputTokens)*p.OutputPerMTok) / 1e6
+}
+
+// Saved returns what the prefix cache was worth on this usage: the
+// difference between what the cached prompt tokens actually cost and what
+// they would have cost at the full input rate. It is negative while a write
+// is still unamortized, which is the honest reading — the entry has been
+// paid for but not yet reused.
+func (p Pricing) Saved(u core.Usage) float64 {
+	full := float64(u.CacheReadTokens+u.CacheWriteTokens) * p.InputPerMTok
+	actual := float64(u.CacheReadTokens)*p.CacheReadRate() +
+		float64(u.CacheWriteTokens)*p.CacheWriteRate()
+	return (full - actual) / 1e6
 }
 
 // Limits describes provider-enforced throughput ceilings, consumed by the

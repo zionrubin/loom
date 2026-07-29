@@ -276,3 +276,101 @@ func TestBuildTasksBatchingAndCacheKeys(t *testing.T) {
 		t.Error("cache keys must be stable across runs (run ID must not leak in)")
 	}
 }
+
+// TestPrefixLeavesExistingFingerprintsUntouched pins the compatibility
+// promise: a stage that declares no shared prompt prefix must fingerprint
+// exactly as it did before prefixes existed, so introducing the feature does
+// not cold-start every warm cache in the fleet.
+func TestPrefixLeavesExistingFingerprintsUntouched(t *testing.T) {
+	p := pipeline.New("t")
+	spec := pipeline.InferSpec{
+		Binding: model.Binding{Model: "small"},
+		System:  "sys",
+		Prompt:  "Classify {{.text}}",
+	}
+	p.FromRecords("src", nil).Infer("classify", spec)
+
+	pl, err := Compile(p, reg(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The exact component list the planner used before prefixes were added.
+	want, err := store.Key("infer", bindingKey(spec.Binding), spec.System,
+		spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
+		fragmentKey(spec.Context), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pl.ByID["classify"].Fingerprint; got != want {
+		t.Errorf("prefix-free fingerprint changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestPrefixChangesFingerprint is the other half: editing a shared prefix
+// changes what the model saw, so cached results must not be reused.
+func TestPrefixChangesFingerprint(t *testing.T) {
+	build := func(prefix string) string {
+		t.Helper()
+		p := pipeline.New("t")
+		p.FromRecords("src", nil).Infer("classify", pipeline.InferSpec{
+			Binding: model.Binding{Model: "small"},
+			Prefix:  prefix,
+			Prompt:  "Classify {{.text}}",
+		})
+		pl, err := Compile(p, reg(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pl.ByID["classify"].Fingerprint
+	}
+	if build("rubric v1") == build("rubric v2") {
+		t.Error("editing the shared prefix left the fingerprint unchanged; " +
+			"cached results from the old rubric would be replayed")
+	}
+	if build("") == build("rubric v1") {
+		t.Error("adding a prefix left the fingerprint unchanged")
+	}
+}
+
+// TestPrefixCacheEnabledOnlyWhenShared checks the break-even rule the planner
+// applies when deciding to cache a stage's prompt prefix.
+func TestPrefixCacheEnabledOnlyWhenShared(t *testing.T) {
+	p := pipeline.New("t")
+	p.FromRecords("src", nil).Infer("classify", pipeline.InferSpec{
+		Binding: model.Binding{Model: "small"},
+		Prefix:  "rubric",
+		Prompt:  "Classify {{.text}}",
+	})
+	pl, err := Compile(p, reg(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := pl.ByID["classify"]
+
+	rec := func(n int) []core.Record {
+		out := make([]core.Record, n)
+		for i := range out {
+			out[i] = core.NewRecord("r", map[string]any{"text": "x"})
+		}
+		return out
+	}
+
+	one, err := sp.BuildTasks("run", rec(1), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one[0].Envelope.CachePrefix {
+		t.Error("a stage issuing one call should not write a cache entry nothing reads")
+	}
+
+	many, err := sp.BuildTasks("run", rec(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tk := range many {
+		if !tk.Envelope.CachePrefix {
+			t.Errorf("task %d: prefix caching off despite %d tasks sharing the prefix", i, len(many))
+		}
+	}
+}

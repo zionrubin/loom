@@ -67,8 +67,12 @@ type Event struct {
 	Bytes     int           `json:"bytes,omitempty"`
 	Usage     core.Usage    `json:"usage,omitempty"`
 	Latency   time.Duration `json:"latency,omitempty"`
-	Err       string        `json:"err,omitempty"`
-	Note      string        `json:"note,omitempty"`
+	// Saved is what this model call's prompt-prefix cache activity was worth
+	// in dollars against paying the full input rate (model.called). Negative
+	// while a freshly written entry is still unamortized.
+	Saved float64 `json:"saved,omitempty"`
+	Err   string  `json:"err,omitempty"`
+	Note  string  `json:"note,omitempty"`
 }
 
 // PayloadCap bounds the large observability payloads (record JSON, prompts,
@@ -162,8 +166,12 @@ type StageStats struct {
 	CacheHits  int
 	ModelCalls int
 	Usage      core.Usage
-	Started    time.Time
-	Finished   time.Time
+	// PrefixSavedUSD is what this stage's shared prompt prefix was worth:
+	// the difference between what its cached prompt tokens cost and what
+	// they would have cost at the full input rate.
+	PrefixSavedUSD float64
+	Started        time.Time
+	Finished       time.Time
 
 	latencies []time.Duration
 }
@@ -210,6 +218,15 @@ func (r RunReport) Totals() core.Usage {
 	return u
 }
 
+// PrefixSavedUSD sums what prompt-prefix caching was worth across the run.
+func (r RunReport) PrefixSavedUSD() float64 {
+	var total float64
+	for _, s := range r.Stages {
+		total += s.PrefixSavedUSD
+	}
+	return total
+}
+
 // Duration is total run wall time.
 func (r RunReport) Duration() time.Duration {
 	if r.Started.IsZero() || r.Finished.IsZero() {
@@ -222,16 +239,21 @@ func (r RunReport) Duration() time.Duration {
 func (r RunReport) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "run %s  (%s)\n", r.RunID, r.Duration().Round(time.Millisecond))
-	fmt.Fprintf(&b, "%-22s %6s %6s %6s %6s %6s %8s %10s %10s\n",
-		"stage", "tasks", "ok", "fail", "retry", "cache", "tokens", "cost($)", "p95")
+	fmt.Fprintf(&b, "%-22s %6s %6s %6s %6s %6s %8s %7s %10s %10s\n",
+		"stage", "tasks", "ok", "fail", "retry", "cache", "tokens", "prefix", "cost($)", "p95")
 	for _, s := range r.Stages {
-		fmt.Fprintf(&b, "%-22s %6d %6d %6d %6d %6d %8d %10.4f %10s\n",
+		fmt.Fprintf(&b, "%-22s %6d %6d %6d %6d %6d %8d %6.0f%% %10.4f %10s\n",
 			s.Stage, s.Tasks, s.Completed, s.Failed, s.Retries, s.CacheHits,
-			s.Usage.TotalTokens(), s.Usage.CostUSD, s.LatencyP95().Round(time.Millisecond))
+			s.Usage.TotalTokens(), 100*s.Usage.CacheHitRate(),
+			s.Usage.CostUSD, s.LatencyP95().Round(time.Millisecond))
 	}
 	t := r.Totals()
-	fmt.Fprintf(&b, "%-22s %6s %6s %6s %6s %6s %8d %10.4f\n",
-		"TOTAL", "", "", "", "", "", t.TotalTokens(), t.CostUSD)
+	fmt.Fprintf(&b, "%-22s %6s %6s %6s %6s %6s %8d %6.0f%% %10.4f\n",
+		"TOTAL", "", "", "", "", "", t.TotalTokens(), 100*t.CacheHitRate(), t.CostUSD)
+	if saved := r.PrefixSavedUSD(); saved != 0 {
+		fmt.Fprintf(&b, "prefix cache: %d tokens served from shared prefixes, $%.4f saved\n",
+			t.CacheReadTokens, saved)
+	}
 	return b.String()
 }
 
@@ -290,6 +312,7 @@ func (c *Collector) Handle(e Event) {
 		s := c.stage(e.Stage)
 		s.ModelCalls++
 		s.Usage.Add(e.Usage)
+		s.PrefixSavedUSD += e.Saved
 		s.latencies = append(s.latencies, e.Latency)
 	}
 }

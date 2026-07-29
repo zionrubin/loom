@@ -301,6 +301,8 @@ let hoveredBroadcast = null;  // shared-value node under the cursor
 let connState = 'connecting'; // connecting | live | reconnecting
 let lastPanelKey = '';
 let lastPanelHTML = '';
+let chromeDirty = true;  // header stats need a rebuild
+let panelDirty = false;  // open inspector needs a rebuild
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const serverNow = () => Date.now() - S.offset;
 
@@ -318,7 +320,9 @@ function clearState() {
   S.tasks = []; S.taskIx = new Map();
   S.workers = []; S.workerIx = new Map();
   S.broadcasts = []; S.broadcastIx = new Map();
+  detailCache.clear();
   S.layoutDirty = true; S.thresholdsDirty = true; S.lineageDirty = true; S.stageStatsDirty = true;
+  chromeDirty = true;
 }
 
 function selectionStillValid(sel) {
@@ -343,7 +347,7 @@ function applySnapshot(snap) {
   S.offset = Date.now() - snap.now;
   clearState();
   S.run = { runId: snap.runId || '', startedAt: snap.startedAt || 0, endedAt: snap.endedAt || 0,
-            done: !!snap.done, note: snap.note || '' };
+            done: !!snap.done, note: snap.note || '', driver: snap.driver || '' };
   (snap.stages || []).forEach(st => upsert(S.stages, S.stageIx, st));
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
@@ -362,7 +366,8 @@ function applyDelta(d) {
   }
   const wasDone = S.run.done;
   if (d.run) S.run = { runId: d.run.runId || '', startedAt: d.run.startedAt || 0,
-                       endedAt: d.run.endedAt || 0, done: !!d.run.done, note: d.run.note || '' };
+                       endedAt: d.run.endedAt || 0, done: !!d.run.done, note: d.run.note || '',
+                       driver: d.run.driver || '' };
   // Watched the run finish live → surface the summary once, after the
   // completion flash has had its moment. Reconnecting to an already-done
   // run (snapshots) never auto-opens.
@@ -370,14 +375,21 @@ function applyDelta(d) {
   if (d.stage) upsert(S.stages, S.stageIx, d.stage);
   if (d.task) {
     const t = upsert(S.tasks, S.taskIx, d.task);
-    S.lineageDirty = true;
+    // Lineage is derived from record IDs, and only two events carry them.
+    // Recomputing it on every status change meant rebuilding the whole
+    // graph on every event of the run.
+    if (d.task.inputIds || d.task.outputIds) S.lineageDirty = true;
     S.stageStatsDirty = true;
     if (t.status === 'completed' || t.status === 'failed') S.thresholdsDirty = true;
   }
   if (d.worker) upsert(S.workers, S.workerIx, d.worker);
   if (d.broadcast) upsert(S.broadcasts, S.broadcastIx, d.broadcast);
-  refreshChrome();
-  if (selected && panel.classList.contains('open')) renderPanel();
+  // The chrome and the inspector are DOM, and rebuilding them per event is
+  // what turns a fast run into a stalled tab. Mark them dirty and let the
+  // display tick coalesce: the canvas stays live at frame rate regardless,
+  // so nothing the eye tracks is delayed.
+  chromeDirty = true;
+  panelDirty = true;
 }
 
 function parseSSE(raw) {
@@ -572,13 +584,32 @@ function computeStageStats() {
 let camX = 0, camY = 0;
 
 // ------------------------------------------------------------- painting ----
-function glow(x, y, r, color, alpha) {
-  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+// A glow is a radial gradient, and building one per node per frame was the
+// single most expensive thing this view did: thousands of gradient objects
+// created and thrown away every frame. Each colour is instead rendered once
+// into an offscreen sprite and then blitted, which is a plain textured draw
+// no matter how many stars are on screen.
+const glowSprites = new Map();
+const GLOW_TEX = 64; // sprite radius in texels; scaled per draw
+
+function glowSprite(color) {
+  let sprite = glowSprites.get(color);
+  if (sprite) return sprite;
+  sprite = document.createElement('canvas');
+  sprite.width = sprite.height = GLOW_TEX * 2;
+  const sctx = sprite.getContext('2d');
+  const g = sctx.createRadialGradient(GLOW_TEX, GLOW_TEX, 0, GLOW_TEX, GLOW_TEX, GLOW_TEX);
   g.addColorStop(0, color);
   g.addColorStop(1, 'rgba(0,0,0,0)');
+  sctx.fillStyle = g;
+  sctx.fillRect(0, 0, GLOW_TEX * 2, GLOW_TEX * 2);
+  glowSprites.set(color, sprite);
+  return sprite;
+}
+
+function glow(x, y, r, color, alpha) {
   ctx.globalAlpha = alpha;
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+  ctx.drawImage(glowSprite(color), x - r, y - r, r * 2, r * 2);
   ctx.globalAlpha = 1;
 }
 
@@ -615,7 +646,11 @@ function cross(x, y, s, color, alpha) {
   ctx.globalAlpha = 1;
 }
 
-function drawTask(t, now, tms) {
+// lod: in a large run most stars are settled and identical frame to frame.
+// They still have to be drawn, but they do not have to twinkle — dropping
+// the glow and sparkle for them keeps the frame budget for the handful of
+// nodes that are actually doing something.
+function drawTask(t, now, tms, lod) {
   const x = t._x, y = t._y;
   const ph = (hash(t.id) % 628) / 100;
   const pulseAmt = reduceMotion ? 0 : 1;
@@ -675,6 +710,12 @@ function drawTask(t, now, tms) {
         ctx.beginPath(); ctx.arc(x, y, 3 + 20 * f, 0, 6.2832); ctx.stroke();
         ctx.globalAlpha = 1;
         sparkle(x, y, 5.5 - 1.5 * f, color, 1, t.cacheHit);
+      } else if (lod) {
+        // settled and past its flash: a plain star, no per-frame maths
+        ctx.globalAlpha = .9;
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(x, y, 1.9, 0, 6.2832); ctx.fill();
+        ctx.globalAlpha = 1;
       } else {
         const tw = reduceMotion ? 1 : (.8 + .2 * Math.sin(tms / 900 + ph));
         glow(x, y, 6, color, .22 * tw);
@@ -783,6 +824,7 @@ function draw(tms) {
   const now = serverNow();
   const taskN = S.tasks.length;
   const heavy = taskN >= 400;
+  const lod = taskN >= 1500;
   const panelOpen = panel.classList.contains('open');
   const panelW = panelOpen && W >= 720 ? Math.min(380, W * 0.92) : 0;
 
@@ -923,7 +965,7 @@ function draw(tms) {
     for (const b of S.broadcasts) drawBroadcast(b, tms, focusB);
   }
 
-  for (const t of S.tasks) drawTask(t, now, tms);
+  for (const t of S.tasks) drawTask(t, now, tms, lod);
   for (const w of S.workers) drawWorker(w, tms);
 
   const focus = [];
@@ -1162,6 +1204,45 @@ function pct(sorted, p) {
 // The panel re-renders on a live tick; keep the user's <details> toggles and
 // scroll position stable across re-renders of the same selection. Skip the
 // DOM write when the HTML is unchanged so typing/scroll stays calm.
+// ------------------------------------------------------- lazy task detail --
+// Full prompts, responses, and record JSON are fetched per task, only when a
+// node is actually opened. `rev` on the light node advances whenever that
+// detail changes, which is how an open inspector notices its copy went stale
+// without polling the payload itself.
+const detailCache = new Map(); // taskId -> {rev, input, output, callLog, log}
+const detailPending = new Set();
+const MAX_CACHED_DETAILS = 40;
+
+function taskDetail(t) {
+  const have = detailCache.get(t.id);
+  const rev = t.rev || 0;
+  const stale = !have || have.rev !== rev;
+  const nothingToFetch = !t.inBytes && !t.outBytes && !t.callN && !t.logN;
+
+  if (stale && !nothingToFetch && !detailPending.has(t.id)) {
+    detailPending.add(t.id);
+    fetch('/api/task?id=' + encodeURIComponent(t.id))
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (!d) return;
+        detailCache.set(d.id, {
+          rev: d.rev || 0, input: d.input || '', output: d.output || '',
+          callLog: d.callLog || [], log: d.log || [],
+        });
+        // Bound the client cache too: a long run must not accumulate every
+        // node's prompts in the tab it was meant to keep responsive.
+        while (detailCache.size > MAX_CACHED_DETAILS) {
+          detailCache.delete(detailCache.keys().next().value);
+        }
+        panelDirty = true;
+      })
+      .catch(() => {})
+      .finally(() => detailPending.delete(t.id));
+  }
+  // A stale copy beats a blank panel while the refresh is in flight.
+  return have || null;
+}
+
 function setPanelHTML(body, html) {
   const key = selected ? selected.type + ':' + selected.id : '';
   const same = key === lastPanelKey;
@@ -1223,6 +1304,10 @@ function renderPanel() {
     ['cost', fmtCost((t.usage && t.usage.cost) || 0)],
     ['cache', t.cacheHit ? '⚡ replayed from cache' : 'no'],
   ];
+  if (t.usage && t.usage.cached) {
+    rows.push(['shared prefix',
+      `${fmtTok(t.usage.cached)} tokens served from the stage's cached prompt head`]);
+  }
   if ((t.broadcasts || []).length) {
     rows.push(['shared values', t.broadcasts.map(n => jumpBtn('broadcast', n)).join(' ')]);
   }
@@ -1248,16 +1333,30 @@ function renderPanel() {
       : `<span class="none">${t.status === 'completed' ? 'not consumed downstream (yet)' : 'no output yet'}</span>`) +
     '</div>';
 
-  if (t.input) {
-    html += `<h4>input · ${t.records || 0} record${t.records === 1 ? '' : 's'}</h4>` +
-      `<details open><summary>${esc(summarizeIDs(t.inputIds))}</summary><pre>${esc(t.input)}</pre></details>`;
+  // Everything below is the heavy half of the node, fetched on demand for
+  // the one task being inspected rather than shipped for every task in the
+  // run. Until it lands, the headers still say what is there.
+  const det = taskDetail(t);
+  const loading = `<div class="none">loading…</div>`;
+
+  if (t.inBytes) {
+    html += `<h4>input · ${t.records || 0} record${t.records === 1 ? '' : 's'} · ${fmtBytes(t.inBytes)}</h4>`;
+    html += det
+      ? `<details open><summary>${esc(summarizeIDs(t.inputIds))}</summary><pre>${esc(det.input)}</pre></details>`
+      : loading;
   }
-  if (t.output) {
-    html += `<h4>output · ${(t.outputIds || []).length} record${(t.outputIds || []).length === 1 ? '' : 's'}</h4>` +
-      `<details open><summary>${esc(summarizeIDs(t.outputIds))}</summary><pre>${esc(t.output)}</pre></details>`;
+  if (t.outBytes) {
+    const n = (t.outputIds || []).length;
+    html += `<h4>output · ${n} record${n === 1 ? '' : 's'} · ${fmtBytes(t.outBytes)}</h4>`;
+    html += det
+      ? `<details open><summary>${esc(summarizeIDs(t.outputIds))}</summary><pre>${esc(det.output)}</pre></details>`
+      : loading;
   }
 
-  const calls = t.callLog || [];
+  const calls = (det && det.callLog) || [];
+  if (!det && t.callN) {
+    html += `<h4>model calls · ${t.callN}</h4>${loading}`;
+  }
   if (calls.length) {
     html += `<h4>model calls · ${calls.length}</h4>`;
     calls.forEach((c, i) => {
@@ -1275,10 +1374,13 @@ function renderPanel() {
   }
 
   if (t.error) html += `<h4>error</h4><pre class="err">${esc(t.error)}</pre>`;
-  const log = (t.log || []);
-  html += `<h4>log · ${log.length} events</h4><ul class="log">` +
-    log.map(l => `<li><span class="t">${relTime(l.at)}</span><span>${esc(l.msg)}</span></li>`).join('') +
-    '</ul>';
+  const log = (det && det.log) || [];
+  html += `<h4>log · ${det ? log.length : (t.logN || 0)} events</h4>`;
+  html += det
+    ? `<ul class="log">` +
+      log.map(l => `<li><span class="t">${relTime(l.at)}</span><span>${esc(l.msg)}</span></li>`).join('') +
+      '</ul>'
+    : loading;
   setPanelHTML(body, html);
 }
 
@@ -1381,6 +1483,19 @@ function renderStagePanel(title, body) {
     ['cost', fmtCost(cost)],
     ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
   ];
+  // The shared prompt prefix is a stage-level property — every task in the
+  // stage sends the same head — so its economics belong here, next to the
+  // stage's own tokens and cost.
+  if (st.cachedTokens || st.writtenTokens) {
+    const served = st.cachedTokens || 0, written = st.writtenTokens || 0;
+    const share = (served + written) ? Math.round(100 * served / (served + written + tokIn)) : 0;
+    rows.push(['shared prefix',
+      `${fmtTok(served)} tokens served from cache · ${fmtTok(written)} written`]);
+    rows.push(['prefix saving',
+      `${st.savedUsd >= 0 ? '' : '−'}$${Math.abs(st.savedUsd || 0).toFixed(5)}` +
+      (st.savedUsd < 0 ? ' <span class="none">(entry not yet reused)</span>'
+                       : ` <span class="none">(${share}% of prompt tokens)</span>`)]);
+  }
   const reads = S.broadcasts.filter(b => (b.stages || []).includes(st.id));
   if (reads.length) {
     rows.push(['shared values', reads.map(b => jumpBtn('broadcast', b.id)).join(' ')]);
@@ -1452,6 +1567,12 @@ function renderSummary() {
     tok += ((t.usage && t.usage.in) || 0) + ((t.usage && t.usage.out) || 0);
     cost += (t.usage && t.usage.cost) || 0;
   }
+  let prefixServed = 0, prefixWritten = 0, prefixSaved = 0;
+  for (const st of S.stages) {
+    prefixServed += st.cachedTokens || 0;
+    prefixWritten += st.writtenTokens || 0;
+    prefixSaved += st.savedUsd || 0;
+  }
   const elapsed = S.run.startedAt ? (S.run.endedAt || serverNow()) - S.run.startedAt : null;
   const stat = (v, l) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`;
   let html = '<div class="totals">' +
@@ -1460,6 +1581,7 @@ function renderSummary() {
     stat(String(cache), 'cache replays') +
     stat(String(retries), 'retries') +
     stat(fmtTok(tok), 'tokens') +
+    (prefixServed ? stat(fmtTok(prefixServed), 'prefix served') : '') +
     stat(fmtCost(cost), 'cost') +
     '</div>';
 
@@ -1482,6 +1604,17 @@ function renderSummary() {
       `<td>${a.durs.length ? fmtDur(pct(a.durs, .95)) : '—'}</td></tr>`;
   }
   html += '</table>';
+
+  if (prefixServed || prefixWritten) {
+    html += `<div class="note">shared prompt prefixes: ` +
+      `<span class="save">${fmtTok(prefixServed)}</span> prompt tokens were served from the ` +
+      `providers' caches instead of being reprocessed, against ${fmtTok(prefixWritten)} spent ` +
+      `establishing those entries` +
+      (prefixSaved > 0
+        ? ` — <span class="save">${fmtCost(prefixSaved)}</span> saved against paying the full input rate.`
+        : `. The entries have not been reused enough to pay for themselves yet.`) +
+      ` A stage's prefix is cached only when it issues more than one call.</div>`;
+  }
 
   if (S.broadcasts.length) {
     html += '<h4>shared values · stored once, referenced by hash</h4>' +
@@ -1569,7 +1702,13 @@ function refreshChrome() {
       : `<span class="chip live">◉ live</span>`;
     const note = S.run.note ? `<span class="chip note">⚠ ${esc(S.run.note)}</span>` : '';
     const sumBtn = `<button type="button" class="chip btn" data-summary title="run summary (s)">☰ summary</button>`;
-    metaHTML = `<span style="font-family:ui-monospace,Menlo,monospace">${esc(S.run.runId)}</span>${state}${note}${sumBtn}${connChip}`;
+    // Which driver ran is part of reading the picture: under streaming the
+    // stages overlap and the executors are shared engine slots.
+    const drv = S.run.driver === 'streaming'
+      ? `<span class="chip" title="pipelined execution — stages overlap, executors are shared engine slots">⇄ streaming</span>`
+      : (S.run.driver === 'barrier'
+          ? `<span class="chip" title="one stage at a time">▮ barrier</span>` : '');
+    metaHTML = `<span style="font-family:ui-monospace,Menlo,monospace">${esc(S.run.runId)}</span>${state}${drv}${note}${sumBtn}${connChip}`;
   }
   if (meta.dataset.html !== metaHTML) {
     meta.innerHTML = metaHTML;
@@ -1605,10 +1744,20 @@ function refreshChrome() {
   }
 }
 
-// live ticking for elapsed/runtime while things are in flight
+// The display tick: one coalesced rebuild of the DOM chrome per interval,
+// however many events arrived in between. It also keeps elapsed/runtime
+// counters moving while things are in flight, so it runs even when nothing
+// changed — but only while a run is live.
 setInterval(() => {
-  refreshChrome();
-  if (selected && panel.classList.contains('open')) renderPanel();
+  const live = S.run.runId && !S.run.done;
+  if (chromeDirty || live) {
+    chromeDirty = false;
+    refreshChrome();
+  }
+  if ((panelDirty || live) && selected && panel.classList.contains('open')) {
+    panelDirty = false;
+    renderPanel();
+  }
   if (summaryEl.classList.contains('open')) renderSummary();
 }, 400);
 refreshChrome();
