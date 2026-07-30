@@ -287,6 +287,22 @@ is the same principle the prefix-cache accounting follows in reporting
 negative savings while a write is unamortized: state the truth, including when
 it is inconvenient.
 
+The sharpest case of that principle is `ParseJSON`. Its output fields are
+chosen by the model, so a `Filter` below it drops every record during
+projection while keeping them in the run — an under-count, and the only
+direction in which a cost projection is dangerous. Those stages are marked,
+`Projection.Partial()` reports the whole projection as incomplete, and the
+ceiling stops being described as a bound; `loom.WithStageSample` supplies the
+field names and restores exactness.
+
+The projection is published on the event bus (§4.8) as `stage.projected` and
+`run.projected` rather than only returned, which is what lets an observer hold
+both halves of the comparison. Point `Explain` and `Run` at one handler and the
+constellation view (`viz`) shows the forecast before the run exists, then reads
+each stage's live cost against it — the projection deliberately survives
+`run.started`, because it describes the pipeline and the run that follows is
+the thing it predicted.
+
 ## 5. Failure taxonomy (summary)
 
 | Class | Detected by | Recovery |

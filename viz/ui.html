@@ -288,6 +288,11 @@ const S = {
   tasks: [], taskIx: new Map(),
   workers: [], workerIx: new Map(),
   broadcasts: [], broadcastIx: new Map(),
+  // The pre-flight projection (loom.Explain), when one was published to the
+  // same handler. Deliberately absent from clearState: it describes the
+  // pipeline, not a run, and outliving the reset is what lets the view show
+  // expected against actual once the run it predicted begins.
+  projection: null,
   offset: 0,          // Date.now() - server time
   layoutDirty: true,
   thresholdsDirty: true,
@@ -352,6 +357,7 @@ function applySnapshot(snap) {
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
   (snap.broadcasts || []).forEach(b => upsert(S.broadcasts, S.broadcastIx, b));
+  S.projection = snap.projection || null;
   if (keep && !selectionStillValid(keep)) dropSelection();
   refreshChrome();
   if (selected && panel.classList.contains('open')) renderPanel();
@@ -384,6 +390,7 @@ function applyDelta(d) {
   }
   if (d.worker) upsert(S.workers, S.workerIx, d.worker);
   if (d.broadcast) upsert(S.broadcasts, S.broadcastIx, d.broadcast);
+  if (d.projection) { S.projection = d.projection; chromeDirty = true; }
   // The chrome and the inspector are DOM, and rebuilding them per event is
   // what turns a fast run into a stalled tab. Mark them dirty and let the
   // display tick coalesce: the canvas stays live at frame rate regardless,
@@ -1191,6 +1198,20 @@ function fmtCost(c) {
   if (c < 0.0001) return '<$0.0001';
   return '$' + c.toFixed(c < 1 ? 4 : 2);
 }
+// costVerdict reads actual spend against a projection. Under the ceiling is
+// the expected state and says so quietly; over it is worth colouring, because
+// the ceiling is a bound rather than an estimate — passing it means retries or
+// escalation are spending above what the plan could account for.
+function costVerdict(actual, p) {
+  if (!actual) return '';
+  // An estimated stage has no ceiling worth exceeding — its counts were a
+  // guess — so overspend there is not the signal it is elsewhere.
+  if (actual > p.ceilingUsd && !p.estimated) {
+    return ` <span style="color:${COLORS.fail}">· ${fmtCost(actual)} spent, past the ceiling</span>`;
+  }
+  const share = p.expectedUsd ? Math.round(100 * actual / p.expectedUsd) : 0;
+  return ` <span class="none">· ${fmtCost(actual)} spent` + (share ? ` (${share}% of expected)` : '') + '</span>';
+}
 function relTime(at) {
   if (!S.run.startedAt) return '';
   return '+' + ((at - S.run.startedAt) / 1000).toFixed(2) + 's';
@@ -1483,6 +1504,28 @@ function renderStagePanel(title, body) {
     ['cost', fmtCost(cost)],
     ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
   ];
+  // What this stage was projected to cost, beside what it is costing. The
+  // comparison is the point: a stage tracking its forecast needs no attention,
+  // and one running past it is the thing you want to find while there is still
+  // a run to stop.
+  if (st.proj) {
+    const p = st.proj;
+    rows.push(['projected calls',
+      `${p.calls}` + (calls ? ` <span class="none">· ${calls} made</span>` : '')]);
+    rows.push(['projected cost',
+      `${fmtCost(p.expectedUsd)} expected <span class="none">·</span> ` +
+      `${fmtCost(p.ceilingUsd)} ${p.estimated ? 'guessed' : 'ceiling'}` +
+      costVerdict(cost, p)]);
+    if (p.estimated) {
+      rows.push(['projection', `<span style="color:${COLORS.retry}">estimated</span> ` +
+        `<span class="none">— a ParseJSON stage upstream invents the fields this ` +
+        `stage's records are filtered on, so these counts are a guess</span>`]);
+    }
+    if (p.floorMs) {
+      rows.push(['rate-limit floor',
+        `${fmtDur(p.floorMs)} <span class="none">(the fastest these calls can be admitted)</span>`]);
+    }
+  }
   // The shared prompt prefix is a stage-level property — every task in the
   // stage sends the same head — so its economics belong here, next to the
   // stage's own tokens and cost.
@@ -1583,16 +1626,22 @@ function renderSummary() {
     stat(fmtTok(tok), 'tokens') +
     (prefixServed ? stat(fmtTok(prefixServed), 'prefix served') : '') +
     stat(fmtCost(cost), 'cost') +
+    (S.projection ? stat(fmtCost(S.projection.expectedUsd), 'projected') : '') +
     '</div>';
 
-  // Steps, in the order the driver started them (topological).
+  // Steps, in the order the driver started them (topological). The projected
+  // column only appears when a projection was published, so a run without one
+  // reads exactly as it did before.
+  const proj = S.projection;
   html += '<h4>steps</h4><table><tr><th>stage</th><th>kind</th><th>tasks</th>' +
-    '<th>records</th><th>retries</th><th>cached</th><th>tokens</th><th>cost</th><th>p95</th></tr>';
+    '<th>records</th><th>retries</th><th>cached</th><th>tokens</th>' +
+    (proj ? '<th>projected</th>' : '') + '<th>cost</th><th>p95</th></tr>';
   for (const st of S.stages) {
     const a = aggStage(st.id);
     const tasksTxt = a.total
       ? `${a.done}/${a.total}` + (a.failed ? ` <span style="color:${COLORS.fail}">✕${a.failed}</span>` : '')
       : '<span style="color:var(--ink-3)">driver</span>';
+    const over = st.proj && a.cost > st.proj.ceilingUsd;
     html += `<tr><td>${jumpBtn('stage', st.id)}</td>` +
       `<td>${esc(st.kind || '—')}</td>` +
       `<td>${tasksTxt}</td>` +
@@ -1600,10 +1649,39 @@ function renderSummary() {
       `<td>${a.retries || (a.total ? '0' : '—')}</td>` +
       `<td>${a.total ? (a.cache ? `<span class="save">✧ ${a.cache}</span>` : '0') : '—'}</td>` +
       `<td>${a.tokIn + a.tokOut ? fmtTok(a.tokIn + a.tokOut) : '—'}</td>` +
-      `<td>${a.cost ? fmtCost(a.cost) : '—'}</td>` +
+      (proj ? `<td>${st.proj ? fmtCost(st.proj.expectedUsd) : '—'}</td>` : '') +
+      `<td${over ? ` style="color:${COLORS.fail}"` : ''}>${a.cost ? fmtCost(a.cost) : '—'}</td>` +
       `<td>${a.durs.length ? fmtDur(pct(a.durs, .95)) : '—'}</td></tr>`;
   }
   html += '</table>';
+
+  if (proj) {
+    const share = proj.expectedUsd ? Math.round(100 * cost / proj.expectedUsd) : null;
+    html += `<div class="note">projected before the run: <b>${proj.calls}</b> model calls, ` +
+      `${fmtTok(proj.tokens)} tokens, <b>${fmtCost(proj.expectedUsd)}</b> expected — and at most ` +
+      `<b>${fmtCost(proj.ceilingUsd)}</b>, which is a bound rather than an estimate because ` +
+      `MaxTokens is a cap the provider enforces` +
+      (proj.floorMs ? `. Provider rate limits put a floor of ${fmtDur(proj.floorMs)} under the run` : '') +
+      `. Actual: <b>${fmtCost(cost)}</b>` + (share != null ? ` (${share}% of expected)` : '') +
+      (cost > proj.ceilingUsd && !proj.partial
+        ? ` — <span style="color:${COLORS.fail}">past the ceiling</span>, which means retries or escalation spent above what the plan could account for.`
+        : '.') +
+      (proj.budgetUsd && !proj.fitsBudget
+        ? ` The ${fmtCost(proj.budgetUsd)} run budget did not cover the ceiling, so the governor could stop the run with partial results.`
+        : '') +
+      `</div>`;
+    if (proj.partial) {
+      html += `<div class="note" style="color:${COLORS.retry}">this projection is ` +
+        `<b>incomplete</b>: stages marked below a ParseJSON stage had their record ` +
+        `counts guessed, so ${fmtCost(proj.ceilingUsd)} is a figure for the part that ` +
+        `could be computed — not a cap on the run. Name the fields with ` +
+        `loom.WithStageSample(…) to project them exactly.</div>`;
+    }
+    if (proj.warnings && proj.warnings.length) {
+      html += `<div class="note">the projection could not compute everything it was asked for:` +
+        `<br>· ${proj.warnings.map(esc).join('<br>· ')}</div>`;
+    }
+  }
 
   if (prefixServed || prefixWritten) {
     html += `<div class="note">shared prompt prefixes: ` +
@@ -1678,9 +1756,19 @@ function refreshChrome() {
   const empty = document.getElementById('empty');
   if (!S.run.runId) {
     empty.style.display = 'flex';
+    // A projection arrives before the run it describes, so this is the window
+    // in which it is the only thing there is to show — and the one moment when
+    // knowing the price is still actionable.
+    const p = S.projection;
     const emptyHTML = connState === 'reconnecting'
       ? `<h2>Reconnecting to the event stream…</h2><code>the constellation will resume automatically</code>`
-      : `<h2>Listening for a Loom run</h2><code>loom.Run(ctx, p, loom.WithEventHandler(viz.Handle), …)</code>`;
+      : p
+        ? `<h2>Projected: ${p.calls} model calls, ${fmtCost(p.expectedUsd)} expected</h2>` +
+          `<code>at most ${fmtCost(p.ceilingUsd)}` +
+          (p.floorMs ? ` · rate-limit floor ${fmtDur(p.floorMs)}` : '') +
+          (p.budgetUsd && !p.fitsBudget ? ` · over the ${fmtCost(p.budgetUsd)} budget` : '') +
+          ` — waiting for the run</code>`
+        : `<h2>Listening for a Loom run</h2><code>loom.Run(ctx, p, loom.WithEventHandler(viz.Handle), …)</code>`;
     if (empty.dataset.html !== emptyHTML) {
       empty.innerHTML = emptyHTML;
       empty.dataset.html = emptyHTML;
@@ -1736,6 +1824,14 @@ function refreshChrome() {
     stat(String(cache), 'cached') +
     stat(fmtTok(tok), 'tokens') +
     stat(fmtCost(cost), 'cost') +
+    // Spend against forecast, live. This is the one number that is actionable
+    // while the run is still running: past the ceiling means retries or
+    // escalation are spending above what the plan could account for.
+    (S.projection
+      ? stat(`${fmtCost(S.projection.expectedUsd)}`,
+             cost > S.projection.ceilingUsd ? 'projected · OVER' : 'projected',
+             cost > S.projection.ceilingUsd ? 'accent-fail' : '')
+      : '') +
     (S.broadcasts.length ? stat(String(S.broadcasts.length), 'shared') : '');
   const statsEl = document.getElementById('stats');
   if (statsEl.dataset.html !== statsHTML) {

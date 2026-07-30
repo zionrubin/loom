@@ -11,6 +11,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
 	"github.com/zionrubin/loom/runtime"
@@ -49,6 +50,34 @@ func WithSourceSample(stage string, recs []core.Record) Option {
 	}
 }
 
+// WithStageSample supplies the fields a ParseJSON inference stage is expected
+// to add to each record, so the stages after it can be projected exactly.
+//
+// It exists because ParseJSON is the one operator that changes a record's
+// *shape* in a way no plan can know: the field names come out of the model. A
+// downstream Filter testing one of those fields therefore sees it missing and
+// drops every record, and everything past it projects as zero work — an
+// under-count, and the one way this projection can be wrong in the dangerous
+// direction. Naming the fields once removes the guess:
+//
+//	loom.WithStageSample("classify", map[string]any{
+//	    "category": "billing", "urgent": true,
+//	})
+//
+// A sample is one scenario applied to every record, not a distribution, so a
+// filter below it keeps all the records or none of them. Choose the values
+// that make the most downstream work — the bool a filter accepts, the label
+// with the most expensive branch — and the projection becomes a conservative
+// bound rather than a mid-case guess, which is what a ceiling is for.
+func WithStageSample(stage string, fields map[string]any) Option {
+	return func(c *Config) {
+		if c.StageSamples == nil {
+			c.StageSamples = map[string]map[string]any{}
+		}
+		c.StageSamples[stage] = fields
+	}
+}
+
 // StageProjection is one stage's forecast.
 type StageProjection struct {
 	Stage   string
@@ -57,6 +86,12 @@ type StageProjection struct {
 	Records int    // records entering the stage
 	Calls   int    // model calls the stage issues
 	Tasks   int    // scheduled units those calls are grouped into
+
+	// Estimated marks a stage whose record count descends from a ParseJSON
+	// stage with no WithStageSample: the model invents the fields the stages
+	// below it filter and template on, so this stage's counts — and therefore
+	// its cost, in either column — are a guess rather than a computation.
+	Estimated bool
 
 	// Usage is the projected accounting at the expected response length,
 	// priced from the registry exactly as a run would price it — including
@@ -92,6 +127,23 @@ type Projection struct {
 	// approximation, and every discrepancy worth seeing before spending
 	// money. A projection with no warnings is computed end to end.
 	Warnings []string
+}
+
+// Partial reports whether any stage's record count was guessed rather than
+// computed, which happens when a ParseJSON stage has no WithStageSample.
+//
+// It matters more than it looks: Ceiling is a genuine bound only over the
+// records the projection knows about. When a stage is Estimated, the run can
+// do work this projection never saw, so the ceiling becomes a figure for the
+// part that was understood rather than a cap on the whole run — and the report
+// says so instead of quietly claiming otherwise.
+func (p *Projection) Partial() bool {
+	for _, s := range p.Stages {
+		if s.Estimated {
+			return true
+		}
+	}
+	return false
 }
 
 // Expected returns the whole-run projection at the expected response length.
@@ -208,10 +260,11 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	}
 
 	e := &explainer{
-		cfg:    cfg,
-		values: values,
-		ratio:  cfg.ExpectedOutput,
-		recs:   map[string][]core.Record{},
+		cfg:     cfg,
+		values:  values,
+		ratio:   cfg.ExpectedOutput,
+		recs:    map[string][]core.Record{},
+		tainted: map[string]bool{},
 	}
 	if e.ratio <= 0 {
 		e.ratio = defaultExpectedOutput
@@ -233,14 +286,56 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 		proj.Stages = append(proj.Stages, sproj)
 	}
 	proj.Warnings = e.warnings
+	if cfg.EventHandler != nil {
+		proj.publish(cfg.EventHandler)
+	}
 	return proj, nil
 }
 
+// publish emits the projection on the run's event handler. Pointing Explain
+// and Run at one handler is what lets an observer — the constellation view,
+// say — hold both halves of the comparison: the stages arrive with what they
+// are expected to cost, and then the tasks arrive with what they actually do.
+//
+// Stages go first and the run-level total last, so a consumer that treats
+// run.projected as "the projection is complete" sees a consistent picture.
+func (p *Projection) publish(fn func(observe.Event)) {
+	now := time.Now()
+	// Note carries the one qualifier an observer must not miss: a stage whose
+	// counts were guessed, and a run whose ceiling is therefore not a bound.
+	for _, s := range p.Stages {
+		e := observe.Event{
+			Type: observe.StageProjected, Time: now,
+			Stage: s.Stage, Kind: s.Kind, Model: s.Model,
+			Records: s.Records, Usage: s.Usage, Ceiling: s.Ceiling,
+			Latency: s.AdmissionFloor,
+		}
+		if s.Estimated {
+			e.Note = "estimated"
+		}
+		fn(e)
+	}
+	run := observe.Event{
+		Type: observe.RunProjected, Time: now,
+		Kind: p.Driver, Usage: p.Expected(), Ceiling: p.Ceiling(),
+		Budget: p.Budget, Latency: p.AdmissionFloor(),
+		Detail: strings.Join(p.Warnings, "\n"),
+	}
+	if p.Partial() {
+		run.Note = "partial"
+	}
+	fn(run)
+}
+
 type explainer struct {
-	cfg      Config
-	values   map[string]any // broadcast name → value as a task would read it
-	ratio    float64
-	recs     map[string][]core.Record
+	cfg    Config
+	values map[string]any // broadcast name → value as a task would read it
+	ratio  float64
+	recs   map[string][]core.Record
+	// tainted marks stages whose output records have a shape the plan could
+	// not know — a ParseJSON stage with no sample — so every stage downstream
+	// can be reported as estimated rather than computed.
+	tainted  map[string]bool
 	seen     map[string]bool
 	warnings []string
 }
@@ -312,8 +407,13 @@ func (e *explainer) stage(sp *plan.StagePlan) (StageProjection, error) {
 	var input []core.Record
 	if up := s.Upstream; up != nil {
 		input = e.recs[up.ID]
+		// Uncertainty about a record's shape flows downstream with the record.
+		if e.tainted[up.ID] {
+			e.tainted[s.ID] = true
+		}
 	}
-	out := StageProjection{Stage: s.ID, Kind: string(s.Kind), Records: len(input)}
+	out := StageProjection{Stage: s.ID, Kind: string(s.Kind),
+		Records: len(input), Estimated: e.tainted[s.ID]}
 
 	switch s.Kind {
 	case pipeline.KindSource:
@@ -646,16 +746,29 @@ func (e *explainer) inferOutputs(s *pipeline.Stage, input []core.Record, expecte
 	if field == "" {
 		field = "output"
 	}
-	if s.Infer.ParseJSON {
-		e.warnf("stage %q parses its output as JSON, so which fields it adds to "+
-			"each record is not knowable from the plan; a downstream template "+
-			"reading one of them is estimated from its source", s.ID)
+	sample, sampled := e.cfg.StageSamples[s.ID]
+	if s.Infer.ParseJSON && !sampled {
+		// This is the one way a projection can be wrong in the dangerous
+		// direction. A downstream Filter testing a field the model was going to
+		// invent sees it missing, drops every record, and everything past it
+		// projects as no work at all — so the total understates the run rather
+		// than bounding it. Say so, and say how to fix it.
+		e.tainted[s.ID] = true
+		e.warnf("stage %q parses its output as JSON, so the fields it adds to each "+
+			"record are not knowable from the plan: stages below it are estimated, "+
+			"and a filter testing one of those fields will drop every record here "+
+			"while keeping them in the real run. Name the fields with "+
+			"loom.WithStageSample(%q, ...) to project them exactly", s.ID, s.ID)
 	}
 	placeholder := strings.Repeat("x", 4*expected)
 	out := make([]core.Record, 0, len(input))
 	for _, r := range input {
 		nr := r.Clone()
-		if !s.Infer.ParseJSON {
+		if s.Infer.ParseJSON {
+			for k, v := range sample {
+				nr.Data[k] = v
+			}
+		} else {
 			nr.Data[field] = placeholder
 		}
 		out = append(out, nr)
@@ -685,8 +798,12 @@ func (p *Projection) String() string {
 	fmt.Fprintf(&b, "%-22s %-24s %6s %6s %8s %8s %10s %10s %8s\n",
 		"stage", "model", "recs", "calls", "prompt", "cached", "exp($)", "max($)", "floor")
 	for _, s := range p.Stages {
+		name := s.Stage
+		if s.Estimated {
+			name = "~" + name // counts guessed, not computed
+		}
 		fmt.Fprintf(&b, "%-22s %-24s %6d %6d %8d %8d %10.4f %10.4f %8s\n",
-			s.Stage, s.Model, s.Records, s.Calls,
+			name, s.Model, s.Records, s.Calls,
 			s.Usage.PromptTokens(), s.Usage.CacheReadTokens,
 			s.Usage.CostUSD, s.Ceiling.CostUSD,
 			s.AdmissionFloor.Round(time.Second))
@@ -696,13 +813,26 @@ func (p *Projection) String() string {
 		"TOTAL", "", "", exp.Requests, exp.PromptTokens(), exp.CacheReadTokens,
 		exp.CostUSD, ceil.CostUSD, p.AdmissionFloor().Round(time.Second))
 
-	fmt.Fprintf(&b, "expected %d tokens for $%.4f; cannot exceed %d tokens / $%.4f before retries\n",
-		exp.TotalTokens(), exp.CostUSD, ceil.TotalTokens(), ceil.CostUSD)
+	if p.Partial() {
+		// Being explicit here is the whole point. A ceiling that covers only
+		// the stages the projection understood is not a cap on the run, and
+		// presenting it as one is exactly the failure this tool exists to
+		// prevent.
+		fmt.Fprintf(&b, "expected %d tokens for $%.4f across the stages that could be "+
+			"computed\nstages marked ~ are estimated, so $%.4f is NOT a bound on the "+
+			"run — work below them is unaccounted for\n",
+			exp.TotalTokens(), exp.CostUSD, ceil.CostUSD)
+	} else {
+		fmt.Fprintf(&b, "expected %d tokens for $%.4f; cannot exceed %d tokens / $%.4f before retries\n",
+			exp.TotalTokens(), exp.CostUSD, ceil.TotalTokens(), ceil.CostUSD)
+	}
 	if p.Budget.MaxCostUSD > 0 || p.Budget.MaxTokens > 0 {
 		verdict := "covers the ceiling"
 		if !p.FitsBudget() {
 			verdict = "is below the ceiling: the governor will stop the run and " +
 				"return partial results"
+		} else if p.Partial() {
+			verdict = "covers the projected stages, but the projection is incomplete"
 		}
 		fmt.Fprintf(&b, "run budget %s %s\n", budgetDetail(p.Budget), verdict)
 	}

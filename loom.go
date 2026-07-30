@@ -52,6 +52,7 @@ type Config struct {
 	// run would cost.
 	ExpectedOutput float64
 	SourceSamples  map[string][]core.Record
+	StageSamples   map[string]map[string]any
 }
 
 // Option configures a run.

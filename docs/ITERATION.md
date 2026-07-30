@@ -215,6 +215,23 @@ cannot compute — a response's length, the fields a `ParseJSON` stage
 introduces, the output of a source function it deliberately refuses to invoke
 — becomes a named warning rather than a confident wrong number.
 
+One of those deserves singling out, because it is the only way a projection can
+be wrong in the direction that costs money. A `ParseJSON` stage's field names
+come out of the model, so a `Filter` below it testing one of them drops every
+record during projection while keeping them in the real run, and everything
+past it projects as no work at all. That is an *under*-count, and an
+under-count presented as a ceiling is precisely the failure this tool exists to
+prevent — so those stages are marked, `Projection.Partial()` reports the
+projection as incomplete, and the report stops using the word ceiling.
+`loom.WithStageSample` names the fields and makes it exact again.
+
+The same projection is published on the event bus (`stage.projected`,
+`run.projected`), so pointing `Explain` and `Run` at one handler gives the
+constellation view both halves: the forecast while the sky is still empty, then
+every stage read against it as the run fills in. That pairing is what makes the
+next step tractable — a loop's cost is only legible as *per-round projected
+versus actual*, and the machinery for that comparison now exists.
+
 The example above earns its keep immediately: the reduce tree costs **22×**
 the classification stage that feeds it, which is not where anyone looks first.
 

@@ -4,11 +4,13 @@ import (
 	"context"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 
 	loom "github.com/zionrubin/loom"
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 )
 
@@ -370,4 +372,128 @@ func hasWarning(warnings []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestExplainPublishesProjection covers the seam that lets an observer hold
+// both halves of the comparison: point Explain and Run at one event handler,
+// and the projection arrives before the run it describes.
+func TestExplainPublishesProjection(t *testing.T) {
+	reg, _ := explainRegistry(t)
+
+	var mu sync.Mutex
+	var stages []observe.Event
+	var runs []observe.Event
+	handler := func(e observe.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch e.Type {
+		case observe.StageProjected:
+			stages = append(stages, e)
+		case observe.RunProjected:
+			runs = append(runs, e)
+		}
+	}
+
+	proj, err := loom.Explain(explainPipeline(), loom.WithRegistry(reg),
+		loom.WithExpectedOutput(explainRatio), loom.WithEventHandler(handler))
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+
+	if len(stages) != len(proj.Stages) {
+		t.Errorf("published %d stage projections, projection has %d", len(stages), len(proj.Stages))
+	}
+	if len(runs) != 1 {
+		t.Fatalf("published %d run projections, want exactly 1", len(runs))
+	}
+	if got, want := runs[0].Usage.CostUSD, proj.Expected().CostUSD; got != want {
+		t.Errorf("published expected cost %v, projection says %v", got, want)
+	}
+	if got, want := runs[0].Ceiling.CostUSD, proj.Ceiling().CostUSD; got != want {
+		t.Errorf("published ceiling %v, projection says %v", got, want)
+	}
+	if runs[0].Ceiling.CostUSD <= runs[0].Usage.CostUSD {
+		t.Error("the published ceiling does not exceed the expected case")
+	}
+
+	// A run through the same handler must not be disturbed by having been
+	// projected first: same events, same report.
+	res, err := loom.Run(context.Background(), explainPipeline(),
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()), loom.WithEventHandler(handler))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Errorf("the run emitted %d run projections; only Explain should", len(runs)-1)
+	}
+	if got := res.Report.Totals().Requests; got != proj.Expected().Requests {
+		t.Errorf("run made %d calls, projection said %d", got, proj.Expected().Requests)
+	}
+}
+
+// TestExplainMarksUnknownRecordShapes covers the one way this projection can be
+// wrong in the dangerous direction. A ParseJSON stage's fields come out of the
+// model, so a filter testing one of them drops every record during projection
+// while keeping them in the real run — and everything below projects as no work
+// at all. That has to be reported as incomplete, never as a ceiling.
+func TestExplainMarksUnknownRecordShapes(t *testing.T) {
+	build := func() *pipeline.Pipeline {
+		p := pipeline.New("json-filter")
+		p.FromRecords("tickets", tickets()).
+			Infer("classify", pipeline.InferSpec{
+				Binding:   model.Binding{Tier: model.TierFast},
+				Prompt:    "Classify: {{.subject}}",
+				MaxTokens: explainMaxTokens,
+				ParseJSON: true,
+			}).
+			Filter("urgent-only", func(r core.Record) (bool, error) {
+				urgent, _ := r.Data["urgent"].(bool)
+				return urgent, nil
+			}).
+			Infer("reply", pipeline.InferSpec{
+				Binding:   model.Binding{Tier: model.TierFast},
+				Prompt:    "Reply to: {{.subject}}",
+				MaxTokens: explainMaxTokens,
+			})
+		return p
+	}
+	reg, _ := explainRegistry(t)
+
+	blind, err := loom.Explain(build(), loom.WithRegistry(reg))
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	if !blind.Partial() {
+		t.Fatal("a projection that guessed a stage's record count called itself complete")
+	}
+	if !strings.Contains(blind.String(), "NOT a bound") {
+		t.Errorf("the report presents an incomplete total as a ceiling:\n%s", blind)
+	}
+	if !hasWarning(blind.Warnings, "WithStageSample") {
+		t.Errorf("the warning does not say how to fix it: %v", blind.Warnings)
+	}
+	// The filter dropped everything, so the stage below it saw no work.
+	for _, s := range blind.Stages {
+		if s.Stage == "reply" && s.Calls != 0 {
+			t.Errorf("reply projected %d calls without a sample, want 0", s.Calls)
+		}
+	}
+
+	// Naming the fields makes the same pipeline computable end to end.
+	exact, err := loom.Explain(build(), loom.WithRegistry(reg),
+		loom.WithStageSample("classify", map[string]any{"urgent": true}))
+	if err != nil {
+		t.Fatalf("explain with sample: %v", err)
+	}
+	if exact.Partial() {
+		t.Errorf("a sampled projection still calls itself partial: %v", exact.Warnings)
+	}
+	for _, s := range exact.Stages {
+		if s.Stage == "reply" && s.Calls != len(tickets()) {
+			t.Errorf("reply projected %d calls, want %d", s.Calls, len(tickets()))
+		}
+	}
+	if got, want := exact.Expected().Requests, 2*len(tickets()); got != want {
+		t.Errorf("sampled projection has %d calls, want %d", got, want)
+	}
 }

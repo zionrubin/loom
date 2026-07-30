@@ -131,7 +131,10 @@ this one, including what is deliberately left out.
   per-executor utilization. The header names the driver that ran, stage and
   task inspectors carry the shared prefix's cache economics, and under
   streaming the executors are the engine's slots, so overlapping stages and
-  shared occupancy are visible as they happen. Heavy per-node payloads
+  shared occupancy are visible as they happen. Feed it a projection
+  (`loom.Explain` on the same handler) and it shows the forecast before the run
+  starts, then reads every stage against it live — spend versus projection in
+  the header, and a projected-versus-actual reconciliation in the summary. Heavy per-node payloads
   (rendered prompts, responses, record JSON) load only for the node you open,
   which is what keeps the view responsive on runs with thousands of tasks.
 - **Providers** — a deterministic mock (offline dev, scripted failures) plus
@@ -246,10 +249,45 @@ Because it compiles the pipeline exactly as `Run` does, it doubles as a free
 validation pass — unregistered models, unparseable templates, and a prefix
 reading a broadcast its stage never declared all surface before anything is
 provisioned. Anything it genuinely cannot compute becomes a named warning
-instead of a confident wrong number: response length, the fields a `ParseJSON`
-stage will introduce, and the output of a source function, which it declines
-to invoke precisely because a cost projection that reads your database has
-defeated its own purpose (supply records with `loom.WithSourceSample`).
+instead of a confident wrong number, and the report stops calling the total a
+ceiling when it no longer is:
+
+- **Response length** is the one assumption, above.
+- **A source function** is never invoked — a cost projection that reads your
+  database has defeated its own purpose. Supply records with
+  `loom.WithSourceSample`.
+- **A `ParseJSON` stage's fields come out of the model**, so a downstream
+  `Filter` testing one of them would drop every record during projection while
+  keeping them in the real run — an *under*-count, the only way this can be
+  wrong in the dangerous direction. Those stages are marked `~`, the run is
+  reported as incomplete, and `Projection.Partial()` says so. Name the fields
+  with `loom.WithStageSample("classify", map[string]any{"urgent": true})` and
+  it becomes exact again. A sample is one scenario applied to every record, so
+  pick the values that make the most downstream work and the result is a
+  conservative bound.
+
+### In the constellation view
+
+Point `Explain` and `Run` at the same event handler and the
+[constellation view](#what-you-get) holds both halves of the comparison:
+
+```go
+opts := []loom.Option{loom.WithRegistry(reg), loom.WithEventHandler(v.Handle)}
+
+proj, _ := loom.Explain(p, append(opts, loom.WithStageSample(...))...)  // before
+res, _ := loom.Run(ctx, p, opts...)                                     // after
+```
+
+The projection is published on the same bus as everything else
+(`stage.projected`, `run.projected`), so it arrives while the sky is still
+empty — the empty state shows the forecast and the budget verdict instead of
+"waiting for a run". Once the run starts, each stage's inspector reads its live
+cost against what it was projected to cost, the header carries spend against
+forecast and flags going past the ceiling, and the run summary gains a
+projected column plus a projected-versus-actual reconciliation. The projection
+deliberately survives `run.started`: it describes the pipeline, and the run
+that follows is the thing it predicted. `go run ./examples/constellation`
+demonstrates the whole loop.
 
 ## Sharing data across tasks
 
