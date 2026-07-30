@@ -1,0 +1,727 @@
+package loom
+
+import (
+	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"text/template"
+	"time"
+
+	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/runtime"
+	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/task"
+)
+
+// defaultExpectedOutput is the share of a stage's MaxTokens a response is
+// assumed to actually use. Output length is the one quantity a plan cannot
+// determine — everything else in a projection is computed — so it is a stated
+// assumption with a knob (WithExpectedOutput) rather than a hidden constant.
+const defaultExpectedOutput = 0.35
+
+// WithExpectedOutput sets the fraction of each stage's MaxTokens that
+// responses are assumed to fill, for Explain's expected-cost column (default
+// 0.35). It does not affect a run: MaxTokens still caps responses, and the
+// projection's ceiling is always computed at the full cap.
+func WithExpectedOutput(ratio float64) Option {
+	return func(c *Config) { c.ExpectedOutput = ratio }
+}
+
+// WithSourceSample supplies the records a function-backed source (FromFunc)
+// would produce, so Explain can project the stages downstream of it.
+//
+// Explain never invokes a source function — it is the one stage whose
+// execution may touch the outside world, and a cost projection that reads a
+// database or an object store to tell you what a run would cost has defeated
+// its own purpose. FromRecords sources need no sample; their records are
+// already in the pipeline.
+func WithSourceSample(stage string, recs []core.Record) Option {
+	return func(c *Config) {
+		if c.SourceSamples == nil {
+			c.SourceSamples = map[string][]core.Record{}
+		}
+		c.SourceSamples[stage] = recs
+	}
+}
+
+// StageProjection is one stage's forecast.
+type StageProjection struct {
+	Stage   string
+	Kind    string
+	Model   string // base model of the binding; "" for stages that call none
+	Records int    // records entering the stage
+	Calls   int    // model calls the stage issues
+	Tasks   int    // scheduled units those calls are grouped into
+
+	// Usage is the projected accounting at the expected response length,
+	// priced from the registry exactly as a run would price it — including
+	// the three disjoint prompt-token classes, so a stage that shares a
+	// prefix shows what it reads from the provider's cache rather than pays
+	// for.
+	Usage core.Usage
+
+	// Ceiling is the same accounting with every response filling MaxTokens.
+	// Unlike Usage it rests on no assumption: MaxTokens is a cap the provider
+	// enforces, so a first attempt of this stage cannot cost more than this.
+	Ceiling core.Usage
+
+	// AdmissionFloor is the shortest wall-clock time these calls can take
+	// under the model's requests/min and tokens/min limits — the scheduler
+	// will not admit them faster, however many workers are available.
+	AdmissionFloor time.Duration
+
+	// CachePrefix reports whether the planner will enable provider prompt-
+	// prefix caching for this stage.
+	CachePrefix bool
+}
+
+// Projection is what a pipeline is expected to cost and how long it can least
+// take, computed without issuing a single model call.
+type Projection struct {
+	Pipeline string
+	Driver   string
+	Budget   core.Budget
+	Stages   []StageProjection
+
+	// Warnings name every place the projection had to fall back to an
+	// approximation, and every discrepancy worth seeing before spending
+	// money. A projection with no warnings is computed end to end.
+	Warnings []string
+}
+
+// Expected returns the whole-run projection at the expected response length.
+func (p *Projection) Expected() core.Usage { return sumUsage(p.Stages, false) }
+
+// Ceiling returns the whole-run projection with every response filling its
+// stage's MaxTokens: the most a run can spend before retries.
+func (p *Projection) Ceiling() core.Usage { return sumUsage(p.Stages, true) }
+
+func sumUsage(stages []StageProjection, ceiling bool) core.Usage {
+	var t core.Usage
+	for _, s := range stages {
+		if ceiling {
+			t.Add(s.Ceiling)
+		} else {
+			t.Add(s.Usage)
+		}
+	}
+	return t
+}
+
+// AdmissionFloor returns the shortest time the run can take under provider
+// rate limits. Stages that cannot overlap add up, so the barrier driver sums
+// every stage's floor while the streaming driver — which runs all stages
+// against one slot pool — is bounded by the longest dependency chain.
+func (p *Projection) AdmissionFloor() time.Duration {
+	if p.Driver != "streaming" {
+		var total time.Duration
+		for _, s := range p.Stages {
+			total += s.AdmissionFloor
+		}
+		return total
+	}
+	var longest time.Duration
+	for _, s := range p.Stages {
+		longest = max(longest, s.AdmissionFloor)
+	}
+	return longest
+}
+
+// FitsBudget reports whether the run's budget covers the projected ceiling.
+// A false here does not mean the run fails: the governor stops admitting work
+// and returns partial results, which is sometimes exactly what you want.
+func (p *Projection) FitsBudget() bool {
+	c := p.Ceiling()
+	if p.Budget.MaxCostUSD > 0 && c.CostUSD > p.Budget.MaxCostUSD {
+		return false
+	}
+	if p.Budget.MaxTokens > 0 && c.TotalTokens() > p.Budget.MaxTokens {
+		return false
+	}
+	return true
+}
+
+// Explain projects what running p would cost, without running it.
+//
+// It compiles the pipeline exactly as Run does — same validation, same
+// fusion, same fingerprints, same envelopes — then walks the plan computing
+// per-stage call counts, rendered prompt sizes, prompt-cache economics, and
+// registry-priced cost. Two numbers come out of every stage: an expected cost
+// under a stated assumption about response length, and a ceiling that rests
+// on none, because MaxTokens is a cap the provider enforces. The ceiling is
+// the number to hand WithRunBudget.
+//
+// What makes the projection sharp rather than a guess is a property specific
+// to this framework: a pipeline's cheap stages are ordinary Go functions and
+// its expensive ones are declarative data. So Explain *executes* the cheap
+// skeleton — Map, Filter, FlatMap, Combine really run — and only models the
+// paid calls. Record counts are therefore exact, not extrapolated, and every
+// prompt is measured after rendering against the record that will produce it.
+//
+// Three things it cannot compute, each of which produces a warning rather
+// than a wrong number: the length of a response, the fields a ParseJSON stage
+// will introduce (so a downstream template reading them falls back to
+// estimating from the template source), and the output of a source function
+// or a MapTools stage, which Explain declines to execute because one may
+// touch the network and the other needs a provisioned session.
+//
+// Explain issues no model calls, resolves no secrets, opens no sockets, and
+// writes nothing to the state directory, so it is safe to run against a
+// production pipeline config. Retries and escalation are excluded: both are
+// responses to failures a projection cannot predict, and both spend above the
+// ceiling when they happen.
+func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
+	cfg := Config{Workers: 8, Retry: runtime.DefaultRetry}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.Registry == nil {
+		cfg.Registry = model.NewRegistry()
+	}
+
+	// An in-memory CAS: a projection must not touch the run's state dir, and
+	// the broadcast hashes it needs are only there to make the compiled plan —
+	// and therefore the fingerprints — identical to the one Run would compile.
+	cas, err := store.NewCAS("")
+	if err != nil {
+		return nil, err
+	}
+	broadcasts := store.NewBroadcasts(cas)
+	for _, name := range slices.Sorted(maps.Keys(cfg.Broadcasts)) {
+		if _, err := broadcasts.Register(name, cfg.Broadcasts[name]); err != nil {
+			return nil, err
+		}
+	}
+	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(broadcasts.Hashes()))
+	if err != nil {
+		return nil, err
+	}
+
+	values, err := decodeBroadcasts(cfg.Broadcasts)
+	if err != nil {
+		return nil, err
+	}
+
+	e := &explainer{
+		cfg:    cfg,
+		values: values,
+		ratio:  cfg.ExpectedOutput,
+		recs:   map[string][]core.Record{},
+	}
+	if e.ratio <= 0 {
+		e.ratio = defaultExpectedOutput
+	}
+
+	proj := &Projection{
+		Pipeline: p.Name,
+		Driver:   "barrier",
+		Budget:   cfg.RunBudget,
+	}
+	if cfg.Streaming {
+		proj.Driver = "streaming"
+	}
+	for _, sp := range pl.Order {
+		sproj, err := e.stage(sp)
+		if err != nil {
+			return nil, err
+		}
+		proj.Stages = append(proj.Stages, sproj)
+	}
+	proj.Warnings = e.warnings
+	return proj, nil
+}
+
+type explainer struct {
+	cfg      Config
+	values   map[string]any // broadcast name → value as a task would read it
+	ratio    float64
+	recs     map[string][]core.Record
+	seen     map[string]bool
+	warnings []string
+}
+
+func (e *explainer) warnf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if e.seen == nil {
+		e.seen = map[string]bool{}
+	}
+	if e.seen[msg] {
+		return
+	}
+	e.seen[msg] = true
+	e.warnings = append(e.warnings, msg)
+}
+
+// decodeBroadcasts round-trips registered values through JSON the way the
+// store does, so a prefix rendering {{broadcastJSON "x"}} is measured on the
+// bytes a task would actually receive.
+func decodeBroadcasts(values map[string]any) (map[string]any, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]any, len(values))
+	for name, v := range values {
+		blob, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("broadcast %q: %w", name, err)
+		}
+		var decoded any
+		if err := json.Unmarshal(blob, &decoded); err != nil {
+			return nil, fmt.Errorf("broadcast %q: %w", name, err)
+		}
+		out[name] = decoded
+	}
+	return out, nil
+}
+
+// funcs binds the broadcast template functions to exactly the values this
+// stage declared. Scoping them to the declaration is deliberate: a prefix
+// that reads a broadcast the stage never declared fails at run time, and this
+// is the cheapest possible place to find that out.
+func (e *explainer) funcs(declared map[string]string) template.FuncMap {
+	get := func(name string) (any, error) {
+		if _, ok := declared[name]; !ok {
+			return nil, fmt.Errorf("broadcast %q: not declared by this stage "+
+				"(add pipeline.WithBroadcast(%q))", name, name)
+		}
+		return e.values[name], nil
+	}
+	return template.FuncMap{
+		"broadcast": get,
+		"broadcastJSON": func(name string) (string, error) {
+			v, err := get(name)
+			if err != nil {
+				return "", err
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				return "", fmt.Errorf("broadcast %q: %w", name, err)
+			}
+			return string(b), nil
+		},
+	}
+}
+
+func (e *explainer) stage(sp *plan.StagePlan) (StageProjection, error) {
+	s := sp.Stage
+	var input []core.Record
+	if up := s.Upstream; up != nil {
+		input = e.recs[up.ID]
+	}
+	out := StageProjection{Stage: s.ID, Kind: string(s.Kind), Records: len(input)}
+
+	switch s.Kind {
+	case pipeline.KindSource:
+		recs := s.SourceRecords
+		if s.SourceFn != nil {
+			sample, ok := e.cfg.SourceSamples[s.ID]
+			if !ok {
+				e.warnf("source %q is a function, which Explain does not invoke: "+
+					"nothing downstream of it is projected (supply records with "+
+					"loom.WithSourceSample(%q, ...))", s.ID, s.ID)
+			}
+			recs = sample
+		}
+		e.recs[s.ID] = recs
+		out.Records = len(recs)
+
+	case pipeline.KindFused:
+		e.recs[s.ID] = e.applyFused(s, input)
+
+	case pipeline.KindCombine:
+		folded, err := foldCombine(s, input)
+		if err != nil {
+			e.warnf("stage %q: combine function returned an error during "+
+				"projection (%v); downstream estimates use the first record", s.ID, err)
+			if len(input) > 0 {
+				folded = []core.Record{input[0].Clone()}
+			}
+		}
+		e.recs[s.ID] = folded
+
+	case pipeline.KindInfer:
+		e.infer(sp, input, &out)
+
+	case pipeline.KindReduceAI:
+		e.reduce(sp, input, &out)
+	}
+	return out, nil
+}
+
+// applyFused runs a fused stage's pure functions for real. They are ordinary
+// deterministic Go transforms — that is the definition of the fusion the
+// planner performed — so executing them is what makes every downstream record
+// count exact instead of extrapolated from a selectivity guess.
+func (e *explainer) applyFused(s *pipeline.Stage, input []core.Record) []core.Record {
+	cur := input
+	for _, sub := range s.Fused {
+		if sub.MapCtxFn != nil {
+			e.warnf("stage %q: MapTools needs a provisioned session, so Explain "+
+				"treats it as identity; record counts past it assume it drops nothing", sub.ID)
+			continue
+		}
+		next := make([]core.Record, 0, len(cur))
+		for _, r := range cur {
+			recs, err := applyPure(sub, r)
+			if err != nil {
+				e.warnf("stage %q: %v during projection; the record is kept as-is", sub.ID, err)
+				next = append(next, r)
+				continue
+			}
+			next = append(next, recs...)
+		}
+		cur = next
+	}
+	return cur
+}
+
+// applyPure applies one pure transform to one record, converting a panic into
+// an error: Explain is a pre-flight check and must not be the thing that
+// brings down the caller.
+func applyPure(s *pipeline.Stage, r core.Record) (out []core.Record, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			out, err = nil, fmt.Errorf("%s panicked: %v", s.Kind, p)
+		}
+	}()
+	switch {
+	case s.MapFn != nil:
+		nr, err := s.MapFn(r.Clone())
+		if err != nil {
+			return nil, err
+		}
+		return []core.Record{nr}, nil
+	case s.FilterFn != nil:
+		keep, err := s.FilterFn(r)
+		if err != nil {
+			return nil, err
+		}
+		if !keep {
+			return nil, nil
+		}
+		return []core.Record{r}, nil
+	case s.FlatMapFn != nil:
+		return s.FlatMapFn(r.Clone())
+	}
+	return []core.Record{r}, nil
+}
+
+// infer projects a per-record inference stage. One model call per record —
+// batching groups records into scheduled tasks, not into requests — and one
+// shared prefix per task.
+func (e *explainer) infer(sp *plan.StagePlan, input []core.Record, out *StageProjection) {
+	s := sp.Stage
+	spec := s.Infer
+
+	batch := s.Opts.BatchSize
+	if batch <= 0 {
+		batch = 1
+	}
+	out.Tasks = (len(input) + batch - 1) / batch
+	out.Calls = len(input)
+
+	// Mirror the planner's rule rather than restate its intent: it enables
+	// prefix caching when a stage builds more than one *task*, so a stage
+	// whose whole input fits one batch pays full price on every record even
+	// though it issues many calls. Worth knowing before a run, not worth
+	// silently modelling differently here.
+	out.CachePrefix = out.Tasks > 1 && !s.Opts.NoPrefixCache && !spec.Binding.IsZero()
+	if !out.CachePrefix && out.Calls > 1 && !s.Opts.NoPrefixCache && spec.Prefix != "" {
+		e.warnf("stage %q issues %d calls in %d task(s), and the planner keys prefix "+
+			"caching on task count, so the shared prefix is sent uncached on every call "+
+			"(a smaller pipeline.WithBatchSize would cache it)", s.ID, out.Calls, out.Tasks)
+	}
+
+	if len(sp.Candidates) == 0 {
+		return
+	}
+	info := sp.Candidates[0]
+	out.Model = info.ID
+
+	maxTokens := spec.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+	expected := max(1, int(e.ratio*float64(maxTokens)))
+
+	shared := model.EstimateTokens(spec.System) +
+		model.EstimateTokens(e.renderPrefix(s.ID, spec.Prefix, spec.Context, sp.Broadcasts))
+	prompts := e.renderPrompts(s.ID, spec.Prompt, input)
+
+	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	e.recs[s.ID] = e.inferOutputs(s, input, expected)
+}
+
+// reduce projects a hierarchical AI reduce: each level groups the level below
+// it FanIn at a time and issues one call per group, until one record remains.
+func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StageProjection) {
+	s := sp.Stage
+	spec := s.Reduce
+
+	fanIn := spec.FanIn
+	if fanIn <= 1 {
+		fanIn = 8
+	}
+	if len(sp.Candidates) == 0 {
+		e.recs[s.ID] = nil
+		return
+	}
+	info := sp.Candidates[0]
+	out.Model = info.ID
+
+	maxTokens := spec.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+	expected := max(1, int(e.ratio*float64(maxTokens)))
+	itemField := spec.ItemField
+	if itemField == "" {
+		itemField = "output"
+	}
+
+	shared := model.EstimateTokens(spec.System) +
+		model.EstimateTokens(e.renderPrefix(s.ID, spec.Prefix, nil, sp.Broadcasts))
+
+	// Walk the tree the way the driver does: build the level's groups, count a
+	// call per group, and feed the level's outputs into the next one.
+	cur := input
+	var prompts []int
+	for len(cur) > 0 {
+		groups := (len(cur) + fanIn - 1) / fanIn
+		for i := 0; i < len(cur); i += fanIn {
+			group := cur[i:min(i+fanIn, len(cur))]
+			items := make([]string, 0, len(group))
+			for _, r := range group {
+				items = append(items, r.String(itemField))
+			}
+			prompts = append(prompts, e.renderReducePrompt(s.ID, spec.Prompt, items))
+		}
+		out.Tasks += groups
+		cur = e.reduceOutputs(s, groups, expected)
+		if groups == 1 {
+			break
+		}
+	}
+	out.Calls = len(prompts)
+	out.CachePrefix = out.Tasks > 1 && !s.Opts.NoPrefixCache && !spec.Binding.IsZero()
+
+	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	e.recs[s.ID] = cur
+}
+
+// accumulate turns per-call prompt sizes into the stage's two projections,
+// splitting prompt tokens across the three disjoint classes exactly as a
+// provider's prompt cache does: the first call carrying a shared head writes
+// the entry, every later one reads it.
+func (e *explainer) accumulate(out *StageProjection, info model.Info, prompts []int, shared, expected, maxTokens int) {
+	for i, p := range prompts {
+		u := core.Usage{InputTokens: p, Requests: 1}
+		switch {
+		case !out.CachePrefix:
+			u.InputTokens += shared
+		case i == 0:
+			u.CacheWriteTokens = shared
+		default:
+			u.CacheReadTokens = shared
+		}
+
+		u.OutputTokens = expected
+		u.CostUSD = info.Pricing.Cost(u)
+		out.Usage.Add(u)
+
+		u.OutputTokens = maxTokens
+		u.CostUSD = info.Pricing.Cost(u)
+		out.Ceiling.Add(u)
+	}
+	out.AdmissionFloor = admissionFloor(info, len(prompts), out.Ceiling.TotalTokens())
+}
+
+// admissionFloor is the shortest time the scheduler's token buckets can
+// release this many calls and tokens. Workers do not enter into it: no amount
+// of concurrency moves work through a provider's per-minute ceiling faster.
+func admissionFloor(info model.Info, calls, tokens int) time.Duration {
+	var floor time.Duration
+	per := func(units, limit int) time.Duration {
+		if limit <= 0 || units <= 0 {
+			return 0
+		}
+		return time.Duration(float64(units) / float64(limit) * float64(time.Minute))
+	}
+	floor = max(floor, per(calls, info.Limits.RequestsPerMinute))
+	floor = max(floor, per(tokens, info.Limits.TokensPerMinute))
+	return floor
+}
+
+// renderPrefix renders a stage's shared prompt head the way ops.sharedPrefix
+// does — context fragments, then the prefix template with no record data in
+// scope — so its token count is measured on the bytes the provider receives.
+func (e *explainer) renderPrefix(stageID, prefix string, frags []task.Fragment, declared map[string]string) string {
+	var b strings.Builder
+	if len(frags) > 0 {
+		b.WriteString("<context>\n")
+		for _, f := range frags {
+			fmt.Fprintf(&b, "<%s>\n%s\n</%s>\n", f.Name, f.Content, f.Name)
+		}
+		b.WriteString("</context>\n\n")
+	}
+	if prefix == "" {
+		return b.String()
+	}
+	tmpl, err := template.New(stageID + ".prefix").Funcs(e.funcs(declared)).Parse(prefix)
+	if err != nil {
+		e.warnf("stage %q: prefix template does not parse (%v)", stageID, err)
+		return b.String() + prefix
+	}
+	var rendered strings.Builder
+	if err := tmpl.Execute(&rendered, nil); err != nil {
+		e.warnf("stage %q: shared prefix does not render (%v), so its size is "+
+			"estimated from the template source", stageID, err)
+		return b.String() + prefix
+	}
+	return b.String() + rendered.String()
+}
+
+// renderPrompts renders the stage's prompt against every record that will
+// reach it and returns the per-call prompt token counts. When a template
+// cannot render — most often because it reads a field a ParseJSON stage
+// upstream will introduce, whose name no plan knows — it falls back to the
+// template source and says so once.
+func (e *explainer) renderPrompts(stageID, prompt string, input []core.Record) []int {
+	tmpl, err := template.New(stageID).Funcs(pipeline.TemplateFuncs()).
+		Option("missingkey=error").Parse(prompt)
+	if err != nil {
+		e.warnf("stage %q: prompt template does not parse (%v)", stageID, err)
+		return estimateEach(prompt, len(input))
+	}
+	out := make([]int, 0, len(input))
+	for _, r := range input {
+		var sb strings.Builder
+		if err := tmpl.Execute(&sb, r.Data); err != nil {
+			e.warnf("stage %q: prompt does not render against a projected record "+
+				"(%v), so prompt sizes for this stage are estimated from the "+
+				"template source", stageID, err)
+			return estimateEach(prompt, len(input))
+		}
+		out = append(out, model.EstimateTokens(sb.String()))
+	}
+	return out
+}
+
+func (e *explainer) renderReducePrompt(stageID, prompt string, items []string) int {
+	tmpl, err := template.New(stageID).Funcs(pipeline.TemplateFuncs()).Parse(prompt)
+	if err != nil {
+		e.warnf("stage %q: prompt template does not parse (%v)", stageID, err)
+		return model.EstimateTokens(prompt)
+	}
+	var sb strings.Builder
+	if err := tmpl.Execute(&sb, map[string]any{"Items": items, "Count": len(items)}); err != nil {
+		e.warnf("stage %q: aggregation prompt does not render (%v), so its size is "+
+			"estimated from the template source", stageID, err)
+		return model.EstimateTokens(prompt)
+	}
+	return model.EstimateTokens(sb.String())
+}
+
+func estimateEach(prompt string, n int) []int {
+	est := model.EstimateTokens(prompt)
+	out := make([]int, n)
+	for i := range out {
+		out[i] = est
+	}
+	return out
+}
+
+// inferOutputs stands in for the records this stage has not produced. The
+// placeholder is sized to the projected response so that a downstream stage
+// reading this stage's output measures a prompt of the right order — the
+// alternative, an empty field, would under-count every prompt after the first
+// inference in a chain.
+func (e *explainer) inferOutputs(s *pipeline.Stage, input []core.Record, expected int) []core.Record {
+	field := s.Infer.OutputField
+	if field == "" {
+		field = "output"
+	}
+	if s.Infer.ParseJSON {
+		e.warnf("stage %q parses its output as JSON, so which fields it adds to "+
+			"each record is not knowable from the plan; a downstream template "+
+			"reading one of them is estimated from its source", s.ID)
+	}
+	placeholder := strings.Repeat("x", 4*expected)
+	out := make([]core.Record, 0, len(input))
+	for _, r := range input {
+		nr := r.Clone()
+		if !s.Infer.ParseJSON {
+			nr.Data[field] = placeholder
+		}
+		out = append(out, nr)
+	}
+	return out
+}
+
+func (e *explainer) reduceOutputs(s *pipeline.Stage, n, expected int) []core.Record {
+	field := s.Reduce.OutputField
+	if field == "" {
+		field = "output"
+	}
+	placeholder := strings.Repeat("x", 4*expected)
+	out := make([]core.Record, 0, n)
+	for i := range n {
+		out = append(out, core.NewRecord(fmt.Sprintf("%s-%d", s.ID, i),
+			map[string]any{field: placeholder}))
+	}
+	return out
+}
+
+// String renders the projection as a table, in the shape of the run report it
+// is trying to predict.
+func (p *Projection) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "projection  %s  (%s driver, no calls issued)\n", p.Pipeline, p.Driver)
+	fmt.Fprintf(&b, "%-22s %-24s %6s %6s %8s %8s %10s %10s %8s\n",
+		"stage", "model", "recs", "calls", "prompt", "cached", "exp($)", "max($)", "floor")
+	for _, s := range p.Stages {
+		fmt.Fprintf(&b, "%-22s %-24s %6d %6d %8d %8d %10.4f %10.4f %8s\n",
+			s.Stage, s.Model, s.Records, s.Calls,
+			s.Usage.PromptTokens(), s.Usage.CacheReadTokens,
+			s.Usage.CostUSD, s.Ceiling.CostUSD,
+			s.AdmissionFloor.Round(time.Second))
+	}
+	exp, ceil := p.Expected(), p.Ceiling()
+	fmt.Fprintf(&b, "%-22s %-24s %6s %6d %8d %8d %10.4f %10.4f %8s\n",
+		"TOTAL", "", "", exp.Requests, exp.PromptTokens(), exp.CacheReadTokens,
+		exp.CostUSD, ceil.CostUSD, p.AdmissionFloor().Round(time.Second))
+
+	fmt.Fprintf(&b, "expected %d tokens for $%.4f; cannot exceed %d tokens / $%.4f before retries\n",
+		exp.TotalTokens(), exp.CostUSD, ceil.TotalTokens(), ceil.CostUSD)
+	if p.Budget.MaxCostUSD > 0 || p.Budget.MaxTokens > 0 {
+		verdict := "covers the ceiling"
+		if !p.FitsBudget() {
+			verdict = "is below the ceiling: the governor will stop the run and " +
+				"return partial results"
+		}
+		fmt.Fprintf(&b, "run budget %s %s\n", budgetDetail(p.Budget), verdict)
+	}
+	if len(p.Warnings) > 0 {
+		b.WriteString("warnings:\n")
+		for _, w := range p.Warnings {
+			fmt.Fprintf(&b, "  - %s\n", w)
+		}
+	}
+	return b.String()
+}
+
+func budgetDetail(b core.Budget) string {
+	var parts []string
+	if b.MaxCostUSD > 0 {
+		parts = append(parts, fmt.Sprintf("$%.4f", b.MaxCostUSD))
+	}
+	if b.MaxTokens > 0 {
+		parts = append(parts, fmt.Sprintf("%d tokens", b.MaxTokens))
+	}
+	return strings.Join(parts, " / ")
+}
