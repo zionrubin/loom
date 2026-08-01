@@ -19,7 +19,7 @@ import (
 func at(ms int64) time.Time { return time.UnixMilli(ms) }
 
 func feedLifecycle(v *Server) {
-	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Time: at(1000)})
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Pipeline: "triage", Time: at(1000)})
 	v.Handle(observe.Event{Type: observe.StageStarted, RunID: "run_1", Stage: "classify",
 		Kind: "infer", Detail: "per-record inference · tier \"fast\"", Time: at(1001)})
 	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "run_1", Stage: "classify",
@@ -61,8 +61,17 @@ func feedLifecycle(v *Server) {
 
 func snapshot(t *testing.T, v *Server) Snapshot {
 	t.Helper()
+	return snapshotOf(t, v, nil)
+}
+
+// snapshotOf serializes one run of the universe; a nil run means the live one.
+func snapshotOf(t *testing.T, v *Server, r *runState) Snapshot {
+	t.Helper()
 	v.mu.Lock()
-	b := v.snapshotLocked()
+	if r == nil {
+		r = v.cur
+	}
+	b := v.snapshotLocked(r)
 	v.mu.Unlock()
 	var snap Snapshot
 	if err := json.Unmarshal(b, &snap); err != nil {
@@ -160,13 +169,128 @@ func TestStageUpstream(t *testing.T) {
 	}
 }
 
-func TestResetOnNewRun(t *testing.T) {
+// TestNewRunOpensItsOwnSky covers the half of the universe that always
+// worked: a new run is a clean sky, not the previous run with more stars in
+// it.
+func TestNewRunOpensItsOwnSky(t *testing.T) {
 	v := New()
 	feedLifecycle(v)
 	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_2", Time: at(5000)})
 	snap := snapshot(t, v)
 	if snap.RunID != "run_2" || snap.Done || len(snap.Tasks) != 0 || len(snap.Stages) != 0 {
-		t.Fatalf("state not reset: %+v", snap)
+		t.Fatalf("new run did not start clean: %+v", snap)
+	}
+}
+
+// TestUniverseRetainsFinishedRuns is the point of the universe: a pipeline
+// that finishes while the next one starts stays watchable. Before this, the
+// second run.started erased the first run and there was no way back to it.
+func TestUniverseRetainsFinishedRuns(t *testing.T) {
+	v := New()
+	feedLifecycle(v) // run_1, pipeline "triage", 2 tasks, finished
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_2", Pipeline: "overview", Time: at(5000)})
+	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "run_2", Stage: "fuse",
+		TaskID: "task_c", Records: 2, Time: at(5001)})
+
+	live := snapshot(t, v)
+	if live.RunID != "run_2" || live.Pipeline != "overview" || live.Index != 2 {
+		t.Fatalf("live run header = %+v", live.runHeader)
+	}
+	if live.Live != "run_2" {
+		t.Errorf("live run = %q, want run_2", live.Live)
+	}
+	if len(live.Runs) != 2 {
+		t.Fatalf("roster = %d runs, want both", len(live.Runs))
+	}
+
+	first, second := live.Runs[0], live.Runs[1]
+	if first.RunID != "run_1" || first.Pipeline != "triage" || first.Index != 1 {
+		t.Errorf("first run in roster = %+v", first.runHeader)
+	}
+	if !first.Done {
+		t.Error("the finished run lost its completion in the roster")
+	}
+	if first.Tasks != 2 || first.Completed != 1 || first.Failed != 1 || first.Retries != 1 {
+		t.Errorf("run_1 tallies = %+v", first)
+	}
+	if first.CostUSD != 0.002 || first.Tokens != 120 {
+		t.Errorf("run_1 economics = cost %v tokens %d", first.CostUSD, first.Tokens)
+	}
+	if len(first.Stages) != 1 || first.Stages[0].ID != "classify" || first.Stages[0].Tasks != 2 {
+		t.Errorf("run_1 stage briefs = %+v", first.Stages)
+	}
+	if first.Stages[0].Done != 1 || first.Stages[0].Failed != 1 {
+		t.Errorf("run_1 stage outcome = %+v", first.Stages[0])
+	}
+	if second.Done || second.Tasks != 1 {
+		t.Errorf("run_2 summary = %+v", second)
+	}
+
+	// And the whole first run is still there to walk back into.
+	v.mu.Lock()
+	prev := v.runIx["run_1"]
+	v.mu.Unlock()
+	if prev == nil {
+		t.Fatal("the finished run was dropped from the universe")
+	}
+	old := snapshotOf(t, v, prev)
+	if old.RunID != "run_1" || len(old.Tasks) != 2 || len(old.Stages) != 1 {
+		t.Fatalf("previous run no longer inspectable: %+v", old.runHeader)
+	}
+	if old.Live != "run_2" {
+		t.Error("a past run's snapshot should still name the run that is live")
+	}
+}
+
+// TestConcurrentRunsStayApart: two pipelines sharing one handler used to
+// interleave into a single unreadable sky. Events carry a run ID; each run
+// gets its own.
+func TestConcurrentRunsStayApart(t *testing.T) {
+	v := New()
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "a", Pipeline: "left", Time: at(1)})
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "b", Pipeline: "right", Time: at(2)})
+	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "a", Stage: "sa", TaskID: "ta", Time: at(3)})
+	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "b", Stage: "sb", TaskID: "tb", Time: at(4)})
+	v.Handle(observe.Event{Type: observe.TaskCompleted, RunID: "a", Stage: "sa", TaskID: "ta", Time: at(5)})
+
+	v.mu.Lock()
+	ra, rb := v.runIx["a"], v.runIx["b"]
+	v.mu.Unlock()
+	if ra == nil || rb == nil {
+		t.Fatal("both runs should be held")
+	}
+	if len(ra.tasks) != 1 || ra.tasks[0].ID != "ta" || ra.tasks[0].Status != "completed" {
+		t.Errorf("run a tasks = %+v", ra.tasks)
+	}
+	if len(rb.tasks) != 1 || rb.tasks[0].ID != "tb" || rb.tasks[0].Status != "pending" {
+		t.Errorf("run b tasks = %+v", rb.tasks)
+	}
+}
+
+// TestRetainDropsOldestRuns bounds the universe: runs are held whole, so the
+// history has to end somewhere, and it ends at the oldest run.
+func TestRetainDropsOldestRuns(t *testing.T) {
+	v := New(Retain(2))
+	for i := 1; i <= 4; i++ {
+		id := fmt.Sprintf("run_%d", i)
+		v.Handle(observe.Event{Type: observe.RunStarted, RunID: id, Time: at(int64(i))})
+		v.Handle(observe.Event{Type: observe.RunFinished, RunID: id, Time: at(int64(i) + 1)})
+	}
+	snap := snapshot(t, v)
+	if len(snap.Runs) != 2 {
+		t.Fatalf("roster = %d runs, want 2 retained", len(snap.Runs))
+	}
+	if snap.Runs[0].RunID != "run_3" || snap.Runs[1].RunID != "run_4" {
+		t.Errorf("retained the wrong runs: %q, %q", snap.Runs[0].RunID, snap.Runs[1].RunID)
+	}
+	if snap.Runs[1].Index != 4 {
+		t.Errorf("index should count every run seen, got %d", snap.Runs[1].Index)
+	}
+	v.mu.Lock()
+	_, gone := v.runIx["run_1"]
+	v.mu.Unlock()
+	if gone {
+		t.Error("evicted run still indexed")
 	}
 }
 
@@ -178,7 +302,7 @@ func TestLogCap(t *testing.T) {
 			TaskID: "t1", Model: "m", Usage: core.Usage{Requests: 1}, Time: at(int64(i + 2))})
 	}
 	v.mu.Lock()
-	got := len(v.taskIx["t1"].Log)
+	got := len(v.cur.taskIx["t1"].Log)
 	v.mu.Unlock()
 	if got != maxLogEntries {
 		t.Fatalf("log length = %d, want %d", got, maxLogEntries)
@@ -207,7 +331,7 @@ func TestSnapshotOmitsHeavyPayloads(t *testing.T) {
 	}
 
 	v.mu.Lock()
-	b := v.snapshotLocked()
+	b := v.snapshotLocked(v.cur)
 	v.mu.Unlock()
 
 	// 50 tasks × ~160KB of payload would be ~8MB if it all shipped.
@@ -326,6 +450,80 @@ func TestServesUIAndState(t *testing.T) {
 	}
 }
 
+// TestServesPastRunAndRoster is the HTTP half of the universe: the run that
+// finished has to be reachable while another one is live.
+func TestServesPastRunAndRoster(t *testing.T) {
+	v := New()
+	feedLifecycle(v)
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_2", Pipeline: "overview", Time: at(5000)})
+	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "run_2", Stage: "fuse",
+		TaskID: "task_c", Records: 2, Input: `[{"id":"r9"}]`, Time: at(5001)})
+
+	srv := httptest.NewServer(v)
+	defer srv.Close()
+
+	get := func(path string, into any) int {
+		t.Helper()
+		res, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode == 200 && into != nil {
+			if err := json.NewDecoder(res.Body).Decode(into); err != nil {
+				t.Fatalf("decode %s: %v", path, err)
+			}
+		}
+		return res.StatusCode
+	}
+
+	var live Snapshot
+	if code := get("/api/state", &live); code != 200 || live.RunID != "run_2" {
+		t.Fatalf("/api/state = %d, run %q; want the live run", code, live.RunID)
+	}
+
+	var past Snapshot
+	if code := get("/api/state?run=run_1", &past); code != 200 {
+		t.Fatalf("/api/state?run=run_1 = %d", code)
+	}
+	if past.RunID != "run_1" || len(past.Tasks) != 2 || past.Pipeline != "triage" {
+		t.Errorf("past run = %+v with %d tasks", past.runHeader, len(past.Tasks))
+	}
+	if past.Live != "run_2" {
+		t.Errorf("past snapshot should name the live run, got %q", past.Live)
+	}
+	if code := get("/api/state?run=nope", nil); code != http.StatusNotFound {
+		t.Errorf("unknown run = %d, want 404", code)
+	}
+
+	var roster struct {
+		Live string        `json:"live"`
+		Runs []*RunSummary `json:"runs"`
+	}
+	if code := get("/api/runs", &roster); code != 200 {
+		t.Fatalf("/api/runs = %d", code)
+	}
+	if roster.Live != "run_2" || len(roster.Runs) != 2 {
+		t.Fatalf("roster = live %q, %d runs", roster.Live, len(roster.Runs))
+	}
+	if len(roster.Runs[0].Stages) == 0 {
+		t.Error("roster runs should carry their stage shape")
+	}
+
+	// A task is addressable in its own run, and only there.
+	var d TaskDetail
+	if code := get("/api/task?id=task_a&run=run_1", &d); code != 200 || d.Input == "" {
+		t.Errorf("/api/task in run_1 = %d, detail %+v", code, d)
+	}
+	if code := get("/api/task?id=task_a&run=run_2", nil); code != http.StatusNotFound {
+		t.Errorf("task from another run = %d, want 404", code)
+	}
+	// Without a run it still resolves, so an old link keeps working.
+	if code := get("/api/task?id=task_a", nil); code != 200 {
+		t.Errorf("unscoped task lookup = %d", code)
+	}
+}
+
 func TestEventStream(t *testing.T) {
 	v := New()
 	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_sse", Time: at(1)})
@@ -382,10 +580,55 @@ func TestEventStream(t *testing.T) {
 		t.Fatalf("delta frame = %q %q", ev, data)
 	}
 	var d struct {
-		Task *Node `json:"task"`
+		Task    *Node       `json:"task"`
+		RunID   string      `json:"runId"`
+		Summary *RunSummary `json:"summary"`
 	}
 	if err := json.Unmarshal([]byte(data), &d); err != nil || d.Task == nil || d.Task.Status != "pending" {
 		t.Fatalf("delta payload = %q (%v)", data, err)
+	}
+	// A delta names its run, so a viewer watching a different one knows to
+	// keep its own sky and just update the overview.
+	if d.RunID != "run_sse" {
+		t.Errorf("delta run = %q, want run_sse", d.RunID)
+	}
+	if d.Summary == nil || d.Summary.Tasks != 1 || d.Summary.RunID != "run_sse" {
+		t.Errorf("delta summary = %+v", d.Summary)
+	}
+}
+
+// TestDeltaSummaryStaysLean keeps the hot path cheap: the overview's stage
+// shape rides snapshots, not the delta sent for every model call.
+func TestDeltaSummaryStaysLean(t *testing.T) {
+	v := New()
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "r", Pipeline: "p", Time: at(1)})
+
+	sub := &subscriber{ch: make(chan []byte, 8)}
+	v.mu.Lock()
+	v.subs[sub] = struct{}{}
+	v.mu.Unlock()
+
+	v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "r", Stage: "s", TaskID: "t", Time: at(2)})
+	select {
+	case b := <-sub.ch:
+		var d struct {
+			Runs    []*RunSummary `json:"runs"`
+			Summary *RunSummary   `json:"summary"`
+		}
+		if err := json.Unmarshal(b, &d); err != nil {
+			t.Fatal(err)
+		}
+		if d.Runs != nil {
+			t.Error("the full roster rode a task delta; it belongs on run.started")
+		}
+		if d.Summary == nil {
+			t.Fatal("delta carried no summary")
+		}
+		if len(d.Summary.Stages) != 0 {
+			t.Errorf("stage briefs rode a task delta: %+v", d.Summary.Stages)
+		}
+	default:
+		t.Fatal("no delta was broadcast")
 	}
 }
 
@@ -426,12 +669,13 @@ func TestStartAndClose(t *testing.T) {
 // projectionEvents is what loom.Explain publishes: a forecast per stage, then
 // the run-level total, all before the run itself starts.
 func projectionEvents(v *Server) {
-	v.Handle(observe.Event{Type: observe.StageProjected, Stage: "classify", Kind: "infer",
+	v.Handle(observe.Event{Type: observe.StageProjected, Pipeline: "triage",
+		Stage: "classify", Kind: "infer",
 		Records: 3, Time: at(900),
 		Usage:   core.Usage{InputTokens: 300, OutputTokens: 60, Requests: 3, CostUSD: 0.006},
 		Ceiling: core.Usage{InputTokens: 300, OutputTokens: 300, Requests: 3, CostUSD: 0.020},
 		Latency: 30 * time.Second})
-	v.Handle(observe.Event{Type: observe.RunProjected, Kind: "barrier", Time: at(901),
+	v.Handle(observe.Event{Type: observe.RunProjected, Pipeline: "triage", Kind: "barrier", Time: at(901),
 		Usage:   core.Usage{InputTokens: 300, OutputTokens: 60, Requests: 3, CostUSD: 0.006},
 		Ceiling: core.Usage{InputTokens: 300, OutputTokens: 300, Requests: 3, CostUSD: 0.020},
 		Budget:  core.Budget{MaxCostUSD: 0.01},
@@ -439,34 +683,37 @@ func projectionEvents(v *Server) {
 		Detail:  "stage \"load\" is a function"})
 }
 
-// TestProjectionBeforeRun checks a projection published ahead of the run lands
-// on the stage it describes and on the run header.
+// TestProjectionBeforeRun checks a forecast published ahead of its run is
+// held, and reaches a viewer connecting while the sky is still empty — the
+// one moment when knowing the price is still actionable.
 func TestProjectionBeforeRun(t *testing.T) {
 	v := New()
 	projectionEvents(v)
 
-	if v.projection == nil {
+	v.mu.Lock()
+	fc := v.forecasts["triage"]
+	v.mu.Unlock()
+	if fc == nil || fc.run == nil {
 		t.Fatal("run-level projection was not recorded")
 	}
-	if got, want := v.projection.ExpectedUSD, 0.006; got != want {
+	if got, want := fc.run.ExpectedUSD, 0.006; got != want {
 		t.Errorf("expected cost = %v, want %v", got, want)
 	}
-	if got, want := v.projection.CeilingUSD, 0.020; got != want {
+	if got, want := fc.run.CeilingUSD, 0.020; got != want {
 		t.Errorf("ceiling cost = %v, want %v", got, want)
 	}
 	// A $0.01 budget cannot cover a $0.02 ceiling.
-	if v.projection.FitsBudget {
+	if fc.run.FitsBudget {
 		t.Error("a budget below the ceiling was reported as covering it")
 	}
-	if len(v.projection.Warnings) != 1 {
-		t.Errorf("warnings = %v, want the one that was published", v.projection.Warnings)
+	if len(fc.run.Warnings) != 1 {
+		t.Errorf("warnings = %v, want the one that was published", fc.run.Warnings)
 	}
-	st := v.stageIx["classify"]
-	if st == nil || st.Proj == nil {
-		t.Fatal("stage projection did not reach the stage")
+	if p := fc.stages["classify"]; p == nil || p.Calls != 3 || p.FloorMS != 30_000 {
+		t.Errorf("stage projection = %+v, want 3 calls and a 30s floor", p)
 	}
-	if st.Proj.Calls != 3 || st.Proj.FloorMS != 30_000 {
-		t.Errorf("stage projection = %+v, want 3 calls and a 30s floor", st.Proj)
+	if snap := snapshot(t, v); snap.Projection == nil {
+		t.Error("a viewer connecting before the run sees no forecast")
 	}
 }
 
@@ -478,10 +725,13 @@ func TestProjectionSurvivesRunReset(t *testing.T) {
 	projectionEvents(v)
 	feedLifecycle(v)
 
-	if v.projection == nil {
+	v.mu.Lock()
+	proj := v.cur.proj
+	st := v.cur.stageIx["classify"]
+	v.mu.Unlock()
+	if proj == nil {
 		t.Fatal("run.started discarded the projection")
 	}
-	st := v.stageIx["classify"]
 	if st == nil || st.Proj == nil {
 		t.Fatal("run.started discarded the stage's projection")
 	}
@@ -489,10 +739,7 @@ func TestProjectionSurvivesRunReset(t *testing.T) {
 		t.Error("the stage lost its live status while regaining its projection")
 	}
 
-	var snap Snapshot
-	if err := json.Unmarshal(v.snapshotLocked(), &snap); err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
+	snap := snapshot(t, v)
 	if snap.Projection == nil {
 		t.Error("snapshot omitted the projection, so a reconnecting viewer loses it")
 	}
@@ -503,12 +750,43 @@ func TestProjectionSurvivesRunReset(t *testing.T) {
 	}
 }
 
+// TestProjectionGoesToItsOwnPipeline: in a universe, a forecast has to find
+// the run it predicted. Handing one pipeline's numbers to another's stages
+// would read as a wild overspend that never happened.
+func TestProjectionGoesToItsOwnPipeline(t *testing.T) {
+	v := New()
+	projectionEvents(v) // pipeline "triage"
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "other", Pipeline: "overview", Time: at(1000)})
+	v.Handle(observe.Event{Type: observe.StageStarted, RunID: "other", Stage: "classify", Time: at(1001)})
+
+	v.mu.Lock()
+	other := v.cur
+	v.mu.Unlock()
+	if other.proj != nil {
+		t.Error("another pipeline's forecast landed on this run")
+	}
+	if st := other.stageIx["classify"]; st != nil && st.Proj != nil {
+		t.Error("another pipeline's forecast landed on a same-named stage")
+	}
+
+	// The run it was published for still claims it, whenever it starts.
+	feedLifecycle(v)
+	v.mu.Lock()
+	claimed := v.cur.proj != nil && v.cur.stageIx["classify"].Proj != nil
+	v.mu.Unlock()
+	if !claimed {
+		t.Error("the pipeline that was projected did not claim its forecast")
+	}
+}
+
 // TestNoProjectionIsAbsentFromSnapshot keeps a run without a projection
 // rendering exactly as it did before the feature existed.
 func TestNoProjectionIsAbsentFromSnapshot(t *testing.T) {
 	v := New()
 	feedLifecycle(v)
-	blob := v.snapshotLocked()
+	v.mu.Lock()
+	blob := v.snapshotLocked(v.cur)
+	v.mu.Unlock()
 	if strings.Contains(string(blob), `"projection"`) {
 		t.Errorf("unprojected run carries a projection key:\n%s", blob)
 	}

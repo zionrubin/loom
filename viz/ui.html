@@ -223,6 +223,103 @@
   #summary .save { color: var(--c-shared); }
   #runMeta .chip.btn { cursor: pointer; background: none; font: inherit; font-size: 11px; }
   #runMeta .chip.btn:hover { color: var(--ink); border-color: rgba(255,255,255,.3); }
+  #runMeta .chip.btn:disabled { opacity: .35; cursor: default; }
+  #runMeta .chip.btn:disabled:hover { color: var(--ink-2); border-color: var(--hairline); }
+  #runMeta .chip.btn.step { padding: 2px 7px; }
+  #runMeta .chip.live-elsewhere { color: var(--c-running); border-color: rgba(57,135,229,.5); cursor: pointer; }
+  #runMeta .chip.live-elsewhere:hover { background: rgba(57,135,229,.14); }
+  #runMeta .pipe { color: var(--ink); }
+
+  /* universe overview: every run this process has produced, on one screen.
+     A pipeline that finishes while the next one starts stays here, whole,
+     and any of them can be entered — opened with `u` or the header button. */
+  #universe {
+    position: fixed; inset: 0; z-index: 9; display: none;
+    align-items: flex-start; justify-content: center;
+    background: rgba(5,5,9,.72); backdrop-filter: blur(3px);
+    overflow-y: auto; padding: 6vh 16px 48px;
+  }
+  #universe.open { display: flex; }
+  #universe .card {
+    background: rgba(18,18,26,.97); border: 1px solid var(--hairline);
+    border-radius: 14px; width: 1020px; max-width: 96vw; padding: 16px 22px 22px;
+  }
+  #universe .card > .head {
+    display: flex; align-items: baseline; gap: 12px;
+    padding-bottom: 10px; border-bottom: 1px solid var(--hairline);
+  }
+  #universe .card > .head h3 {
+    font-size: 12px; color: var(--ink); letter-spacing: .18em;
+    text-transform: uppercase; font-weight: 600;
+  }
+  #universe .card > .head .sub { font-size: 11px; color: var(--ink-3); }
+  #universe .card > .head .x {
+    margin-left: auto; cursor: pointer; border: 0; background: none; color: var(--ink-3);
+    font-size: 16px; padding: 2px 6px; border-radius: 6px; line-height: 1;
+  }
+  #universe .card > .head .x:hover { color: var(--ink); background: rgba(255,255,255,.06); }
+  #universe .card > .head .x:focus-visible { outline: 1px solid var(--c-running); outline-offset: 2px; }
+  #runs {
+    display: grid; gap: 12px; margin-top: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  }
+  .rcard {
+    text-align: left; font: inherit; color: inherit; cursor: pointer;
+    background: rgba(10,10,16,.7); border: 1px solid var(--hairline);
+    border-radius: 12px; padding: 12px 13px 13px; display: flex; flex-direction: column; gap: 9px;
+    transition: border-color .12s, transform .12s;
+  }
+  .rcard:hover { border-color: rgba(255,255,255,.28); transform: translateY(-1px); }
+  .rcard:focus-visible { outline: 1px solid var(--c-running); outline-offset: 2px; }
+  .rcard.viewing { border-color: rgba(255,255,255,.42); background: rgba(24,24,34,.9); }
+  .rcard.live { border-color: rgba(57,135,229,.5); }
+  .rcard .rc-head { display: flex; align-items: center; gap: 8px; }
+  .rcard .rc-idx {
+    flex: 0 0 auto; width: 20px; height: 20px; border-radius: 50%;
+    border: 1px solid var(--hairline); color: var(--ink-3);
+    font-size: 10.5px; display: flex; align-items: center; justify-content: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .rcard.viewing .rc-idx { color: var(--ink); border-color: rgba(255,255,255,.4); }
+  .rcard .rc-name {
+    color: var(--ink); font-size: 12.5px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rcard .rc-state { margin-left: auto; font-size: 10.5px; white-space: nowrap; }
+  .rcard .rc-state.live { color: var(--c-running); }
+  .rcard .rc-state.done { color: var(--c-done); }
+  .rcard .rc-state.fail { color: var(--c-fail); }
+  .rcard .rc-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px; color: var(--ink-3); word-break: break-all; margin-top: -4px;
+  }
+  .rcard .rc-bar {
+    display: flex; height: 6px; border-radius: 999px; overflow: hidden;
+    background: rgba(255,255,255,.06);
+  }
+  .rcard .rc-bar i { display: block; height: 100%; }
+  .rcard .rc-stats { display: flex; gap: 14px; flex-wrap: wrap; }
+  .rcard .rc-stats .s { min-width: 0; }
+  .rcard .rc-stats b {
+    display: block; font-size: 12.5px; color: var(--ink); font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .rcard .rc-stats b .accent-fail { color: var(--c-fail); }
+  .rcard .rc-stats em {
+    font-style: normal; font-size: 8.5px; letter-spacing: .11em;
+    color: var(--ink-3); text-transform: uppercase;
+  }
+  .rcard .rc-stages { display: flex; flex-wrap: wrap; gap: 4px; }
+  .rcard .sc {
+    font-size: 10px; color: var(--ink-2); border: 1px solid var(--hairline);
+    border-radius: 5px; padding: 1px 5px; white-space: nowrap;
+  }
+  .rcard .sc i { color: var(--ink-3); font-style: normal; font-variant-numeric: tabular-nums; }
+  .rcard .sc.fail { border-color: rgba(208,59,59,.45); }
+  .rcard .sc.more { color: var(--ink-3); border-style: dashed; }
+  .rcard .rc-enter { font-size: 10.5px; color: var(--c-running); }
+  #universe .note { color: var(--ink-3); font-size: 11px; margin-top: 14px; line-height: 1.5; }
+  #universe .empty { color: var(--ink-3); font-size: 12px; padding: 24px 0; text-align: center; }
 </style>
 </head>
 <body>
@@ -249,7 +346,7 @@
   <span class="li"><span class="ic" style="color:var(--c-fail)">✕</span>failed</span>
   <span class="li"><span class="ic" style="color:var(--c-running)">◇</span>executor</span>
   <span class="li"><span class="ic" style="color:var(--c-shared)">⬡</span>shared value</span>
-  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · b shared · s summary · esc</span>
+  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · b shared · s summary · u universe · ,. runs · esc</span>
 </div>
 
 <div id="tooltip"></div>
@@ -273,6 +370,18 @@
   </div>
 </div>
 
+<div id="universe" role="dialog" aria-modal="true" aria-label="Universe — every run">
+  <div class="card">
+    <div class="head">
+      <h3>universe</h3>
+      <span class="sub" id="universeSub"></span>
+      <button type="button" class="x" id="universeClose" title="close (esc)" aria-label="Close universe">✕</button>
+    </div>
+    <div id="runs"></div>
+    <div class="note" id="universeNote"></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -288,10 +397,18 @@ const S = {
   tasks: [], taskIx: new Map(),
   workers: [], workerIx: new Map(),
   broadcasts: [], broadcastIx: new Map(),
-  // The pre-flight projection (loom.Explain), when one was published to the
-  // same handler. Deliberately absent from clearState: it describes the
-  // pipeline, not a run, and outliving the reset is what lets the view show
-  // expected against actual once the run it predicted begins.
+  // The universe: every run the server is holding. A process usually runs
+  // more than one pipeline, and the sky below shows exactly one of them —
+  // `viewing` — while `live` names the one still receiving events. They are
+  // the same run until you walk back into a finished one.
+  runs: [], runIx: new Map(),
+  viewing: '',
+  live: '',
+  follow: true,       // ride the live run as new ones start
+  // The pre-flight projection (loom.Explain) for the run being viewed, when
+  // one was published to the same handler. It arrives before its run and is
+  // handed over when that run starts, which is what lets the view show
+  // expected against actual.
   projection: null,
   offset: 0,          // Date.now() - server time
   layoutDirty: true,
@@ -308,6 +425,7 @@ let lastPanelKey = '';
 let lastPanelHTML = '';
 let chromeDirty = true;  // header stats need a rebuild
 let panelDirty = false;  // open inspector needs a rebuild
+let universeDirty = true; // open universe overview needs a rebuild
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const serverNow = () => Date.now() - S.offset;
 
@@ -347,12 +465,54 @@ function dropSelection() {
   closePanel();
 }
 
+// ------------------------------------------------------------- universe ----
+// The roster is the one piece of state that spans runs: it is how the view
+// knows a finished pipeline is still there to walk back into.
+function mergeRun(sum) {
+  if (!sum || !sum.runId) return null;
+  const cur = S.runIx.get(sum.runId);
+  if (cur) {
+    // Deltas ride the hot path and omit the stage shape; keep what we have.
+    const stages = sum.stages || cur.stages;
+    Object.assign(cur, sum);
+    cur.stages = stages;
+    universeDirty = true;
+    return cur;
+  }
+  S.runIx.set(sum.runId, sum);
+  S.runs.push(sum);
+  S.runs.sort((a, b) => (a.index || 0) - (b.index || 0));
+  universeDirty = true;
+  return sum;
+}
+
+function setRoster(list) {
+  if (!list) return;
+  const next = new Map();
+  for (const sum of list) {
+    const prev = S.runIx.get(sum.runId);
+    if (prev && !sum.stages) sum.stages = prev.stages;
+    next.set(sum.runId, sum);
+  }
+  S.runIx = next;
+  S.runs = [...next.values()].sort((a, b) => (a.index || 0) - (b.index || 0));
+  universeDirty = true;
+}
+
+function runHeaderOf(h) {
+  return { runId: h.runId || '', pipeline: h.pipeline || '', index: h.index || 0,
+           startedAt: h.startedAt || 0, endedAt: h.endedAt || 0,
+           done: !!h.done, note: h.note || '', driver: h.driver || '' };
+}
+
 function applySnapshot(snap) {
   const keep = selected;
   S.offset = Date.now() - snap.now;
   clearState();
-  S.run = { runId: snap.runId || '', startedAt: snap.startedAt || 0, endedAt: snap.endedAt || 0,
-            done: !!snap.done, note: snap.note || '', driver: snap.driver || '' };
+  S.run = runHeaderOf(snap);
+  S.viewing = S.run.runId;
+  if (snap.live !== undefined) S.live = snap.live || '';
+  setRoster(snap.runs);
   (snap.stages || []).forEach(st => upsert(S.stages, S.stageIx, st));
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
@@ -365,15 +525,37 @@ function applySnapshot(snap) {
 
 function applyDelta(d) {
   S.offset = Date.now() - d.now;
+  // The overview updates for every run, whichever one is on screen.
+  if (d.runs) setRoster(d.runs);
+  else if (d.summary) mergeRun(d.summary);
+  if (d.live) S.live = d.live;
+  chromeDirty = true;
+
   if (d.reset) {
+    // A new run opened. The live view follows it by default — but never out
+    // from under someone who is reading this one. An open summary or an open
+    // inspector is a deliberate act; the new run waits in the header instead
+    // of replacing what is on screen.
+    const reading = summaryEl.classList.contains('open') ||
+                    (selected && panel.classList.contains('open'));
+    if (S.viewing && (!S.follow || reading)) {
+      S.follow = false;
+      universeDirty = true;
+      return;
+    }
+    S.viewing = d.runId || '';
+    S.follow = true;
     clearState();
     dropSelection();
     closeSummary();
+    S.projection = d.projection || null;
+  } else if (d.runId ? d.runId !== S.viewing : !!S.viewing) {
+    // An event for a run this view is not showing. The roster above already
+    // absorbed what it means for the overview; the sky stays as it is.
+    return;
   }
   const wasDone = S.run.done;
-  if (d.run) S.run = { runId: d.run.runId || '', startedAt: d.run.startedAt || 0,
-                       endedAt: d.run.endedAt || 0, done: !!d.run.done, note: d.run.note || '',
-                       driver: d.run.driver || '' };
+  if (d.run) S.run = runHeaderOf(d.run);
   // Watched the run finish live → surface the summary once, after the
   // completion flash has had its moment. Reconnecting to an already-done
   // run (snapshots) never auto-opens.
@@ -404,12 +586,58 @@ function parseSSE(raw) {
   catch (err) { console.warn('viz: bad SSE payload', err); return null; }
 }
 
+// viewRun walks the sky over to another run. Following resumes only when the
+// run being entered is the live one: picking a finished run means staying in
+// it, which is the point of keeping them.
+let viewPending = '';
+function viewRun(id, opts) {
+  if (!id) return;
+  opts = opts || {};
+  viewPending = id;
+  fetch('/api/state?run=' + encodeURIComponent(id))
+    .then(r => {
+      // The universe is bounded, so a run can age out from under a link.
+      if (r.status === 404 && id !== S.live) { viewPending = ''; jumpLive(); return null; }
+      return r.ok ? r.json() : null;
+    })
+    .then(snap => {
+      if (!snap || viewPending !== id) return;
+      S.follow = opts.follow !== undefined ? opts.follow : (id === (snap.live || ''));
+      applySnapshot(snap);
+      universeDirty = true;
+    })
+    .catch(() => {});
+}
+
+function stepRun(dir) {
+  if (S.runs.length < 2) return;
+  let i = S.runs.findIndex(r => r.runId === S.viewing);
+  if (i < 0) i = dir > 0 ? -1 : 0;
+  i = (i + dir + S.runs.length) % S.runs.length;
+  viewRun(S.runs[i].runId);
+}
+
+function jumpLive() {
+  if (S.live && S.live !== S.viewing) viewRun(S.live, { follow: true });
+}
+
 function connect() {
   const es = new EventSource('/api/events');
   es.addEventListener('snapshot', e => {
     const snap = parseSSE(e.data);
     if (!snap) return;
     connState = 'live';
+    // The stream's snapshot always describes the live run (it is what a fresh
+    // viewer wants). Someone who walked back into a finished one keeps their
+    // sky and re-syncs it instead of being yanked forward.
+    if (!S.follow && S.viewing && S.viewing !== (snap.runId || '')) {
+      S.offset = Date.now() - snap.now;
+      if (snap.live !== undefined) S.live = snap.live || '';
+      setRoster(snap.runs);
+      chromeDirty = true;
+      viewRun(S.viewing, { follow: false });
+      return;
+    }
     applySnapshot(snap);
   });
   es.addEventListener('delta', e => {
@@ -1093,6 +1321,7 @@ function cycleSelection(list, type, dir) {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
+    if (universeEl.classList.contains('open')) { closeUniverse(); return; }
     if (summaryEl.classList.contains('open')) { closeSummary(); return; }
     dropSelection();
     canvas.focus({ preventScroll: true });
@@ -1127,6 +1356,18 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     if (!S.run.runId) return;
     if (summaryEl.classList.contains('open')) closeSummary(); else openSummary();
+  } else if (e.key === 'u' || e.key === 'U') {
+    e.preventDefault();
+    toggleUniverse();
+  } else if (e.key === ',' || e.key === '<') {
+    e.preventDefault();
+    stepRun(-1);
+  } else if (e.key === '.' || e.key === '>') {
+    e.preventDefault();
+    stepRun(1);
+  } else if (e.key === 'l' || e.key === 'L') {
+    e.preventDefault();
+    jumpLive();
   }
 });
 document.getElementById('panelClose').addEventListener('click', () => {
@@ -1242,7 +1483,10 @@ function taskDetail(t) {
 
   if (stale && !nothingToFetch && !detailPending.has(t.id)) {
     detailPending.add(t.id);
-    fetch('/api/task?id=' + encodeURIComponent(t.id))
+    // Scoped to the run on screen: a task belongs to its run, and a universe
+    // can hold the same stage's tasks several times over.
+    fetch('/api/task?id=' + encodeURIComponent(t.id) +
+          (S.viewing ? '&run=' + encodeURIComponent(S.viewing) : ''))
       .then(r => (r.ok ? r.json() : null))
       .then(d => {
         if (!d) return;
@@ -1600,7 +1844,9 @@ function aggStage(id) {
 
 function renderSummary() {
   document.getElementById('summaryRun').textContent =
-    S.run.runId + (S.run.done ? '' : ' · still running');
+    (S.run.pipeline ? S.run.pipeline + ' · ' : '') + S.run.runId +
+    (S.run.index && S.runs.length > 1 ? ` · run ${S.run.index}` : '') +
+    (S.run.done ? '' : ' · still running');
 
   let done = 0, retries = 0, cache = 0, tok = 0, cost = 0;
   for (const t of S.tasks) {
@@ -1747,8 +1993,120 @@ summaryBody.addEventListener('click', e => {
   selected = { type: b.dataset.jt, id: b.dataset.ji };
   openPanel();
 });
+// ------------------------------------------------------------ universe ----
+// Every run this process has produced, on one screen: which pipeline it was,
+// how it ended, what it cost, and the shape of its stages — with a way into
+// each. A run that finishes while the next one starts lives here rather than
+// disappearing behind it.
+const universeEl = document.getElementById('universe');
+const runsEl = document.getElementById('runs');
+let runsFetch = 0;
+
+function openUniverse() {
+  renderUniverse();
+  universeEl.classList.add('open');
+  refreshRuns();
+  queueMicrotask(() => document.getElementById('universeClose').focus({ preventScroll: true }));
+}
+function closeUniverse() { universeEl.classList.remove('open'); }
+function toggleUniverse() {
+  if (universeEl.classList.contains('open')) closeUniverse(); else openUniverse();
+}
+
+// Deltas carry each run's counters but not its stage shape — that would put
+// a dozen stage names on every model call. The overview asks for the full
+// roster while it is open, which is the only time the shape is looked at.
+function refreshRuns() {
+  const at = ++runsFetch;
+  fetch('/api/runs')
+    .then(r => (r.ok ? r.json() : null))
+    .then(d => {
+      if (!d || at !== runsFetch) return;
+      if (d.live !== undefined) S.live = d.live || '';
+      setRoster(d.runs);
+      if (universeEl.classList.contains('open')) renderUniverse();
+      chromeDirty = true;
+    })
+    .catch(() => {});
+}
+
+function runStateOf(r) {
+  if (!r.done) return { cls: 'live', label: '◉ running' };
+  if (r.failed) return { cls: 'fail', label: `✕ ${r.failed} failed` };
+  return { cls: 'done', label: '✦ complete' };
+}
+
+function renderUniverse() {
+  universeDirty = false;
+  const sub = document.getElementById('universeSub');
+  const note = document.getElementById('universeNote');
+  const going = S.runs.filter(r => !r.done).length;
+  sub.textContent = S.runs.length
+    ? `${S.runs.length} run${S.runs.length === 1 ? '' : 's'} · ` +
+      (going ? `${going} still running` : 'all finished')
+    : '';
+  if (!S.runs.length) {
+    runsEl.innerHTML = '<div class="empty">no runs yet — the first loom.Run on this handler opens the universe</div>';
+    note.textContent = '';
+    return;
+  }
+  let html = '';
+  for (const r of S.runs) {
+    const st = runStateOf(r);
+    const total = Math.max(r.tasks || 0, 1);
+    const seg = (n, c) => (n ? `<i style="width:${(100 * n / total).toFixed(2)}%;background:${c}"></i>` : '');
+    const elapsed = r.startedAt ? (r.endedAt || serverNow()) - r.startedAt : null;
+    const stages = r.stages || [];
+    const shown = stages.slice(0, 8).map(s => {
+      const tail = s.tasks
+        ? ` <i>${s.done}${s.failed ? '+' + s.failed + '✕' : ''}/${s.tasks}</i>`
+        : '';
+      return `<span class="sc${s.failed ? ' fail' : ''}">${esc(s.id)}${tail}</span>`;
+    }).join('');
+    const more = stages.length > 8 ? `<span class="sc more">+${stages.length - 8} more</span>` : '';
+    html += `<button type="button" class="rcard${r.runId === S.viewing ? ' viewing' : ''}${r.done ? '' : ' live'}" data-run="${esc(r.runId)}">` +
+      `<span class="rc-head">` +
+        `<span class="rc-idx">${r.index || '·'}</span>` +
+        `<span class="rc-name">${esc(r.pipeline || 'pipeline')}</span>` +
+        `<span class="rc-state ${st.cls}">${st.label}</span>` +
+      `</span>` +
+      `<span class="rc-id">${esc(r.runId)}${r.driver ? ' · ' + esc(r.driver) : ''}</span>` +
+      // completed, failed, in flight — the rest of the bar is what is still queued
+      `<span class="rc-bar">${seg(r.completed, COLORS.done)}${seg(r.failed, COLORS.fail)}` +
+        `${seg(r.running, COLORS.running)}</span>` +
+      `<span class="rc-stats">` +
+        `<span class="s"><b>${r.completed || 0}/${r.tasks || 0}</b><em>tasks</em></span>` +
+        (r.failed ? `<span class="s"><b class="accent-fail">${r.failed}</b><em>failed</em></span>` : '') +
+        (r.cacheHits ? `<span class="s"><b>${r.cacheHits}</b><em>cached</em></span>` : '') +
+        `<span class="s"><b>${fmtTok(r.tokens || 0)}</b><em>tokens</em></span>` +
+        `<span class="s"><b>${fmtCost(r.cost || 0)}</b><em>cost</em></span>` +
+        `<span class="s"><b>${elapsed != null ? fmtDur(elapsed) : '—'}</b><em>elapsed</em></span>` +
+      `</span>` +
+      (shown ? `<span class="rc-stages">${shown}${more}</span>` : '') +
+      `<span class="rc-enter">${r.runId === S.viewing ? 'you are here' : 'enter this run →'}</span>` +
+      `</button>`;
+  }
+  runsEl.innerHTML = html;
+  note.innerHTML = `each run keeps its own sky — stages, tasks, executors, shared values, prompts and ` +
+    `responses — so a pipeline that finished while the next one started is still there to read. ` +
+    `Move between them with <b>,</b> and <b>.</b>, or jump back to the live one with <b>l</b>.`;
+}
+
+runsEl.addEventListener('click', e => {
+  const card = e.target.closest('[data-run]');
+  if (!card) return;
+  closeUniverse();
+  viewRun(card.dataset.run);
+});
+document.getElementById('universeClose').addEventListener('click', closeUniverse);
+universeEl.addEventListener('click', e => { if (e.target === universeEl) closeUniverse(); });
+
 document.getElementById('runMeta').addEventListener('click', e => {
-  if (e.target.closest('[data-summary]')) openSummary();
+  if (e.target.closest('[data-summary]')) { openSummary(); return; }
+  if (e.target.closest('[data-universe]')) { toggleUniverse(); return; }
+  if (e.target.closest('[data-run-live]')) { jumpLive(); return; }
+  const step = e.target.closest('[data-run-step]');
+  if (step) stepRun(Number(step.dataset.runStep));
 });
 
 // -------------------------------------------------------- header / stats ---
@@ -1781,9 +2139,29 @@ function refreshChrome() {
   const connCls = connState === 'live' ? 'ok' : (connState === 'reconnecting' ? 'warn' : '');
   const connLabel = connState === 'live' ? 'stream live' : (connState === 'reconnecting' ? 'reconnecting…' : 'connecting…');
   const connChip = `<span class="chip conn ${connCls}" title="event stream">${connLabel}</span>`;
+  // The universe controls: where this run sits among the process's runs, and
+  // the way back to the one still going. They are what makes a second
+  // pipeline an addition to the view rather than a replacement of it.
+  const at = S.runs.findIndex(r => r.runId === S.viewing);
+  const pos = at >= 0 && S.runs.length > 1 ? ` ${at + 1}/${S.runs.length}` : '';
+  const uniBtn = `<button type="button" class="chip btn" data-universe title="every run in this process (u)">⊞ universe${pos}</button>`;
+  const nav = S.runs.length > 1
+    ? `<button type="button" class="chip btn step" data-run-step="-1" title="previous run (,)"${at <= 0 ? ' disabled' : ''}>‹</button>` +
+      `<button type="button" class="chip btn step" data-run-step="1" title="next run (.)"${at < 0 || at >= S.runs.length - 1 ? ' disabled' : ''}>›</button>`
+    : '';
+  // The newest run, when it is not the one on screen: the notice that the
+  // view stayed put rather than following, and the way forward to it. A run
+  // that came and went while you were reading this one still says so.
+  const newest = S.live && S.live !== S.viewing ? S.runIx.get(S.live) : null;
+  const elsewhere = !newest ? ''
+    : newest.done
+      ? `<button type="button" class="chip btn" data-run-live title="jump to the newest run (l)">` +
+        `${esc(newest.pipeline || 'run ' + newest.index)} ran →</button>`
+      : `<button type="button" class="chip live-elsewhere" data-run-live title="jump to the run still going (l)">` +
+        `◉ ${esc(newest.pipeline || 'run ' + newest.index)} live →</button>`;
   let metaHTML;
   if (!S.run.runId) {
-    metaHTML = `waiting for a run…${connChip}`;
+    metaHTML = `waiting for a run…${S.runs.length ? uniBtn : ''}${elsewhere}${connChip}`;
   } else {
     const state = S.run.done
       ? `<span class="chip done">✦ complete</span>`
@@ -1796,7 +2174,11 @@ function refreshChrome() {
       ? `<span class="chip" title="pipelined execution — stages overlap, executors are shared engine slots">⇄ streaming</span>`
       : (S.run.driver === 'barrier'
           ? `<span class="chip" title="one stage at a time">▮ barrier</span>` : '');
-    metaHTML = `<span style="font-family:ui-monospace,Menlo,monospace">${esc(S.run.runId)}</span>${state}${drv}${note}${sumBtn}${connChip}`;
+    const pipe = S.run.pipeline
+      ? `<span class="pipe" title="pipeline">${esc(S.run.pipeline)}</span>&nbsp;`
+      : '';
+    metaHTML = `${pipe}<span style="font-family:ui-monospace,Menlo,monospace">${esc(S.run.runId)}</span>` +
+      `${state}${drv}${note}${nav}${uniBtn}${sumBtn}${elsewhere}${connChip}`;
   }
   if (meta.dataset.html !== metaHTML) {
     meta.innerHTML = metaHTML;
@@ -1855,6 +2237,7 @@ setInterval(() => {
     renderPanel();
   }
   if (summaryEl.classList.contains('open')) renderSummary();
+  if (universeEl.classList.contains('open') && (universeDirty || S.live)) renderUniverse();
 }, 400);
 refreshChrome();
 </script>

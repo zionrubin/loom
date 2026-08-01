@@ -13,11 +13,20 @@
 //	url, _ := v.Start("localhost:8077")
 //	res, err := loom.Run(ctx, p, loom.WithEventHandler(v.Handle), ...)
 //
-// The server folds the event stream into the state of the current run (a
-// new run.started event resets it), serves the embedded single-file UI at
-// /, a JSON snapshot at /api/state, a live delta stream at /api/events
-// (server-sent events), and one task's full detail at /api/task?id=…. It has
-// no dependencies beyond the standard library.
+// A process usually runs more than one pipeline — a fan-out run and the run
+// that fuses its results, a retry, an A/B — so the server keeps a *universe*
+// of runs rather than only the latest. Each run.started opens a new sky and
+// the previous one is retained, whole and inspectable, alongside it: the
+// overview names every run in the process, and any of them can be entered,
+// compared, and drilled into after it has finished. Events are routed by run
+// ID, so pipelines running concurrently on one handler land in their own
+// universes instead of interleaving into one unreadable sky.
+//
+// It serves the embedded single-file UI at /, a JSON snapshot of one run at
+// /api/state (optionally ?run=…), the roster of every retained run at
+// /api/runs, a live delta stream at /api/events (server-sent events), and one
+// task's full detail at /api/task?id=…. It has no dependencies beyond the
+// standard library.
 //
 // Snapshots and deltas carry only what the constellation draws. A task's
 // heavy payloads — rendered prompts and responses, full record JSON — are
@@ -162,6 +171,12 @@ type StageInfo struct {
 	Status    string `json:"status"`           // running | done
 	StartedAt int64  `json:"startedAt,omitempty"`
 	EndedAt   int64  `json:"endedAt,omitempty"`
+	// Task tallies, maintained as tasks settle. The viewed run's counts are
+	// derivable from its tasks, but the overview shows the shape of runs whose
+	// tasks the client is not holding, so they are kept here too.
+	Tasks  int `json:"tasks,omitempty"`
+	Done   int `json:"done,omitempty"`
+	Failed int `json:"failed,omitempty"`
 	// Prefix-cache accounting for the stage's shared prompt head: tokens the
 	// provider served from it, tokens spent establishing it, and what the
 	// difference was worth. A stage is where these belong — the prefix is
@@ -239,7 +254,11 @@ type WorkerInfo struct {
 }
 
 type runHeader struct {
-	RunID     string `json:"runId"`
+	RunID string `json:"runId"`
+	// Pipeline is the name the run's pipeline was built with. It is what makes
+	// a universe of runs readable: run IDs are random, pipeline names are not.
+	Pipeline  string `json:"pipeline,omitempty"`
+	Index     int    `json:"index,omitempty"` // 1-based order of appearance
 	StartedAt int64  `json:"startedAt,omitempty"`
 	EndedAt   int64  `json:"endedAt,omitempty"`
 	Done      bool   `json:"done"`
@@ -249,10 +268,48 @@ type runHeader struct {
 	Driver string `json:"driver,omitempty"`
 }
 
-// Snapshot is the complete state of the current run.
+// StageBrief is one stage reduced to what the overview draws for a run the
+// viewer is not currently inside.
+type StageBrief struct {
+	ID     string `json:"id"`
+	Kind   string `json:"kind,omitempty"`
+	Status string `json:"status,omitempty"`
+	Tasks  int    `json:"tasks"`
+	Done   int    `json:"done"`
+	Failed int    `json:"failed"`
+}
+
+// RunSummary is one run as the universe overview sees it: enough to rank,
+// compare, and pick between runs without holding any of their tasks.
+//
+// Stages is carried only by roster views (snapshots and /api/runs). Deltas
+// ride the hot path and send the counters alone.
+type RunSummary struct {
+	runHeader
+	Tasks      int          `json:"tasks"`
+	Completed  int          `json:"completed"`
+	Failed     int          `json:"failed"`
+	Running    int          `json:"running"`
+	Pending    int          `json:"pending"`
+	Retries    int          `json:"retries"`
+	CacheHits  int          `json:"cacheHits"`
+	StageCount int          `json:"stageCount"`
+	Tokens     int          `json:"tokens"`
+	CostUSD    float64      `json:"cost"`
+	Projected  float64      `json:"projectedUsd,omitempty"`
+	Stages     []StageBrief `json:"stages,omitempty"`
+}
+
+// Snapshot is the complete state of one run, plus the roster of every run
+// the server is holding so a viewer can see where it is in the universe.
 type Snapshot struct {
 	runHeader
-	Now        int64            `json:"now"`
+	Now int64 `json:"now"`
+	// Live names the run currently receiving events, which is not necessarily
+	// the run this snapshot describes — the point of keeping a universe is
+	// that a finished run stays watchable while the next one runs.
+	Live       string           `json:"live,omitempty"`
+	Runs       []*RunSummary    `json:"runs"`
 	Stages     []*StageInfo     `json:"stages"`
 	Tasks      []*Node          `json:"tasks"`
 	Workers    []*WorkerInfo    `json:"workers"`
@@ -260,12 +317,21 @@ type Snapshot struct {
 	Projection *ProjectionInfo  `json:"projection,omitempty"`
 }
 
-// delta is one incremental update: the run header plus whichever entities
-// the triggering event changed.
+// delta is one incremental update: which run it belongs to, that run's header
+// and summary, and whichever entities the triggering event changed. A client
+// watching a different run applies the summary and drops the rest.
 type delta struct {
-	Now        int64           `json:"now"`
-	Reset      bool            `json:"reset,omitempty"`
+	Now int64 `json:"now"`
+	// Reset marks the delta that opened a new run. Clients following the live
+	// run switch to it; clients pinned to an older one stay where they are.
+	Reset bool   `json:"reset,omitempty"`
+	RunID string `json:"runId,omitempty"`
+	// Runs is the full roster, sent when it changes shape (a run started, an
+	// old one was evicted) rather than on every event.
+	Runs       []*RunSummary   `json:"runs,omitempty"`
+	Live       string          `json:"live,omitempty"`
 	Run        runHeader       `json:"run"`
+	Summary    *RunSummary     `json:"summary,omitempty"`
 	Stage      *StageInfo      `json:"stage,omitempty"`
 	Task       *Node           `json:"task,omitempty"`
 	Worker     *WorkerInfo     `json:"worker,omitempty"`
@@ -279,6 +345,10 @@ const (
 	// Reader lists are for showing *where* a value landed, not for
 	// enumerating every task; Readers stays exact regardless.
 	maxBroadcastTasks = 24
+	// defaultRetainedRuns bounds the universe. Runs are held whole — every
+	// task, prompt, and response — so the history is finite by construction:
+	// the oldest run is dropped when a new one pushes past the limit.
+	defaultRetainedRuns = 12
 )
 
 type subscriber struct {
@@ -286,10 +356,12 @@ type subscriber struct {
 	lost bool // a send was dropped; the writer heals with a full snapshot
 }
 
-// Server folds observe events into run state and serves the constellation UI.
-type Server struct {
-	mu       sync.Mutex
-	run      runHeader
+// runState is one run's whole sky: its stages, tasks, executors, shared
+// values, and the forecast it was measured against. A universe is a list of
+// these, and a run keeps its own indexes so the runs never bleed into one
+// another — the same task ID in two runs is two different stars.
+type runState struct {
+	hdr      runHeader
 	stages   []*StageInfo
 	stageIx  map[string]*StageInfo
 	tasks    []*Node
@@ -298,15 +370,59 @@ type Server struct {
 	workIx   map[string]*WorkerInfo
 	shared   []*BroadcastInfo
 	sharedIx map[string]*BroadcastInfo
-	subs     map[*subscriber]struct{}
 
-	// The projection outlives a run reset. It describes the pipeline, and the
-	// run that follows is precisely the thing it predicted, so clearing it at
-	// run.started would discard the comparison exactly when it starts being
-	// worth something. projIx keeps the per-stage forecasts so they can be
-	// reattached to StageInfos the reset threw away.
-	projection *ProjectionInfo
-	projIx     map[string]*StageProjection
+	// The forecast this run was measured against (loom.Explain), and the
+	// run-level half of it. Held per run so a second pipeline's prediction
+	// never lands on the first one's stages.
+	fc   *forecast
+	proj *ProjectionInfo
+
+	// Totals, kept incrementally. The overview shows every run at once, and
+	// re-tallying each run's tasks on every event is how a view that watches
+	// several runs stops keeping up with any of them.
+	byStatus  map[string]int
+	retries   int
+	cacheHits int
+	tokens    int
+	costUSD   float64
+}
+
+func newRunState(hdr runHeader) *runState {
+	return &runState{
+		hdr:      hdr,
+		stageIx:  map[string]*StageInfo{},
+		taskIx:   map[string]*Node{},
+		workIx:   map[string]*WorkerInfo{},
+		sharedIx: map[string]*BroadcastInfo{},
+		byStatus: map[string]int{},
+	}
+}
+
+// forecast is one pipeline's pre-flight projection, held by pipeline name so
+// the run it predicted can claim it whenever it starts.
+type forecast struct {
+	run    *ProjectionInfo
+	stages map[string]*StageProjection
+}
+
+// Server folds observe events into a universe of runs and serves the
+// constellation UI.
+type Server struct {
+	mu    sync.Mutex
+	runs  []*runState // oldest first
+	runIx map[string]*runState
+	cur   *runState // most recently started run
+	seq   int       // runs seen, ever — the source of Index
+	// retain bounds how many runs are held at once; see Retain.
+	retain int
+	subs   map[*subscriber]struct{}
+
+	// Projections outlive the runs they describe. A forecast is published
+	// before its run starts (loom.Explain), and the run that follows is
+	// precisely the thing it predicted, so it is held by pipeline name and
+	// handed to that pipeline's runs as they open — including a re-run, which
+	// is the same prediction a second time.
+	forecasts map[string]*forecast
 
 	viewer     chan struct{}
 	viewerOnce sync.Once
@@ -315,20 +431,37 @@ type Server struct {
 	http *http.Server
 }
 
-// New returns a Server with empty state.
-func New() *Server {
+// Option configures a Server.
+type Option func(*Server)
+
+// Retain bounds the number of runs the universe holds at once (default 12).
+// Runs are kept whole — every task, prompt, and response — so this is the
+// knob that trades history for memory; the oldest run is dropped when a new
+// one pushes past the limit. Values below 1 are ignored.
+func Retain(n int) Option {
+	return func(s *Server) {
+		if n >= 1 {
+			s.retain = n
+		}
+	}
+}
+
+// New returns a Server with an empty universe.
+func New(opts ...Option) *Server {
 	s := &Server{
-		stageIx:  map[string]*StageInfo{},
-		taskIx:   map[string]*Node{},
-		workIx:   map[string]*WorkerInfo{},
-		sharedIx: map[string]*BroadcastInfo{},
-		projIx:   map[string]*StageProjection{},
-		subs:     map[*subscriber]struct{}{},
-		viewer:   make(chan struct{}),
+		runIx:     map[string]*runState{},
+		forecasts: map[string]*forecast{},
+		retain:    defaultRetainedRuns,
+		subs:      map[*subscriber]struct{}{},
+		viewer:    make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.serveUI)
 	mux.HandleFunc("/api/state", s.serveState)
+	mux.HandleFunc("/api/runs", s.serveRuns)
 	mux.HandleFunc("/api/events", s.serveEvents)
 	mux.HandleFunc("/api/task", s.serveTask)
 	s.mux = mux
@@ -395,16 +528,27 @@ func (s *Server) Handle(e observe.Event) {
 	defer s.mu.Unlock()
 
 	d := delta{Now: now}
+	// Every event but a projection belongs to exactly one run, and routing by
+	// run ID is what keeps two pipelines on one handler in two skies.
+	var r *runState
+	switch e.Type {
+	case observe.StageProjected, observe.RunProjected:
+		// Resolved below: a forecast belongs to a pipeline, not to a run.
+	case observe.RunStarted:
+		// A new sky. The roster rides along because this is the one event
+		// that changes its shape — a run appears, and the oldest may retire.
+		r = s.startRunLocked(e, now)
+		d.Reset = true
+		d.Runs = s.rosterLocked()
+		d.Projection = r.proj
+	default:
+		r = s.runForLocked(e.RunID, now)
+	}
 
 	switch e.Type {
-	case observe.RunStarted:
-		s.resetLocked()
-		s.run = runHeader{RunID: e.RunID, StartedAt: now, Driver: e.Kind}
-		d.Reset = true
-
 	case observe.RunFinished:
-		s.run.Done = true
-		s.run.EndedAt = now
+		r.hdr.Done = true
+		r.hdr.EndedAt = now
 
 	case observe.StageProjected:
 		p := &StageProjection{
@@ -413,19 +557,23 @@ func (s *Server) Handle(e observe.Event) {
 			CeilingUSD: e.Ceiling.CostUSD, FloorMS: e.Latency.Milliseconds(),
 			Estimated: e.Note == "estimated",
 		}
-		s.projIx[e.Stage] = p
-		st := s.stageLocked(e.Stage)
-		st.Proj = p
-		// A projection arrives before the run, so it is usually the event that
-		// creates the stage. Seed what it knows; stage.started overwrites it
-		// with the real thing.
-		if st.Kind == "" {
-			st.Kind = e.Kind
+		fc := s.forecastLocked(e.Pipeline)
+		fc.stages[e.Stage] = p
+		// A projection usually arrives before its run, in which case it waits
+		// for it. When the run is already open it attaches now.
+		if r = s.forecastRunLocked(e.Pipeline); r != nil {
+			st := r.stageLocked(e.Stage)
+			st.Proj = p
+			// Seed what the forecast knows; stage.started overwrites it with
+			// the real thing.
+			if st.Kind == "" {
+				st.Kind = e.Kind
+			}
+			d.Stage = st
 		}
-		d.Stage = st
 
 	case observe.RunProjected:
-		s.projection = &ProjectionInfo{
+		pi := &ProjectionInfo{
 			Driver: e.Kind, Calls: e.Usage.Requests,
 			Tokens: e.Usage.TotalTokens(), ExpectedUSD: e.Usage.CostUSD,
 			CeilingTokens: e.Ceiling.TotalTokens(), CeilingUSD: e.Ceiling.CostUSD,
@@ -436,12 +584,19 @@ func (s *Server) Handle(e observe.Event) {
 				(e.Budget.MaxTokens == 0 || e.Ceiling.TotalTokens() <= e.Budget.MaxTokens),
 		}
 		if e.Detail != "" {
-			s.projection.Warnings = strings.Split(e.Detail, "\n")
+			pi.Warnings = strings.Split(e.Detail, "\n")
 		}
-		d.Projection = s.projection
+		s.forecastLocked(e.Pipeline).run = pi
+		if r = s.forecastRunLocked(e.Pipeline); r != nil {
+			r.proj = pi
+		}
+		// Sent whether or not a run has claimed it: before the first run there
+		// is nothing else to show, and the price is the one thing still
+		// actionable at that moment.
+		d.Projection = pi
 
 	case observe.StageStarted:
-		st := s.stageLocked(e.Stage)
+		st := r.stageLocked(e.Stage)
 		st.Upstream = e.Upstream
 		st.Kind = e.Kind
 		st.Detail = e.Detail
@@ -450,13 +605,13 @@ func (s *Server) Handle(e observe.Event) {
 		d.Stage = st
 
 	case observe.StageFinished:
-		st := s.stageLocked(e.Stage)
+		st := r.stageLocked(e.Stage)
 		st.Status = "done"
 		st.EndedAt = now
 		d.Stage = st
 
 	case observe.TaskScheduled:
-		n := s.nodeLocked(e.TaskID, e.Stage)
+		n := r.nodeLocked(e.TaskID, e.Stage)
 		n.Records = e.Records
 		n.Input = e.Input
 		n.InputIDs = e.InputIDs
@@ -464,8 +619,8 @@ func (s *Server) Handle(e observe.Event) {
 		d.Task = n
 
 	case observe.TaskStarted:
-		n := s.nodeLocked(e.TaskID, e.Stage)
-		n.Status = "running"
+		n := r.nodeLocked(e.TaskID, e.Stage)
+		r.setStatus(n, "running")
 		n.Attempts = e.Attempt
 		n.Worker = e.Worker
 		if e.Model != "" {
@@ -476,10 +631,10 @@ func (s *Server) Handle(e observe.Event) {
 		}
 		logf(n, now, "attempt %d started on %s (%s)", e.Attempt, e.Worker, orDash(e.Model))
 		d.Task = n
-		d.Worker = s.workerStartLocked(e.Worker, e.TaskID, now)
+		d.Worker = r.workerStartLocked(e.Worker, e.TaskID, now)
 
 	case observe.ModelCalled:
-		n := s.nodeLocked(e.TaskID, e.Stage)
+		n := r.nodeLocked(e.TaskID, e.Stage)
 		n.Calls++
 		n.CallLog = append(n.CallLog, Call{
 			At: now, Model: e.Model, Prompt: e.Prompt, Response: e.Response,
@@ -498,6 +653,8 @@ func (s *Server) Handle(e observe.Event) {
 			n.Usage.CachedTokens += e.Usage.CacheReadTokens
 			n.Usage.Requests += e.Usage.Requests
 			n.Usage.CostUSD += e.Usage.CostUSD
+			r.tokens += e.Usage.InputTokens + e.Usage.OutputTokens
+			r.costUSD += e.Usage.CostUSD
 			shared := ""
 			if e.Usage.CacheReadTokens > 0 {
 				shared = fmt.Sprintf(" (+%d from shared prefix)", e.Usage.CacheReadTokens)
@@ -510,7 +667,7 @@ func (s *Server) Handle(e observe.Event) {
 			// Roll the prefix-cache economics up to the stage that owns the
 			// shared prompt head.
 			if e.Stage != "" && (e.Usage.CacheReadTokens > 0 || e.Usage.CacheWriteTokens > 0) {
-				st := s.stageLocked(e.Stage)
+				st := r.stageLocked(e.Stage)
 				st.CachedTokens += e.Usage.CacheReadTokens
 				st.WrittenTokens += e.Usage.CacheWriteTokens
 				st.SavedUSD += e.Saved
@@ -520,23 +677,27 @@ func (s *Server) Handle(e observe.Event) {
 		d.Task = n
 
 	case observe.CacheHit:
-		n := s.nodeLocked(e.TaskID, e.Stage)
-		n.CacheHit = true
+		n := r.nodeLocked(e.TaskID, e.Stage)
+		if !n.CacheHit {
+			n.CacheHit = true
+			r.cacheHits++
+		}
 		logf(n, now, "cache hit — result replayed, zero model calls")
 		d.Task = n
 
 	case observe.TaskRetried:
-		n := s.nodeLocked(e.TaskID, e.Stage)
-		n.Status = "retrying"
+		n := r.nodeLocked(e.TaskID, e.Stage)
+		r.setStatus(n, "retrying")
 		n.Retries++
+		r.retries++
 		n.Attempts = e.Attempt
 		n.Error = e.Err
 		logf(n, now, "attempt %d failed: %s → retrying (%s)", e.Attempt, e.Err, e.Note)
 		d.Task = n
 
 	case observe.TaskCompleted:
-		n := s.nodeLocked(e.TaskID, e.Stage)
-		n.Status = "completed"
+		n := r.nodeLocked(e.TaskID, e.Stage)
+		r.setStatus(n, "completed")
 		n.Attempts = e.Attempt
 		if e.Model != "" {
 			n.Model = e.Model
@@ -548,27 +709,27 @@ func (s *Server) Handle(e observe.Event) {
 		n.Error = ""
 		logf(n, now, "completed in %s (attempt %d)", e.Latency.Round(time.Millisecond), e.Attempt)
 		d.Task = n
-		d.Worker = s.workerEndLocked(e.Worker, e.TaskID, now, false)
+		d.Worker = r.workerEndLocked(e.Worker, e.TaskID, now, false)
 
 	case observe.TaskFailed:
-		n := s.nodeLocked(e.TaskID, e.Stage)
-		n.Status = "failed"
+		n := r.nodeLocked(e.TaskID, e.Stage)
+		r.setStatus(n, "failed")
 		n.Attempts = e.Attempt
 		n.EndedAt = now
 		n.Error = e.Err
 		logf(n, now, "failed after %d attempt%s: %s", e.Attempt, plural(e.Attempt), e.Err)
 		d.Task = n
-		d.Worker = s.workerEndLocked(e.Worker, e.TaskID, now, true)
+		d.Worker = r.workerEndLocked(e.Worker, e.TaskID, now, true)
 
 	case observe.BroadcastRegistered:
-		bc := s.sharedLocked(e.Broadcast)
+		bc := r.sharedLocked(e.Broadcast)
 		bc.Hash = e.Artifact
 		bc.Bytes = e.Bytes
 		bc.Preview = e.Detail
 		d.Broadcast = bc
 
 	case observe.BroadcastRead:
-		bc := s.sharedLocked(e.Broadcast)
+		bc := r.sharedLocked(e.Broadcast)
 		bc.Readers++
 		if e.Stage != "" && !contains(bc.Stages, e.Stage) {
 			bc.Stages = append(bc.Stages, e.Stage)
@@ -576,7 +737,7 @@ func (s *Server) Handle(e observe.Event) {
 		if len(bc.Tasks) < maxBroadcastTasks {
 			bc.Tasks = append(bc.Tasks, e.TaskID)
 		}
-		n := s.nodeLocked(e.TaskID, e.Stage)
+		n := r.nodeLocked(e.TaskID, e.Stage)
 		if !contains(n.Broadcasts, e.Broadcast) {
 			n.Broadcasts = append(n.Broadcasts, e.Broadcast)
 		}
@@ -586,42 +747,174 @@ func (s *Server) Handle(e observe.Event) {
 		d.Broadcast = bc
 
 	case observe.BudgetExceeded:
-		s.run.Note = "budget exceeded: " + e.Note
+		r.hdr.Note = "budget exceeded: " + e.Note
 		if e.TaskID != "" {
-			n := s.nodeLocked(e.TaskID, e.Stage)
+			n := r.nodeLocked(e.TaskID, e.Stage)
 			logf(n, now, "budget exceeded: %s", e.Note)
 			d.Task = n
 		}
 	}
 
-	d.Run = s.run
+	if r != nil {
+		d.RunID = r.hdr.RunID
+		d.Run = r.hdr
+		d.Summary = s.summaryLocked(r, false)
+	}
+	if s.cur != nil {
+		d.Live = s.cur.hdr.RunID
+	}
 	s.broadcastLocked(d)
 }
 
-// resetLocked clears the run. The projection deliberately survives: it
-// describes the pipeline rather than any one run, and the run starting is
-// exactly when the comparison it enables becomes worth something.
-func (s *Server) resetLocked() {
-	s.run = runHeader{}
-	s.stages = nil
-	s.stageIx = map[string]*StageInfo{}
-	s.tasks = nil
-	s.taskIx = map[string]*Node{}
-	s.workers = nil
-	s.workIx = map[string]*WorkerInfo{}
-	s.shared = nil
-	s.sharedIx = map[string]*BroadcastInfo{}
+// startRunLocked opens a new sky for a run, retiring the oldest one if the
+// universe is full. The run inherits its pipeline's forecast, because the run
+// starting is exactly when that comparison becomes worth something.
+func (s *Server) startRunLocked(e observe.Event, now int64) *runState {
+	s.seq++
+	r := newRunState(runHeader{
+		RunID: e.RunID, Pipeline: e.Pipeline, Index: s.seq,
+		StartedAt: now, Driver: e.Kind,
+	})
+	if fc := s.matchForecastLocked(e.Pipeline); fc != nil {
+		r.fc = fc
+		r.proj = fc.run
+	}
+	// A run ID repeated (a reconnected producer, a hand-fed stream) replaces
+	// the run it names rather than shadowing it in the index.
+	if old, ok := s.runIx[e.RunID]; ok && e.RunID != "" {
+		s.dropLocked(old)
+	}
+	s.runs = append(s.runs, r)
+	if r.hdr.RunID != "" {
+		s.runIx[r.hdr.RunID] = r
+	}
+	s.cur = r
+	// Oldest first, and never the run still receiving events — it is the one
+	// thing a viewer cannot recover by looking somewhere else.
+	for len(s.runs) > s.retain && s.runs[0] != s.cur {
+		s.dropLocked(s.runs[0])
+	}
+	return r
+}
+
+// dropLocked forgets a run entirely.
+func (s *Server) dropLocked(victim *runState) {
+	if victim == nil {
+		return
+	}
+	for i, r := range s.runs {
+		if r == victim {
+			s.runs = append(s.runs[:i], s.runs[i+1:]...)
+			break
+		}
+	}
+	if victim.hdr.RunID != "" && s.runIx[victim.hdr.RunID] == victim {
+		delete(s.runIx, victim.hdr.RunID)
+	}
+}
+
+// runForLocked returns the run an event belongs to: the one it names, the
+// current run when it names none, and a fresh universe for a run whose start
+// was never seen — a handler attached mid-run, or a producer that began
+// before the view did.
+func (s *Server) runForLocked(id string, now int64) *runState {
+	if id != "" {
+		if r, ok := s.runIx[id]; ok {
+			return r
+		}
+		// A run whose events arrive before its run.started (or without one)
+		// adopts the unnamed placeholder rather than splitting in two.
+		if s.cur != nil && s.cur.hdr.RunID == "" {
+			s.cur.hdr.RunID = id
+			s.runIx[id] = s.cur
+			return s.cur
+		}
+		return s.startRunLocked(observe.Event{RunID: id}, now)
+	}
+	if s.cur == nil {
+		return s.startRunLocked(observe.Event{}, now)
+	}
+	return s.cur
+}
+
+// forecastLocked returns the forecast slot for a pipeline name, creating it.
+func (s *Server) forecastLocked(pipeline string) *forecast {
+	fc, ok := s.forecasts[pipeline]
+	if !ok {
+		fc = &forecast{stages: map[string]*StageProjection{}}
+		s.forecasts[pipeline] = fc
+	}
+	return fc
+}
+
+// matchForecastLocked finds the forecast a starting run should claim: the one
+// published for its pipeline, or an unnamed one (a projection from a producer
+// that predates pipeline names, which can only mean this run).
+func (s *Server) matchForecastLocked(pipeline string) *forecast {
+	if fc, ok := s.forecasts[pipeline]; ok {
+		return fc
+	}
+	if fc, ok := s.forecasts[""]; ok {
+		return fc
+	}
+	return nil
+}
+
+// pendingForecastLocked returns the forecast to show while the universe is
+// still empty: the only one published, or the unnamed one when several are.
+func (s *Server) pendingForecastLocked() *ProjectionInfo {
+	if len(s.forecasts) == 1 {
+		for _, fc := range s.forecasts {
+			return fc.run
+		}
+	}
+	if fc, ok := s.forecasts[""]; ok {
+		return fc.run
+	}
+	return nil
+}
+
+// forecastRunLocked returns the open run a just-published projection describes,
+// if any. Projections normally precede their run, in which case there is none
+// and the forecast simply waits.
+func (s *Server) forecastRunLocked(pipeline string) *runState {
+	if s.cur == nil {
+		return nil
+	}
+	if s.cur.hdr.Pipeline == pipeline || pipeline == "" || s.cur.hdr.Pipeline == "" {
+		return s.cur
+	}
+	return nil
+}
+
+// setStatus moves a node between states, keeping the run's tallies true. The
+// overview reads those tallies for runs whose tasks nobody is holding.
+func (r *runState) setStatus(n *Node, status string) {
+	if n.Status == status {
+		return
+	}
+	r.byStatus[n.Status]--
+	n.Status = status
+	r.byStatus[status]++
+	if st := r.stageIx[n.Stage]; st != nil {
+		switch status {
+		case "completed":
+			st.Done++
+		case "failed":
+			st.Failed++
+		}
+	}
 }
 
 // sharedLocked returns the entry for a broadcast name, creating it if a read
 // arrives before (or without) its registration event.
-func (s *Server) sharedLocked(name string) *BroadcastInfo {
-	if bc, ok := s.sharedIx[name]; ok {
+func (r *runState) sharedLocked(name string) *BroadcastInfo {
+	if bc, ok := r.sharedIx[name]; ok {
 		return bc
 	}
 	bc := &BroadcastInfo{ID: name}
-	s.sharedIx[name] = bc
-	s.shared = append(s.shared, bc)
+	r.sharedIx[name] = bc
+	r.shared = append(r.shared, bc)
 	return bc
 }
 
@@ -645,37 +938,42 @@ func shortHash(h string) string {
 	return h
 }
 
-func (s *Server) stageLocked(id string) *StageInfo {
-	if st, ok := s.stageIx[id]; ok {
+func (r *runState) stageLocked(id string) *StageInfo {
+	if st, ok := r.stageIx[id]; ok {
 		return st
 	}
-	// Reattach the forecast a reset dropped, so a re-run against the same
-	// projection still shows expected beside actual.
-	st := &StageInfo{ID: id, Proj: s.projIx[id]}
-	s.stageIx[id] = st
-	s.stages = append(s.stages, st)
+	// A re-run of the same pipeline is the same prediction a second time, so
+	// the stage claims its forecast as it appears.
+	st := &StageInfo{ID: id}
+	if r.fc != nil {
+		st.Proj = r.fc.stages[id]
+	}
+	r.stageIx[id] = st
+	r.stages = append(r.stages, st)
 	return st
 }
 
-func (s *Server) nodeLocked(id, stage string) *Node {
-	if n, ok := s.taskIx[id]; ok {
+func (r *runState) nodeLocked(id, stage string) *Node {
+	if n, ok := r.taskIx[id]; ok {
 		return n
 	}
 	n := &Node{ID: id, Stage: stage, Status: "pending"}
-	s.taskIx[id] = n
-	s.tasks = append(s.tasks, n)
+	r.taskIx[id] = n
+	r.tasks = append(r.tasks, n)
+	r.byStatus["pending"]++
+	r.stageLocked(stage).Tasks++
 	return n
 }
 
-func (s *Server) workerStartLocked(id, taskID string, now int64) *WorkerInfo {
+func (r *runState) workerStartLocked(id, taskID string, now int64) *WorkerInfo {
 	if id == "" {
 		return nil
 	}
-	w, ok := s.workIx[id]
+	w, ok := r.workIx[id]
 	if !ok {
 		w = &WorkerInfo{ID: id}
-		s.workIx[id] = w
-		s.workers = append(s.workers, w)
+		r.workIx[id] = w
+		r.workers = append(r.workers, w)
 	}
 	w.Current = taskID
 	if w.busyStart == 0 {
@@ -684,11 +982,11 @@ func (s *Server) workerStartLocked(id, taskID string, now int64) *WorkerInfo {
 	return w
 }
 
-func (s *Server) workerEndLocked(id, taskID string, now int64, failed bool) *WorkerInfo {
+func (r *runState) workerEndLocked(id, taskID string, now int64, failed bool) *WorkerInfo {
 	if id == "" {
 		return nil
 	}
-	w, ok := s.workIx[id]
+	w, ok := r.workIx[id]
 	if !ok {
 		return nil
 	}
@@ -729,15 +1027,70 @@ func orDash(s string) string {
 	return s
 }
 
-func (s *Server) snapshotLocked() []byte {
+// summaryLocked reduces a run to the line the overview shows for it. Stage
+// briefs are for roster views only: deltas ride the hot path and send the
+// counters alone.
+func (s *Server) summaryLocked(r *runState, withStages bool) *RunSummary {
+	sum := &RunSummary{
+		runHeader:  r.hdr,
+		Tasks:      len(r.tasks),
+		Completed:  r.byStatus["completed"],
+		Failed:     r.byStatus["failed"],
+		Running:    r.byStatus["running"] + r.byStatus["retrying"],
+		Pending:    r.byStatus["pending"],
+		Retries:    r.retries,
+		CacheHits:  r.cacheHits,
+		StageCount: len(r.stages),
+		Tokens:     r.tokens,
+		CostUSD:    r.costUSD,
+	}
+	if r.proj != nil {
+		sum.Projected = r.proj.ExpectedUSD
+	}
+	if withStages {
+		sum.Stages = make([]StageBrief, 0, len(r.stages))
+		for _, st := range r.stages {
+			sum.Stages = append(sum.Stages, StageBrief{
+				ID: st.ID, Kind: st.Kind, Status: st.Status,
+				Tasks: st.Tasks, Done: st.Done, Failed: st.Failed,
+			})
+		}
+	}
+	return sum
+}
+
+// rosterLocked is the universe: every run held, oldest first, each with the
+// shape of its pipeline attached.
+func (s *Server) rosterLocked() []*RunSummary {
+	out := make([]*RunSummary, 0, len(s.runs))
+	for _, r := range s.runs {
+		out = append(out, s.summaryLocked(r, true))
+	}
+	return out
+}
+
+// snapshotLocked serializes one run plus the roster it sits in. A nil run
+// means the universe is empty — the view has connected before anything ran.
+func (s *Server) snapshotLocked(r *runState) []byte {
 	snap := Snapshot{
-		runHeader:  s.run,
-		Now:        time.Now().UnixMilli(),
-		Stages:     s.stages,
-		Tasks:      s.tasks,
-		Workers:    s.workers,
-		Broadcasts: s.shared,
-		Projection: s.projection,
+		Now:  time.Now().UnixMilli(),
+		Runs: s.rosterLocked(),
+	}
+	if s.cur != nil {
+		snap.Live = s.cur.hdr.RunID
+	}
+	if r != nil {
+		snap.runHeader = r.hdr
+		snap.Stages = r.stages
+		snap.Tasks = r.tasks
+		snap.Workers = r.workers
+		snap.Broadcasts = r.shared
+		snap.Projection = r.proj
+	} else {
+		// Nothing has run yet. If a forecast has been published it is the only
+		// thing there is to show, and this is the one moment when knowing the
+		// price is still actionable.
+		snap.Projection = s.pendingForecastLocked()
 	}
 	if snap.Stages == nil {
 		snap.Stages = []*StageInfo{}
@@ -793,14 +1146,59 @@ func (s *Server) serveUI(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(page)
 }
 
+// serveState returns one run's full state: the live run by default, or the
+// run named by ?run= — which is how a viewer walks back into a pipeline that
+// finished while the next one was starting.
 func (s *Server) serveState(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	want := r.URL.Query().Get("run")
 	s.mu.Lock()
-	b := s.snapshotLocked()
+	target := s.cur
+	missing := false
+	if want != "" {
+		target, missing = s.runIx[want], s.runIx[want] == nil
+	}
+	var b []byte
+	if !missing {
+		b = s.snapshotLocked(target)
+	}
 	s.mu.Unlock()
+	if missing {
+		http.Error(w, "unknown run", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, b)
+}
+
+// serveRuns returns the universe: every run being held, with the shape of its
+// pipeline, so the overview can be built without loading any run's tasks.
+func (s *Server) serveRuns(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	out := struct {
+		Now  int64         `json:"now"`
+		Live string        `json:"live,omitempty"`
+		Runs []*RunSummary `json:"runs"`
+	}{Now: time.Now().UnixMilli(), Runs: s.rosterLocked()}
+	if s.cur != nil {
+		out.Live = s.cur.hdr.RunID
+	}
+	b, err := json.Marshal(out)
+	s.mu.Unlock()
+	if err != nil {
+		http.Error(w, "marshal failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, b)
+}
+
+func writeJSON(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
@@ -810,6 +1208,10 @@ func (s *Server) serveState(w http.ResponseWriter, r *http.Request) {
 // serveTask returns one task's heavy detail: full input and output records,
 // every rendered model call, and the event log. This is the lazy half of the
 // constellation — the UI asks for it when a node is opened, not before.
+//
+// ?run= scopes the lookup to one run; without it the search walks the
+// universe newest-first, so a link to a task still resolves after the run
+// that produced it has been left behind.
 func (s *Server) serveTask(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -821,8 +1223,9 @@ func (s *Server) serveTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	n, ok := s.taskIx[id]
+	n := s.findTaskLocked(id, r.URL.Query().Get("run"))
 	var b []byte
+	ok := n != nil
 	if ok {
 		var err error
 		b, err = json.Marshal(TaskDetail{
@@ -839,10 +1242,22 @@ func (s *Server) serveTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown task", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(b)
+	writeJSON(w, b)
+}
+
+func (s *Server) findTaskLocked(id, run string) *Node {
+	if run != "" {
+		if r, ok := s.runIx[run]; ok {
+			return r.taskIx[id]
+		}
+		return nil
+	}
+	for i := len(s.runs) - 1; i >= 0; i-- {
+		if n, ok := s.runs[i].taskIx[id]; ok {
+			return n
+		}
+	}
+	return nil
 }
 
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
@@ -863,7 +1278,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
 	sub := &subscriber{ch: make(chan []byte, 512)}
 	s.mu.Lock()
 	s.subs[sub] = struct{}{}
-	first := s.snapshotLocked()
+	first := s.snapshotLocked(s.cur)
 	s.mu.Unlock()
 	s.viewerOnce.Do(func() { close(s.viewer) })
 	defer func() {
@@ -893,7 +1308,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
 			sub.lost = false
 			var snap []byte
 			if lost {
-				snap = s.snapshotLocked()
+				snap = s.snapshotLocked(s.cur)
 			}
 			s.mu.Unlock()
 			if lost {
