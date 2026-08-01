@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -351,6 +352,66 @@ func TestBroadcastInReduceAI(t *testing.T) {
 	}
 	if len(res.Output) != 1 || res.Output[0].String("output") != "ok" {
 		t.Fatalf("tree reduce should collapse to one record: %+v", res.Output)
+	}
+}
+
+// TestReduceTreeFeedsUpperLevels guards the seam between the levels of a
+// reduce tree. Only the bottom level sees the records the stage was pointed
+// at; every level above it sees this stage's own aggregates, which carry
+// OutputField and not the ItemField the leaves were read through. Without the
+// fallback, a reduce with a custom ItemField aggregates blank items above
+// level one — and the run still "succeeds", which is what makes it worth
+// pinning.
+func TestReduceTreeFeedsUpperLevels(t *testing.T) {
+	var mu sync.Mutex
+	var levels []string
+
+	reg := model.NewRegistry()
+	if _, err := model.RegisterMock(reg, "m", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) {
+			items := strings.TrimPrefix(req.Prompt, "Merge:")
+			if strings.TrimSpace(items) == "" {
+				return "", fmt.Errorf("aggregation level received no items: %q", req.Prompt)
+			}
+			mu.Lock()
+			levels = append(levels, items)
+			mu.Unlock()
+			return "[" + strings.TrimSpace(items) + "]", nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+
+	recs := make([]core.Record, 8)
+	for i := range recs {
+		recs[i] = core.NewRecord(fmt.Sprintf("r%d", i),
+			map[string]any{"headline": fmt.Sprintf("h%d", i)})
+	}
+
+	p := pipeline.New("reduce-tree")
+	p.FromRecords("in", recs).ReduceAI("merge", pipeline.ReduceAISpec{
+		Binding:   model.Binding{Model: "m"},
+		Prompt:    `Merge:{{range .Items}} {{.}}{{end}}`,
+		FanIn:     2,
+		ItemField: "headline", // read from the records; written as "output"
+	})
+
+	res, err := loom.Run(context.Background(), p,
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(res.Output) != 1 {
+		t.Fatalf("tree reduce should collapse to one record, got %d", len(res.Output))
+	}
+	// 8 records, fan-in 2: every leaf headline must survive to the root.
+	got := res.Output[0].String("output")
+	for i := range recs {
+		if !strings.Contains(got, fmt.Sprintf("h%d", i)) {
+			t.Errorf("root aggregate lost leaf h%d: %s", i, got)
+		}
+	}
+	if len(levels) != 7 { // 4 + 2 + 1
+		t.Errorf("expected 7 aggregation calls across 3 levels, got %d", len(levels))
 	}
 }
 

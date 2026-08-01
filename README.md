@@ -166,6 +166,13 @@ go run ./examples/constellation   # then open http://localhost:8077
 # for flags (budget squeeze, cache replay) and a recording storyboard
 go run ./examples/research        # then open http://localhost:8077
 
+# a playable web game, planned, written, and shipped by three pipelines —
+# still offline, still free: one task per module, a shared engine contract as
+# the cached prompt prefix, a module cut for needing network the contract
+# doesn't grant, and one self-contained HTML file at the end. The three runs
+# land in one universe; the finished game shows its own build provenance
+go run ./examples/game-forge      # forge on :8077, the game it built on :8078
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -324,7 +331,10 @@ into one. The universe is bounded (12 runs by default, `viz.Retain(n)` to
 change it) — runs are held whole, so the oldest is dropped when a new one
 pushes past the limit.
 
-`go run ./examples/vertical-digest` is the two-run shape end to end.
+`go run ./examples/vertical-digest` is the two-run shape end to end;
+[`examples/game-forge`](./examples/game-forge) is the three-run shape, where
+each run consumes what the last one produced — plan the modules, write them,
+link them into a playable game.
 
 ## Sharing data across tasks
 

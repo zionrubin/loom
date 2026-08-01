@@ -553,7 +553,7 @@ func (e *explainer) infer(sp *plan.StagePlan, input []core.Record, out *StagePro
 
 	shared := model.EstimateTokens(spec.System) +
 		model.EstimateTokens(e.renderPrefix(s.ID, spec.Prefix, spec.Context, sp.Broadcasts))
-	prompts := e.renderPrompts(s.ID, spec.Prompt, input)
+	prompts := e.renderPrompts(s.ID, spec.Prompt, input, sp.Broadcasts)
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
 	e.recs[s.ID] = e.inferOutputs(s, input, expected)
@@ -585,6 +585,10 @@ func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StagePr
 	if itemField == "" {
 		itemField = "output"
 	}
+	outField := spec.OutputField
+	if outField == "" {
+		outField = "output"
+	}
 
 	shared := model.EstimateTokens(spec.System) +
 		model.EstimateTokens(e.renderPrefix(s.ID, spec.Prefix, nil, sp.Broadcasts))
@@ -599,9 +603,15 @@ func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StagePr
 			group := cur[i:min(i+fanIn, len(cur))]
 			items := make([]string, 0, len(group))
 			for _, r := range group {
-				items = append(items, r.String(itemField))
+				// Mirror the operator: above the bottom level the inputs are
+				// this stage's own aggregates, which carry OutputField.
+				item := r.String(itemField)
+				if item == "" && itemField != outField {
+					item = r.String(outField)
+				}
+				items = append(items, item)
 			}
-			prompts = append(prompts, e.renderReducePrompt(s.ID, spec.Prompt, items))
+			prompts = append(prompts, e.renderReducePrompt(s.ID, spec.Prompt, items, sp.Broadcasts))
 		}
 		out.Tasks += groups
 		cur = e.reduceOutputs(s, groups, expected)
@@ -689,12 +699,15 @@ func (e *explainer) renderPrefix(stageID, prefix string, frags []task.Fragment, 
 }
 
 // renderPrompts renders the stage's prompt against every record that will
-// reach it and returns the per-call prompt token counts. When a template
-// cannot render — most often because it reads a field a ParseJSON stage
-// upstream will introduce, whose name no plan knows — it falls back to the
-// template source and says so once.
-func (e *explainer) renderPrompts(stageID, prompt string, input []core.Record) []int {
-	tmpl, err := template.New(stageID).Funcs(pipeline.TemplateFuncs()).
+// reach it and returns the per-call prompt token counts. Broadcast functions
+// are bound to exactly what the stage declared, the way the executor binds
+// them — a taxonomy interpolated into every prompt is usually far larger than
+// the template that reads it, so leaving it unrendered would under-count the
+// stage. When a template cannot render — most often because it reads a field a
+// ParseJSON stage upstream will introduce, whose name no plan knows — it falls
+// back to the template source and says so once.
+func (e *explainer) renderPrompts(stageID, prompt string, input []core.Record, declared map[string]string) []int {
+	tmpl, err := template.New(stageID).Funcs(e.funcs(declared)).
 		Option("missingkey=error").Parse(prompt)
 	if err != nil {
 		e.warnf("stage %q: prompt template does not parse (%v)", stageID, err)
@@ -714,8 +727,8 @@ func (e *explainer) renderPrompts(stageID, prompt string, input []core.Record) [
 	return out
 }
 
-func (e *explainer) renderReducePrompt(stageID, prompt string, items []string) int {
-	tmpl, err := template.New(stageID).Funcs(pipeline.TemplateFuncs()).Parse(prompt)
+func (e *explainer) renderReducePrompt(stageID, prompt string, items []string, declared map[string]string) int {
+	tmpl, err := template.New(stageID).Funcs(e.funcs(declared)).Parse(prompt)
 	if err != nil {
 		e.warnf("stage %q: prompt template does not parse (%v)", stageID, err)
 		return model.EstimateTokens(prompt)
