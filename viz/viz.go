@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -169,6 +170,46 @@ type StageInfo struct {
 	CachedTokens  int     `json:"cachedTokens,omitempty"`
 	WrittenTokens int     `json:"writtenTokens,omitempty"`
 	SavedUSD      float64 `json:"savedUsd,omitempty"`
+
+	// Proj* is this stage's pre-flight projection, present when loom.Explain
+	// published to the same handler as the run. It is what lets a stage be read
+	// against what it was expected to cost while it is still running, rather
+	// than only in hindsight.
+	Proj *StageProjection `json:"proj,omitempty"`
+}
+
+// StageProjection is one stage's forecast, published before the run by
+// loom.Explain. ExpectedUSD carries an assumption about response length;
+// CeilingUSD carries none, because MaxTokens is a cap the provider enforces.
+type StageProjection struct {
+	Calls       int     `json:"calls"`
+	Records     int     `json:"records"`
+	Tokens      int     `json:"tokens"`
+	ExpectedUSD float64 `json:"expectedUsd"`
+	CeilingUSD  float64 `json:"ceilingUsd"`
+	FloorMS     int64   `json:"floorMs,omitempty"`
+	// Estimated marks a stage whose record count was guessed rather than
+	// computed, because a ParseJSON stage upstream invents the fields the
+	// stages below it filter on. Its cost is a guess in both columns.
+	Estimated bool `json:"estimated,omitempty"`
+}
+
+// ProjectionInfo is the run-level forecast: the totals a run was expected to
+// hit, and the budget it was measured against.
+type ProjectionInfo struct {
+	Driver        string  `json:"driver,omitempty"`
+	Calls         int     `json:"calls"`
+	Tokens        int     `json:"tokens"`
+	ExpectedUSD   float64 `json:"expectedUsd"`
+	CeilingTokens int     `json:"ceilingTokens"`
+	CeilingUSD    float64 `json:"ceilingUsd"`
+	FloorMS       int64   `json:"floorMs,omitempty"`
+	BudgetUSD     float64 `json:"budgetUsd,omitempty"`
+	FitsBudget    bool    `json:"fitsBudget"`
+	// Partial means at least one stage was estimated, so CeilingUSD covers
+	// only the stages that could be computed and is not a cap on the run.
+	Partial  bool     `json:"partial,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // BroadcastInfo is the visualized state of one run-level shared value: what
@@ -216,18 +257,20 @@ type Snapshot struct {
 	Tasks      []*Node          `json:"tasks"`
 	Workers    []*WorkerInfo    `json:"workers"`
 	Broadcasts []*BroadcastInfo `json:"broadcasts"`
+	Projection *ProjectionInfo  `json:"projection,omitempty"`
 }
 
 // delta is one incremental update: the run header plus whichever entities
 // the triggering event changed.
 type delta struct {
-	Now       int64          `json:"now"`
-	Reset     bool           `json:"reset,omitempty"`
-	Run       runHeader      `json:"run"`
-	Stage     *StageInfo     `json:"stage,omitempty"`
-	Task      *Node          `json:"task,omitempty"`
-	Worker    *WorkerInfo    `json:"worker,omitempty"`
-	Broadcast *BroadcastInfo `json:"broadcast,omitempty"`
+	Now        int64           `json:"now"`
+	Reset      bool            `json:"reset,omitempty"`
+	Run        runHeader       `json:"run"`
+	Stage      *StageInfo      `json:"stage,omitempty"`
+	Task       *Node           `json:"task,omitempty"`
+	Worker     *WorkerInfo     `json:"worker,omitempty"`
+	Broadcast  *BroadcastInfo  `json:"broadcast,omitempty"`
+	Projection *ProjectionInfo `json:"projection,omitempty"`
 }
 
 const (
@@ -257,6 +300,14 @@ type Server struct {
 	sharedIx map[string]*BroadcastInfo
 	subs     map[*subscriber]struct{}
 
+	// The projection outlives a run reset. It describes the pipeline, and the
+	// run that follows is precisely the thing it predicted, so clearing it at
+	// run.started would discard the comparison exactly when it starts being
+	// worth something. projIx keeps the per-stage forecasts so they can be
+	// reattached to StageInfos the reset threw away.
+	projection *ProjectionInfo
+	projIx     map[string]*StageProjection
+
 	viewer     chan struct{}
 	viewerOnce sync.Once
 
@@ -271,6 +322,7 @@ func New() *Server {
 		taskIx:   map[string]*Node{},
 		workIx:   map[string]*WorkerInfo{},
 		sharedIx: map[string]*BroadcastInfo{},
+		projIx:   map[string]*StageProjection{},
 		subs:     map[*subscriber]struct{}{},
 		viewer:   make(chan struct{}),
 	}
@@ -353,6 +405,40 @@ func (s *Server) Handle(e observe.Event) {
 	case observe.RunFinished:
 		s.run.Done = true
 		s.run.EndedAt = now
+
+	case observe.StageProjected:
+		p := &StageProjection{
+			Calls: e.Usage.Requests, Records: e.Records,
+			Tokens: e.Usage.TotalTokens(), ExpectedUSD: e.Usage.CostUSD,
+			CeilingUSD: e.Ceiling.CostUSD, FloorMS: e.Latency.Milliseconds(),
+			Estimated: e.Note == "estimated",
+		}
+		s.projIx[e.Stage] = p
+		st := s.stageLocked(e.Stage)
+		st.Proj = p
+		// A projection arrives before the run, so it is usually the event that
+		// creates the stage. Seed what it knows; stage.started overwrites it
+		// with the real thing.
+		if st.Kind == "" {
+			st.Kind = e.Kind
+		}
+		d.Stage = st
+
+	case observe.RunProjected:
+		s.projection = &ProjectionInfo{
+			Driver: e.Kind, Calls: e.Usage.Requests,
+			Tokens: e.Usage.TotalTokens(), ExpectedUSD: e.Usage.CostUSD,
+			CeilingTokens: e.Ceiling.TotalTokens(), CeilingUSD: e.Ceiling.CostUSD,
+			FloorMS:   e.Latency.Milliseconds(),
+			BudgetUSD: e.Budget.MaxCostUSD,
+			Partial:   e.Note == "partial",
+			FitsBudget: (e.Budget.MaxCostUSD == 0 || e.Ceiling.CostUSD <= e.Budget.MaxCostUSD) &&
+				(e.Budget.MaxTokens == 0 || e.Ceiling.TotalTokens() <= e.Budget.MaxTokens),
+		}
+		if e.Detail != "" {
+			s.projection.Warnings = strings.Split(e.Detail, "\n")
+		}
+		d.Projection = s.projection
 
 	case observe.StageStarted:
 		st := s.stageLocked(e.Stage)
@@ -512,6 +598,9 @@ func (s *Server) Handle(e observe.Event) {
 	s.broadcastLocked(d)
 }
 
+// resetLocked clears the run. The projection deliberately survives: it
+// describes the pipeline rather than any one run, and the run starting is
+// exactly when the comparison it enables becomes worth something.
 func (s *Server) resetLocked() {
 	s.run = runHeader{}
 	s.stages = nil
@@ -560,7 +649,9 @@ func (s *Server) stageLocked(id string) *StageInfo {
 	if st, ok := s.stageIx[id]; ok {
 		return st
 	}
-	st := &StageInfo{ID: id}
+	// Reattach the forecast a reset dropped, so a re-run against the same
+	// projection still shows expected beside actual.
+	st := &StageInfo{ID: id, Proj: s.projIx[id]}
 	s.stageIx[id] = st
 	s.stages = append(s.stages, st)
 	return st
@@ -646,6 +737,7 @@ func (s *Server) snapshotLocked() []byte {
 		Tasks:      s.tasks,
 		Workers:    s.workers,
 		Broadcasts: s.shared,
+		Projection: s.projection,
 	}
 	if snap.Stages == nil {
 		snap.Stages = []*StageInfo{}

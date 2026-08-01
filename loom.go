@@ -46,6 +46,13 @@ type Config struct {
 	EventHandler    func(observe.Event)
 	Streaming       bool
 	BatchWait       time.Duration
+
+	// Explain-only settings. They configure the pre-flight projection and are
+	// ignored by Run, so one config can describe a run and be asked what that
+	// run would cost.
+	ExpectedOutput float64
+	SourceSamples  map[string][]core.Record
+	StageSamples   map[string]map[string]any
 }
 
 // Option configures a run.

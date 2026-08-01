@@ -37,6 +37,17 @@ const (
 	// BroadcastRead reports a task reaching a shared value, once per task and
 	// name — the "where" of a broadcast, as distinct from the "what".
 	BroadcastRead EventType = "broadcast.read"
+	// StageProjected and RunProjected carry a pre-flight cost projection
+	// (loom.Explain): what a stage and a whole pipeline are expected to spend,
+	// published before anything is spent. They are the only events on this bus
+	// that describe work which has not happened, which is why they carry a
+	// Ceiling beside Usage — one is an estimate, the other a bound.
+	//
+	// Emitting them on the same bus the run uses is what lets an observer hold
+	// both halves of the comparison: point loom.Explain and loom.Run at one
+	// handler and it sees expected against actual, live.
+	StageProjected EventType = "stage.projected"
+	RunProjected   EventType = "run.projected"
 )
 
 // Event is one observation. Fields are populated as relevant per type.
@@ -73,6 +84,14 @@ type Event struct {
 	Saved float64 `json:"saved,omitempty"`
 	Err   string  `json:"err,omitempty"`
 	Note  string  `json:"note,omitempty"`
+	// Ceiling bounds a projection (stage.projected / run.projected): the same
+	// accounting as Usage with every response filling MaxTokens, which the
+	// provider enforces. Usage on those events is the expected case and rests
+	// on an assumption about response length; this rests on nothing.
+	Ceiling core.Usage `json:"ceiling,omitempty"`
+	// Budget is the run budget a projection was measured against
+	// (run.projected), so an observer can say whether it covers the ceiling.
+	Budget core.Budget `json:"budget,omitempty"`
 }
 
 // PayloadCap bounds the large observability payloads (record JSON, prompts,

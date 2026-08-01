@@ -75,6 +75,25 @@ func main() {
 		opts = append(opts, loom.WithStateDir(dir))
 	}
 
+	// Project before running, through the same event handler. The view shows
+	// the forecast while the sky is still empty, then reads every stage against
+	// it as the run fills in — which is the only window in which knowing the
+	// price is still actionable.
+	//
+	// The sample is what makes it exact rather than incomplete: "classify"
+	// parses its output as JSON, so the fields "urgent-only" filters on come
+	// out of the model. Without naming them the filter drops every record here
+	// and the two stages below it project as no work at all.
+	proj, err := loom.Explain(p, append(opts,
+		loom.WithStageSample("classify", map[string]any{
+			"category": "billing", "urgent": true,
+		}))...)
+	if err != nil {
+		fmt.Printf("projection failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print("\n", proj, "\n")
+
 	res, err := loom.Run(ctx, p, opts...)
 	if err != nil {
 		fmt.Printf("\nrun ended with error: %v\n", err)
