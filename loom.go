@@ -244,12 +244,14 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 	}
 	// The driver is part of what a viewer is looking at: the same pipeline
 	// under streaming shows overlapping stages and shared execution slots,
-	// and that is only legible if the view knows which one ran.
-	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID, Kind: driverName})
+	// and that is only legible if the view knows which one ran. The pipeline's
+	// name rides along for the same reason: a process that runs several needs
+	// them told apart by something other than a random run ID.
+	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID, Pipeline: p.Name, Kind: driverName})
 
-	// Announce the shared values after the run header (which resets observer
-	// state) and before any task runs, so a viewer sees what the run agreed to
-	// share before it sees anything read it.
+	// Announce the shared values after the run header (which opens the run in
+	// an observer) and before any task runs, so a viewer sees what the run
+	// agreed to share before it sees anything read it.
 	for _, e := range broadcasts.Entries() {
 		bus.Publish(observe.Event{
 			Type: observe.BroadcastRegistered, RunID: runID,
@@ -269,7 +271,7 @@ func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult,
 	}
 	runErr := run(ctx)
 
-	bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID})
+	bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID, Pipeline: p.Name})
 	res := &RunResult{
 		RunID:        runID,
 		StageOutputs: d.outputs,

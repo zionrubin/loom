@@ -305,7 +305,7 @@ func (p *Projection) publish(fn func(observe.Event)) {
 	// counts were guessed, and a run whose ceiling is therefore not a bound.
 	for _, s := range p.Stages {
 		e := observe.Event{
-			Type: observe.StageProjected, Time: now,
+			Type: observe.StageProjected, Time: now, Pipeline: p.Pipeline,
 			Stage: s.Stage, Kind: s.Kind, Model: s.Model,
 			Records: s.Records, Usage: s.Usage, Ceiling: s.Ceiling,
 			Latency: s.AdmissionFloor,
@@ -315,8 +315,10 @@ func (p *Projection) publish(fn func(observe.Event)) {
 		}
 		fn(e)
 	}
+	// The pipeline's name is what lets an observer holding several forecasts
+	// hand each one to the run it actually predicted.
 	run := observe.Event{
-		Type: observe.RunProjected, Time: now,
+		Type: observe.RunProjected, Time: now, Pipeline: p.Pipeline,
 		Kind: p.Driver, Usage: p.Expected(), Ceiling: p.Ceiling(),
 		Budget: p.Budget, Latency: p.AdmissionFloor(),
 		Detail: strings.Join(p.Warnings, "\n"),

@@ -242,6 +242,18 @@ the built-in collector; non-blocking channels for external consumers). The
 collector folds events into a `RunReport`: per-stage task counts, failures,
 retries, cache hits, token usage, dollar cost, and latency percentiles.
 
+Every event carries the run ID it belongs to, and run-level events carry the
+pipeline's name. That pair is what lets one handler serve several runs: the
+constellation view (`viz`) folds the stream into a *universe* — one run state
+per run ID, retained after the run ends — instead of a single current run that
+`run.started` resets. A process whose work is several pipelines (loom DAGs fan
+out but do not fan back in, so a fan-out and its synthesis are two runs) is
+therefore watchable as a whole, and pipelines running concurrently on one
+handler stay separate rather than interleaving. The universe is bounded by
+run count rather than by age: runs are held whole, so the oldest is dropped
+when a new one pushes past the limit, and the run still receiving events is
+never the one dropped.
+
 ### 4.9 Security
 
 Four cooperating mechanisms, all exercised by tests:

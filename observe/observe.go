@@ -52,24 +52,29 @@ const (
 
 // Event is one observation. Fields are populated as relevant per type.
 type Event struct {
-	Type     EventType `json:"type"`
-	Time     time.Time `json:"time"`
-	RunID    string    `json:"run_id,omitempty"`
-	Stage    string    `json:"stage,omitempty"`
-	Upstream string    `json:"upstream,omitempty"` // stage.started: upstream stage ID
-	Kind     string    `json:"kind,omitempty"`     // stage.started: stage kind (infer, fused, …)
-	Detail   string    `json:"detail,omitempty"`   // stage.started: human-readable stage spec
-	TaskID   string    `json:"task_id,omitempty"`
-	Worker   string    `json:"worker,omitempty"` // scheduler worker executing the task
-	Model    string    `json:"model,omitempty"`
-	Attempt  int       `json:"attempt,omitempty"`
-	Records  int       `json:"records,omitempty"`    // task.scheduled: input record count
-	Input    string    `json:"input,omitempty"`      // task.scheduled: input records JSON (clipped)
-	Output   string    `json:"output,omitempty"`     // task.completed: output records JSON (clipped)
-	InputIDs []string  `json:"input_ids,omitempty"`  // task.scheduled: input record IDs (lineage)
-	OutIDs   []string  `json:"output_ids,omitempty"` // task.completed: output record IDs (lineage)
-	Prompt   string    `json:"prompt,omitempty"`     // model.called: rendered request (clipped)
-	Response string    `json:"response,omitempty"`   // model.called: response text (clipped)
+	Type  EventType `json:"type"`
+	Time  time.Time `json:"time"`
+	RunID string    `json:"run_id,omitempty"`
+	// Pipeline names the pipeline the run (or projection) belongs to. A
+	// process often runs several — a fan-out run and the run that fuses its
+	// results, say — and a run ID alone does not say which is which, so an
+	// observer holding more than one run needs the name to tell them apart.
+	Pipeline string   `json:"pipeline,omitempty"`
+	Stage    string   `json:"stage,omitempty"`
+	Upstream string   `json:"upstream,omitempty"` // stage.started: upstream stage ID
+	Kind     string   `json:"kind,omitempty"`     // stage.started: stage kind (infer, fused, …)
+	Detail   string   `json:"detail,omitempty"`   // stage.started: human-readable stage spec
+	TaskID   string   `json:"task_id,omitempty"`
+	Worker   string   `json:"worker,omitempty"` // scheduler worker executing the task
+	Model    string   `json:"model,omitempty"`
+	Attempt  int      `json:"attempt,omitempty"`
+	Records  int      `json:"records,omitempty"`    // task.scheduled: input record count
+	Input    string   `json:"input,omitempty"`      // task.scheduled: input records JSON (clipped)
+	Output   string   `json:"output,omitempty"`     // task.completed: output records JSON (clipped)
+	InputIDs []string `json:"input_ids,omitempty"`  // task.scheduled: input record IDs (lineage)
+	OutIDs   []string `json:"output_ids,omitempty"` // task.completed: output record IDs (lineage)
+	Prompt   string   `json:"prompt,omitempty"`     // model.called: rendered request (clipped)
+	Response string   `json:"response,omitempty"`   // model.called: response text (clipped)
 	// Broadcast names the shared value on broadcast.* events; Artifact is its
 	// content hash and Bytes its serialized size (broadcast.registered carries
 	// the value itself in Detail, clipped).

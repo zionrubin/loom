@@ -134,7 +134,11 @@ this one, including what is deliberately left out.
   shared occupancy are visible as they happen. Feed it a projection
   (`loom.Explain` on the same handler) and it shows the forecast before the run
   starts, then reads every stage against it live — spend versus projection in
-  the header, and a projected-versus-actual reconciliation in the summary. Heavy per-node payloads
+  the header, and a projected-versus-actual reconciliation in the summary. A
+  process that runs several pipelines gets a **universe** (`u`): every run it
+  has produced, side by side, each one still whole and enterable — so a
+  pipeline that finishes while the next one starts is still there to read.
+  Heavy per-node payloads
   (rendered prompts, responses, record JSON) load only for the node you open,
   which is what keeps the view responsive on runs with thousands of tasks.
 - **Providers** — a deterministic mock (offline dev, scripted failures) plus
@@ -198,7 +202,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
-| `viz` | Constellation view: live web visualization of a run (tasks and executors as stars) |
+| `viz` | Constellation view: live web visualization of a run (tasks and executors as stars), and the universe of every run in the process |
 | `task` | Task + envelope types (serializable — the distribution seam) |
 
 ## Knowing what a run will cost
@@ -288,6 +292,39 @@ projected column plus a projected-versus-actual reconciliation. The projection
 deliberately survives `run.started`: it describes the pipeline, and the run
 that follows is the thing it predicted. `go run ./examples/constellation`
 demonstrates the whole loop.
+
+## Watching more than one pipeline
+
+Most real programs run more than one pipeline: loom DAGs fan out but do not
+fan back in, so a fan-out and the synthesis that fuses its results are two
+runs — and a retry, an A/B, or a nightly loop are more. Point them all at one
+handler and the constellation view keeps a **universe**: one sky per run,
+retained whole, rather than the latest run overwriting the last.
+
+```go
+v := viz.New()                    // viz.New(viz.Retain(30)) to hold more
+url, _ := v.Start("localhost:8077")
+
+loom.Run(ctx, digest,   loom.WithEventHandler(v.Handle), ...)  // run 1
+loom.Run(ctx, overview, loom.WithEventHandler(v.Handle), ...)  // run 2
+```
+
+Press `u` for the overview: every run in the process, named by its pipeline,
+with how it ended, what it cost, and the shape of its stages — click one to
+enter it. `,` and `.` step between runs, `l` jumps to the one still live, and
+each run keeps its own stages, tasks, executors, shared values, prompts, and
+responses, so a finished pipeline stays as inspectable as the running one.
+
+The live view follows new runs as they start, but never out from under you: if
+you are reading a run — its summary open, or a task's prompts on screen — the
+new run waits in the header (`◉ <pipeline> live →`) instead of replacing what
+you were looking at. Events are routed by run ID, so pipelines running
+*concurrently* on one handler land in their own skies rather than interleaving
+into one. The universe is bounded (12 runs by default, `viz.Retain(n)` to
+change it) — runs are held whole, so the oldest is dropped when a new one
+pushes past the limit.
+
+`go run ./examples/vertical-digest` is the two-run shape end to end.
 
 ## Sharing data across tasks
 
