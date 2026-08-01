@@ -13,6 +13,11 @@
 //	OPENAI_API_KEY=sk-... go run ./examples/vertical-digest \
 //	    -messages /path/to/messages -out reports -budget 15
 //
+// Both runs publish to one constellation view, which holds them as two skies
+// in one universe: the digest run stays whole and inspectable after the
+// overview run starts. Press `u` for the overview of both, `,`/`.` to move
+// between them.
+//
 // Sender IDs are anonymized to stable per-day labels (S1, S2, ...) and email
 // addresses in message bodies are redacted before anything leaves the machine.
 package main
@@ -350,7 +355,11 @@ func main() {
 		mu.Unlock()
 	}
 
-	// Constellation view: events from both runs stream to the same page.
+	// Constellation view: events from both runs stream to the same page. The
+	// digest run and the overview run are two separate runs, so the view keeps
+	// them as two skies in one universe — the digest stays whole and
+	// inspectable after the overview starts. Press `u` to see both, `,`/`.`
+	// to move between them.
 	handle := progress
 	var v *viz.Server
 	var vizURL string
@@ -451,7 +460,9 @@ func main() {
 	fmt.Printf("\n--- run report ---\n%s\ntotal spend: $%.4f\n", report, res.Spent.CostUSD+res2.Spent.CostUSD)
 
 	if v != nil {
-		fmt.Printf("\nrun finished — still serving %s (Ctrl-C to exit)\n", vizURL)
+		fmt.Printf("\nboth runs finished — still serving %s\n"+
+			"  press `u` for the universe: the digest run and the overview run, either one still open to inspect\n"+
+			"  (Ctrl-C to exit)\n", vizURL)
 		<-ctx.Done()
 		_ = v.Close()
 	}
