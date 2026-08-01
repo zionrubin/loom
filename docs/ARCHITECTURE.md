@@ -265,6 +265,44 @@ Four cooperating mechanisms, all exercised by tests:
   one record remains. O(log_FanIn n) sequential depth, each level fully
   parallel and cache-eligible.
 
+### 4.11 Projection (`loom.Explain`)
+
+Everything above is measured after the fact. `Explain` is the same accounting
+run forward: it compiles the pipeline exactly as `Run` does, then walks the
+plan computing per-stage call counts, rendered prompt sizes, prompt-cache
+splits, registry-priced cost, and the wall-clock floor the models' per-minute
+limits impose — without issuing a call, resolving a secret, or touching the
+state dir.
+
+It can be sharp rather than heuristic because of the design's own asymmetry:
+pure stages are ordinary Go functions and AI stages are declarative data
+(§4.1), so the projection *executes* the cheap skeleton and models only the
+paid calls. Record counts are exact rather than extrapolated from a
+selectivity guess. Each stage reports an expected cost under one stated
+assumption (response length, the single quantity a plan cannot determine) and a
+ceiling that rests on none, since `MaxTokens` is a provider-enforced cap — so
+the ceiling is what the governor's budget (§4.4) should be set from. Anything
+unknowable becomes a named warning rather than a confident wrong number, which
+is the same principle the prefix-cache accounting follows in reporting
+negative savings while a write is unamortized: state the truth, including when
+it is inconvenient.
+
+The sharpest case of that principle is `ParseJSON`. Its output fields are
+chosen by the model, so a `Filter` below it drops every record during
+projection while keeping them in the run — an under-count, and the only
+direction in which a cost projection is dangerous. Those stages are marked,
+`Projection.Partial()` reports the whole projection as incomplete, and the
+ceiling stops being described as a bound; `loom.WithStageSample` supplies the
+field names and restores exactness.
+
+The projection is published on the event bus (§4.8) as `stage.projected` and
+`run.projected` rather than only returned, which is what lets an observer hold
+both halves of the comparison. Point `Explain` and `Run` at one handler and the
+constellation view (`viz`) shows the forecast before the run exists, then reads
+each stage's live cost against it — the projection deliberately survives
+`run.started`, because it describes the pipeline and the run that follows is
+the thing it predicted.
+
 ## 5. Failure taxonomy (summary)
 
 | Class | Detected by | Recovery |
@@ -314,6 +352,19 @@ and cost-based model routing (route records to cheaper models and escalate
 only the hard ones, the escalation ladder generalized from recovery to
 policy).
 
+**Phase 5 — iteration.** The dimension the DAG cannot express at all: a stage
+cannot look at its own output and decide to run again. Deep research, entity
+resolution, knowledge-graph construction, and refine-until-good are all
+fixpoints, and most are fixpoints over a graph. The proposed primitive is
+bulk-synchronous message passing — Pregel supersteps whose vertex program is a
+model call — which lands on the existing scheduler unchanged (a superstep is a
+stage, a vertex's call is a task) and inherits the four properties that make a
+paid loop safe: dollar-bounded halting, cost per round that *falls* as
+vertices go quiet and their cache keys stop changing, envelope containment for
+a program that discovers its own egress targets, and lineage across hops. The
+full design, the hard parts, and the four-step path are in
+[ITERATION.md](./ITERATION.md).
+
 **Also on the roadmap:**
 - **Semantic caching** — embedding-similarity lookup in front of the exact
   cache for near-duplicate inputs.
@@ -334,11 +385,12 @@ Implemented and tested in this repository: the pipeline API, planner
 executor, capability/secret/egress/broadcast/audit security, CAS + persistent
 cache + lineage, content-hash-referenced broadcast values, shared prompt
 prefixes with provider prompt-cache accounting, streaming (continuously
-batched) execution alongside the barrier driver, event bus + run reports,
-tree AI-reduce, mock, Anthropic, and OpenAI providers, and cross-restart
-cache resume.
+batched) execution alongside the barrier driver, pre-flight cost projection
+(`loom.Explain`), event bus + run reports, tree AI-reduce, mock, Anthropic,
+and OpenAI providers, and cross-restart cache resume.
 
-Designed but not yet implemented: remote executor backends, shared state
+Designed but not yet implemented: iterative/graph execution (phase 5, see
+[ITERATION.md](./ITERATION.md)), remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
 operators, priority/preemptive scheduling, and result-cache eviction. The
 interfaces above are the contract those implementations plug into.

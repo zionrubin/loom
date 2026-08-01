@@ -422,3 +422,97 @@ func TestStartAndClose(t *testing.T) {
 		t.Fatalf("status %d", res.StatusCode)
 	}
 }
+
+// projectionEvents is what loom.Explain publishes: a forecast per stage, then
+// the run-level total, all before the run itself starts.
+func projectionEvents(v *Server) {
+	v.Handle(observe.Event{Type: observe.StageProjected, Stage: "classify", Kind: "infer",
+		Records: 3, Time: at(900),
+		Usage:   core.Usage{InputTokens: 300, OutputTokens: 60, Requests: 3, CostUSD: 0.006},
+		Ceiling: core.Usage{InputTokens: 300, OutputTokens: 300, Requests: 3, CostUSD: 0.020},
+		Latency: 30 * time.Second})
+	v.Handle(observe.Event{Type: observe.RunProjected, Kind: "barrier", Time: at(901),
+		Usage:   core.Usage{InputTokens: 300, OutputTokens: 60, Requests: 3, CostUSD: 0.006},
+		Ceiling: core.Usage{InputTokens: 300, OutputTokens: 300, Requests: 3, CostUSD: 0.020},
+		Budget:  core.Budget{MaxCostUSD: 0.01},
+		Latency: 30 * time.Second,
+		Detail:  "stage \"load\" is a function"})
+}
+
+// TestProjectionBeforeRun checks a projection published ahead of the run lands
+// on the stage it describes and on the run header.
+func TestProjectionBeforeRun(t *testing.T) {
+	v := New()
+	projectionEvents(v)
+
+	if v.projection == nil {
+		t.Fatal("run-level projection was not recorded")
+	}
+	if got, want := v.projection.ExpectedUSD, 0.006; got != want {
+		t.Errorf("expected cost = %v, want %v", got, want)
+	}
+	if got, want := v.projection.CeilingUSD, 0.020; got != want {
+		t.Errorf("ceiling cost = %v, want %v", got, want)
+	}
+	// A $0.01 budget cannot cover a $0.02 ceiling.
+	if v.projection.FitsBudget {
+		t.Error("a budget below the ceiling was reported as covering it")
+	}
+	if len(v.projection.Warnings) != 1 {
+		t.Errorf("warnings = %v, want the one that was published", v.projection.Warnings)
+	}
+	st := v.stageIx["classify"]
+	if st == nil || st.Proj == nil {
+		t.Fatal("stage projection did not reach the stage")
+	}
+	if st.Proj.Calls != 3 || st.Proj.FloorMS != 30_000 {
+		t.Errorf("stage projection = %+v, want 3 calls and a 30s floor", st.Proj)
+	}
+}
+
+// TestProjectionSurvivesRunReset is the property the whole feature rests on:
+// the projection describes the pipeline, and the run that follows is the thing
+// it predicted, so run.started must not throw the comparison away.
+func TestProjectionSurvivesRunReset(t *testing.T) {
+	v := New()
+	projectionEvents(v)
+	feedLifecycle(v)
+
+	if v.projection == nil {
+		t.Fatal("run.started discarded the projection")
+	}
+	st := v.stageIx["classify"]
+	if st == nil || st.Proj == nil {
+		t.Fatal("run.started discarded the stage's projection")
+	}
+	if st.Status == "" {
+		t.Error("the stage lost its live status while regaining its projection")
+	}
+
+	var snap Snapshot
+	if err := json.Unmarshal(v.snapshotLocked(), &snap); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Projection == nil {
+		t.Error("snapshot omitted the projection, so a reconnecting viewer loses it")
+	}
+	for _, s := range snap.Stages {
+		if s.ID == "classify" && s.Proj == nil {
+			t.Error("snapshot omitted the stage's projection")
+		}
+	}
+}
+
+// TestNoProjectionIsAbsentFromSnapshot keeps a run without a projection
+// rendering exactly as it did before the feature existed.
+func TestNoProjectionIsAbsentFromSnapshot(t *testing.T) {
+	v := New()
+	feedLifecycle(v)
+	blob := v.snapshotLocked()
+	if strings.Contains(string(blob), `"projection"`) {
+		t.Errorf("unprojected run carries a projection key:\n%s", blob)
+	}
+	if strings.Contains(string(blob), `"proj"`) {
+		t.Errorf("unprojected stage carries a proj key:\n%s", blob)
+	}
+}
