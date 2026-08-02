@@ -86,15 +86,6 @@ func main() {
 			log.Fatal(err)
 		}
 		fmt.Printf("constellation view: %s\n", vizURL)
-		fmt.Printf("waiting up to %s for a browser (Ctrl-C to abort)…\n", *wait)
-		waitCtx, cancel := context.WithTimeout(context.Background(), *wait)
-		if v.AwaitViewer(waitCtx) {
-			fmt.Println("viewer connected — opening the forge")
-			time.Sleep(800 * time.Millisecond) // a beat, so the empty sky is visible first
-		} else {
-			fmt.Println("no viewer yet — running anyway (the page replays state on connect)")
-		}
-		cancel()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -131,6 +122,12 @@ func main() {
 
 	// --- run 1: design ------------------------------------------------------
 	design := buildDesign(*pitch, lu)
+
+	// Project first, then wait for a browser. The forecast goes out on the same
+	// handler the run will use, so it is already there when the page connects:
+	// the empty sky opens with what the forge is about to cost instead of
+	// "waiting for a run", which is the only window where knowing the price is
+	// still actionable.
 	explain(design, "design", append(base,
 		// The fields the model introduces, named up front: the module
 		// breakdown is what the next stage fans out over, so without this the
@@ -142,6 +139,18 @@ func main() {
 			"accept": []any{"defines one namespace key", "no forbidden API"},
 		}),
 	)...)
+
+	if v != nil {
+		fmt.Printf("waiting up to %s for a browser (Ctrl-C to abort)…\n", *wait)
+		waitCtx, cancel := context.WithTimeout(context.Background(), *wait)
+		if v.AwaitViewer(waitCtx) {
+			fmt.Println("viewer connected — opening the forge")
+			time.Sleep(1500 * time.Millisecond) // a beat, so the forecast is read first
+		} else {
+			fmt.Println("no viewer yet — running anyway (the page replays state on connect)")
+		}
+		cancel()
+	}
 
 	res1, err := loom.Run(ctx, design, base...)
 	if res1 == nil {

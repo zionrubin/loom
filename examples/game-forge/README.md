@@ -114,6 +114,10 @@ go run ./examples/game-forge -budget 0.03 -state /tmp/loom-squeeze
 Each run is projected before it happens (`loom.Explain`, same options, no calls
 issued), so the terminal shows what the build will cost *before* it starts and
 the constellation view reads every stage against that forecast as it fills in.
+The first projection goes out *before* the forge waits for a browser, so the
+page opens on an empty sky already showing what the build is about to cost —
+"Projected: 17 model calls, $0.0277 expected, at most $0.0680" — rather than
+"waiting for a run".
 The projection also says what it could not compute — the `lint` stage is a
 `MapTools`, which needs a provisioned session, so Explain treats it as identity
 and marks what comes after it as estimated rather than quietly guessing.
