@@ -278,6 +278,61 @@ func TestExplainWarnsOnFunctionSource(t *testing.T) {
 
 // TestExplainFlagsUndeclaredBroadcast is the cheapest possible place to find
 // out that a prefix reads a shared value its stage never asked for.
+// TestExplainRendersBroadcastsInPrompts pins the case where getting this wrong
+// is most expensive: a taxonomy interpolated into a per-record prompt is
+// usually far larger than the template that reads it, so a projection that
+// left {{broadcastJSON "..."}} unrendered would measure the template and
+// under-count the stage by the size of the shared value — on every call.
+func TestExplainRendersBroadcastsInPrompts(t *testing.T) {
+	reg, mock := explainRegistry(t)
+	taxonomy := map[string]any{
+		"billing": "invoices, refunds, proration, payment methods",
+		"bug":     "crashes, errors, regressions, data loss",
+		"general": "anything else a human should read",
+	}
+
+	p := pipeline.New("broadcast-prompts")
+	p.FromRecords("tickets", tickets()).
+		Infer("classify", pipeline.InferSpec{
+			Binding:   model.Binding{Tier: model.TierFast},
+			System:    "You classify support tickets.",
+			Prompt:    "Classify against:\n{{broadcastJSON \"taxonomy\"}}\nTicket: {{.subject}}",
+			MaxTokens: explainMaxTokens,
+		}, pipeline.WithBroadcast("taxonomy")).
+		ReduceAI("digest", pipeline.ReduceAISpec{
+			Binding:   model.Binding{Tier: model.TierFast},
+			Prompt:    "Rubric: {{broadcast \"rubric\"}}\nCombine {{.Count}}:\n{{range .Items}}- {{.}}\n{{end}}",
+			FanIn:     2,
+			MaxTokens: explainMaxTokens,
+		}, pipeline.WithBroadcast("rubric"))
+
+	opts := []loom.Option{
+		loom.WithRegistry(reg),
+		loom.WithBroadcast("taxonomy", taxonomy),
+		loom.WithBroadcast("rubric", rubric),
+	}
+	proj, err := loom.Explain(p, append(opts, loom.WithExpectedOutput(explainRatio))...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	if len(proj.Warnings) > 0 {
+		t.Errorf("prompts read only declared broadcasts but the projection warned: %v", proj.Warnings)
+	}
+	if mock.Calls() != 0 {
+		t.Fatalf("Explain issued %d model calls; a projection must not spend", mock.Calls())
+	}
+
+	res, err := loom.Run(context.Background(), p, append(opts, loom.WithRetry(quickRetry()))...)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want, got := res.Report.Totals(), proj.Expected()
+	if got.PromptTokens() != want.PromptTokens() {
+		t.Errorf("projected %d prompt tokens, run sent %d (broadcast bodies unrendered?)",
+			got.PromptTokens(), want.PromptTokens())
+	}
+}
+
 func TestExplainFlagsUndeclaredBroadcast(t *testing.T) {
 	reg, _ := explainRegistry(t)
 	p := pipeline.New("undeclared")

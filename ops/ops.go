@@ -249,7 +249,15 @@ func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Tas
 
 	items := make([]string, 0, len(t.Input))
 	for _, rec := range t.Input {
-		items = append(items, rec.String(itemField))
+		item := rec.String(itemField)
+		if item == "" && itemField != outField {
+			// Only the bottom level of the tree sees the records the stage was
+			// pointed at; every level above it sees this stage's own aggregates,
+			// which carry OutputField. Without this fallback a reduce with a
+			// custom ItemField silently aggregates blanks above level one.
+			item = rec.String(outField)
+		}
+		items = append(items, item)
 	}
 	prefix, err := sharedPrefix(ctx, r.prefix, rt)
 	if err != nil {
