@@ -37,6 +37,12 @@ const (
 	// BroadcastRead reports a task reaching a shared value, once per task and
 	// name — the "where" of a broadcast, as distinct from the "what".
 	BroadcastRead EventType = "broadcast.read"
+	// BlackboardPosted announces one entry appended to a fleet's blackboard: a
+	// conclusion one agent published for later agents to read. It carries no
+	// RunID, because it belongs to the fleet rather than to any single run —
+	// the agent that posted it has usually finished, and the agents that will
+	// read it have not started.
+	BlackboardPosted EventType = "blackboard.posted"
 	// StageProjected and RunProjected carry a pre-flight cost projection
 	// (loom.Explain): what a stage and a whole pipeline are expected to spend,
 	// published before anything is spent. They are the only events on this bus
@@ -78,11 +84,16 @@ type Event struct {
 	// Broadcast names the shared value on broadcast.* events; Artifact is its
 	// content hash and Bytes its serialized size (broadcast.registered carries
 	// the value itself in Detail, clipped).
-	Broadcast string        `json:"broadcast,omitempty"`
-	Artifact  string        `json:"artifact,omitempty"`
-	Bytes     int           `json:"bytes,omitempty"`
-	Usage     core.Usage    `json:"usage,omitempty"`
-	Latency   time.Duration `json:"latency,omitempty"`
+	Broadcast string `json:"broadcast,omitempty"`
+	Artifact  string `json:"artifact,omitempty"`
+	Bytes     int    `json:"bytes,omitempty"`
+	// Topic names the blackboard topic on blackboard.posted, and Posts is how
+	// many entries it holds after the append — together they identify the
+	// snapshot (topic@n) that later agents pin, with Artifact its content hash.
+	Topic   string        `json:"topic,omitempty"`
+	Posts   int           `json:"posts,omitempty"`
+	Usage   core.Usage    `json:"usage,omitempty"`
+	Latency time.Duration `json:"latency,omitempty"`
 	// Saved is what this model call's prompt-prefix cache activity was worth
 	// in dollars against paying the full input rate (model.called). Negative
 	// while a freshly written entry is still unamortized.
