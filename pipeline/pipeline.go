@@ -31,6 +31,10 @@ const (
 	KindInfer    StageKind = "infer"
 	KindReduceAI StageKind = "reduce_ai"
 	KindCombine  StageKind = "combine"
+	// KindIterate is a model operation applied repeatedly under an
+	// algorithm's control until it converges, runs out of rounds, or runs out
+	// of budget. See IterateSpec.
+	KindIterate StageKind = "iterate"
 	// KindFused is produced by the planner: a run of adjacent pure stages
 	// collapsed into one task boundary.
 	KindFused StageKind = "fused"
@@ -193,6 +197,7 @@ type Stage struct {
 
 	Infer   *InferSpec
 	Reduce  *ReduceAISpec
+	Iterate *IterateSpec
 	Combine func(a, b core.Record) (core.Record, error)
 
 	// Fused is populated by the planner for KindFused stages.

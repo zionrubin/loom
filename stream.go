@@ -113,8 +113,12 @@ func (d *driver) streamStage(ctx context.Context, cancel context.CancelCauseFunc
 		d.record(s.ID, recs)
 		emit(recs)
 
-	case pipeline.KindCombine, pipeline.KindReduceAI:
-		// Aggregates need the whole set: drain first, then fold.
+	case pipeline.KindCombine, pipeline.KindReduceAI, pipeline.KindIterate:
+		// Aggregates need the whole set: drain first, then fold. So does an
+		// iterative stage, and for a stronger reason — a message can be
+		// addressed to any vertex, so no vertex's inbox is closed until every
+		// record has arrived. Streaming a superstep would mean running a
+		// vertex before its mail did.
 		input := drain(ctx, pipes[s.ID])
 		if ctx.Err() != nil {
 			return
@@ -252,12 +256,21 @@ func (d *driver) aggregate(ctx context.Context, engine *runtime.Engine,
 	sp *plan.StagePlan, input []core.Record) ([]core.Record, error) {
 
 	s := sp.Stage
-	if s.Kind == pipeline.KindCombine {
+	switch s.Kind {
+	case pipeline.KindCombine:
 		folded, err := foldCombine(s, input)
 		if err != nil {
 			return nil, fmt.Errorf("combine %q: %w", s.ID, err)
 		}
 		return folded, nil
+	case pipeline.KindIterate:
+		// The loop is driver-agnostic: it hands each round's tasks to whatever
+		// runner it is given, and here that is the shared engine, so a
+		// superstep competes for the same slots as every other stage instead
+		// of provisioning its own.
+		return d.iterate(ctx, sp, input, func(ctx context.Context, tasks []task.Task) ([]task.Result, error) {
+			return d.runLevel(ctx, engine, tasks)
+		})
 	}
 
 	fanIn := s.Reduce.FanIn

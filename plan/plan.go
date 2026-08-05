@@ -226,6 +226,54 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 				return nil, err
 			}
 
+		case pipeline.KindIterate:
+			spec := s.Iterate
+			if spec.Algorithm == nil {
+				return nil, fmt.Errorf("stage %q: iterate without an algorithm "+
+					"(try algo.NewBSP, algo.NewRefine, or algo.NewBeam)", s.ID)
+			}
+			// A loop over paid calls with no round cap is the one authoring
+			// error whose cost is unbounded, and compilation is the last point
+			// at which catching it is free.
+			if spec.Halt.MaxRounds <= 0 {
+				return nil, fmt.Errorf("stage %q: iterate needs Halt.MaxRounds > 0", s.ID)
+			}
+			if spec.Step.Prompt == "" {
+				return nil, fmt.Errorf("stage %q: empty prompt template", s.ID)
+			}
+			if _, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(spec.Step.Prompt); err != nil {
+				return nil, fmt.Errorf("stage %q: prompt template: %w", s.ID, err)
+			}
+			if spec.Step.Prefix != "" {
+				if _, err := template.New(s.ID + ".prefix").Funcs(pipeline.TemplateFuncs()).
+					Parse(spec.Step.Prefix); err != nil {
+					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
+				}
+			}
+			cands, err := reg.Candidates(spec.Step.Binding)
+			if err != nil {
+				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			sp.Candidates = cands
+			sp.Cacheable = !s.Opts.NoCache
+			// The algorithm is deliberately absent from the fingerprint. It
+			// decides which vertices run and what they carry, and both of
+			// those are already in the task's cache key — the key is the
+			// record plus its inbox. Two stages whose steps are identical
+			// genuinely perform the same operation on a given (state, inbox),
+			// whatever routed the messages there, so they should share a
+			// cached result. Hashing the algorithm in would break that reuse
+			// to record something no consumer of the fingerprint needs.
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Step.Prefix,
+				"iterate", bindingKey(spec.Step.Binding), spec.Step.System,
+				spec.Step.Prompt, spec.Step.MaxTokens, spec.Step.ParseJSON,
+				spec.Step.OutputField, fragmentKey(spec.Step.Context),
+				s.Opts.Version)...)
+			if err != nil {
+				return nil, err
+			}
+
 		case pipeline.KindFused:
 			var names []string
 			for _, r := range s.Fused {
@@ -403,6 +451,15 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 	case pipeline.KindReduceAI:
 		binding = s.Reduce.Binding
 		ctxBundle = task.ContextBundle{System: s.Reduce.System}
+	case pipeline.KindIterate:
+		// Every round of the loop runs under one envelope, assembled once
+		// from the step's binding. A vertex program that discovers its own
+		// next target therefore discovers it inside a grant set and an egress
+		// allowlist fixed before the first round — which is the property that
+		// makes a self-directed loop safe to run at all.
+		binding = s.Iterate.Step.Binding
+		ctxBundle = task.ContextBundle{
+			System: s.Iterate.Step.System, Fragments: s.Iterate.Step.Context}
 	}
 	for _, info := range sp.Candidates {
 		caps = append(caps, security.ModelCap(info.ID))
@@ -488,6 +545,8 @@ func (sp *StagePlan) BuildTasksBatch(runID string, input []core.Record, batch in
 		maxTokens = sp.Stage.Infer.MaxTokens
 	case pipeline.KindReduceAI:
 		maxTokens = sp.Stage.Reduce.MaxTokens
+	case pipeline.KindIterate:
+		maxTokens = sp.Stage.Iterate.Step.MaxTokens
 	}
 	if maxTokens <= 0 {
 		maxTokens = 1024

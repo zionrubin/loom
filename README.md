@@ -75,6 +75,20 @@ Continuum — and says which rows are honestly still empty.
   AI-native `Infer` (templated per-record inference, JSON parsing,
   validation) and `ReduceAI` (parallel tree aggregation). Branching builds
   DAGs; the planner fuses adjacent pure stages.
+- **Iteration, with a pluggable algorithm** — `pipeline.Iterate` runs a model
+  operation over a record set repeatedly, and `algo.Algorithm` decides what
+  "repeatedly" means: two methods over plain data that return the messages
+  making up the next round, and no messages when it has converged. Three ship —
+  `BSP` (Pregel message passing over a graph), `Refine` (a record critiquing
+  itself), `Beam` (frontier search that grows its own graph). A round is an
+  ordinary stage batch through the ordinary scheduler, so retries, escalation,
+  admission control and the governor apply to a superstep for free. The economics
+  invert the usual ones: a vertex's cache key is its state and its inbox rather
+  than the round it is in, so **cost per round falls as the loop converges**, and
+  a vertex that has already seen its input is not scheduled at all. Three bounds
+  always apply — quiet, a round cap, a stage budget — and the stage reports which
+  one stopped it, because converging and running out of money produce identical
+  records.
 - **Least-privilege task envelopes** — every task carries an explicit,
   serializable declaration of its model binding, capability grants, secret
   references, egress allowlist, context bundle, budget, and sandbox
@@ -181,6 +195,17 @@ cd loom
 go test ./...            # full suite, no network or keys needed
 go run ./examples/triage # complete pipeline on a mock model, offline
 
+# iteration: a research question answered by walking a citation graph the
+# model chooses as it goes. The frontier grows while discovering and shrinks
+# while converging (2 → 4 → 3 → 2 → 1); one cited paper is outside the corpus
+# and the walk creates it; the conclusion is three hops from anything the
+# question named. Prints the projection first, then what the run actually spent
+go run ./examples/multi-hop
+
+# the same, twice, to see a converged loop replay for nothing
+go run ./examples/multi-hop -state /tmp/loom-hop
+go run ./examples/multi-hop -state /tmp/loom-hop   # 0 tokens, $0.0000
+
 # live constellation view: watch a run as a sky of task/executor stars —
 # pulsing while running, ringed when slow, flashing on completion, red on
 # failure; click any star for model, input, tokens, cost, retries, and logs
@@ -232,6 +257,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 |---|---|
 | `core` | Records, usage/cost accounting, budgets, failure taxonomy |
 | `pipeline` | Authoring API: datasets, stages, options |
+| `algo` | The algorithm seam: the `Algorithm` interface an iterative stage plugs in, plus BSP, refine and beam |
 | `plan` | Validation, fusion, fingerprints, least-privilege envelopes |
 | `runtime` | Scheduler, retries, rate-limit admission, budget governor, and the slot pool that admits a fleet's agents by attained service |
 | `executor` | Executor seam, capability-scoped runtime, model client, tools |
@@ -543,18 +569,25 @@ and the inference-engine lineage — what Loom borrows from vLLM/SGLang and
 what it deliberately leaves out — in [docs/INFERENCE.md](docs/INFERENCE.md) for
 the call and [docs/ASYNC.md](docs/ASYNC.md) for the program.
 
-The dimension Loom does not yet have is **iteration**: records flow forward
-once, so nothing can look at a stage's output and decide to go around again.
-That rules out the workloads people most want — deep research, entity
-resolution, knowledge-graph construction, refine-until-good — all of which are
-loops, and most of which are loops over a graph.
+The dimension Loom was missing longest was **iteration**: records flowed
+forward once, so nothing could look at a stage's output and decide to go around
+again — which ruled out the workloads people most want, deep research, entity
+resolution, knowledge-graph construction and refine-until-good, all of which are
+loops and most of which are loops over a graph.
 [docs/ITERATION.md](docs/ITERATION.md) makes the case that Loom is the only
-place this can be built *safely* (the governor bounds a loop in dollars,
-content-addressed caching makes cost per round *fall* as it converges,
-envelopes contain a program that discovers its own egress targets, and lineage
-is the only way to audit six hops of model-derived inference), sketches the
-primitive — Pregel supersteps whose vertex program is a model call — and lays
-out the four steps to get there, the first of which is `loom.Explain` above.
+place this can be built *safely*: the governor bounds a loop in dollars,
+content-addressed caching makes cost per round *fall* as it converges, envelopes
+contain a program that discovers its own targets, and lineage is the only way to
+audit six hops of model-derived inference.
+
+It is now built, and one step further than that document proposed. Rather than a
+graph operator, `pipeline.Iterate` is an operator whose *control flow* is a
+plug-in — so Pregel is one algorithm among several rather than the only shape
+available, and writing a new one is two pure methods that need neither a model
+nor a scheduler to test. [docs/ALGORITHMS.md](docs/ALGORITHMS.md) is the design;
+`examples/multi-hop` is it answering a research question by walking a citation
+graph the model chooses as it goes, reaching a conclusion three hops from
+anything the question named.
 
 ## Demo
 
