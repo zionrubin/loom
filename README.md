@@ -59,6 +59,16 @@ cache sharing and continuous batching — and
 [docs/INFERENCE.md](docs/INFERENCE.md) maps the rest of that playbook onto
 this one, including what is deliberately left out.
 
+That literature has since moved up an altitude, to serving *programs* rather
+than requests — where the unit a caller waits on is a whole multi-call
+trajectory and the resources it needs are shared rather than owned. Loom follows
+it there with `loom.Fleet`: many pipelines running at once as one engine, with
+one quota, one ceiling, one cache, slots admitted fairly between them, and a
+blackboard they use to reach each other's conclusions.
+[docs/ASYNC.md](docs/ASYNC.md) maps that half of the playbook — Autellix's
+attained-service scheduling, Parrot's application-level view, Kairos, Astraea,
+Continuum — and says which rows are honestly still empty.
+
 ## What you get
 
 - **Declarative pipelines** — `Map` / `Filter` / `FlatMap` / `Combine` plus
@@ -110,6 +120,23 @@ this one, including what is deliberately left out.
   the workers behind it, and aggregates (`Combine`, `ReduceAI`) remain the
   natural barriers they have to be. The trade is ordering — records flow in
   completion order — so the barrier driver stays the default.
+- **Fleets — many agents on one engine** — `loom.Fleet` runs any number of
+  pipelines at once and holds the things that were never properties of a
+  pipeline in the first place: **one** rate limiter (a quota belongs to an
+  account), **one** budget governor (`WithFleetBudget` — a ceiling enforced per
+  pipeline is a ceiling multiplied by pipelines), **one** content-addressed
+  cache (an agent replays a sibling's completed work for free), and **one** set
+  of execution slots. Slots are not first-come-first-served: a contended slot
+  goes to the agent whose *program* has been served least, so a three-call
+  summary overtakes a 10,000-record sweep instead of queueing behind it —
+  Autellix's attained-service scheduling, one altitude up — with an aging rule
+  bounding how long a heavily served agent can be held back. Agents coordinate
+  through a **blackboard**: append-only, versioned topics that `Fleet.Post`
+  appends to and later agents read, snapshotted by content hash so a post cannot
+  disturb a running agent, and so the reader's cache key changes when the board
+  does. `loom.Run` is a fleet of one, built through the same path. The fleet
+  report gives each agent its completion time next to the slot-time it was
+  given. See [docs/ASYNC.md](docs/ASYNC.md).
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
@@ -166,6 +193,12 @@ go run ./examples/constellation   # then open http://localhost:8077
 # for flags (budget squeeze, cache replay) and a recording storyboard
 go run ./examples/research        # then open http://localhost:8077
 
+# a fleet: six agents at once on one engine, sharing slots, quota, ceiling and
+# cache, coordinating through a blackboard. Three short agents launched after a
+# 60-task sweep still finish in half its time; a seventh run of the sweep's own
+# input costs zero calls. Ends with the fleet report
+go run ./examples/newsroom        # then open http://localhost:8077, press `u`
+
 # a playable web game, planned, written, and shipped by three pipelines —
 # still offline, still free: one task per module, a shared engine contract as
 # the cached prompt prefix, a module cut for needing network the contract
@@ -200,7 +233,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `core` | Records, usage/cost accounting, budgets, failure taxonomy |
 | `pipeline` | Authoring API: datasets, stages, options |
 | `plan` | Validation, fusion, fingerprints, least-privilege envelopes |
-| `runtime` | Scheduler, retries, rate-limit admission, budget governor |
+| `runtime` | Scheduler, retries, rate-limit admission, budget governor, and the slot pool that admits a fleet's agents by attained service |
 | `executor` | Executor seam, capability-scoped runtime, model client, tools |
 | `ops` | Operation runners (infer, reduce, fused transforms) |
 | `model` | Provider abstraction, registry, tiers, escalation bindings, mock |
@@ -300,13 +333,79 @@ deliberately survives `run.started`: it describes the pipeline, and the run
 that follows is the thing it predicted. `go run ./examples/constellation`
 demonstrates the whole loop.
 
-## Watching more than one pipeline
+## Running more than one pipeline: fleets
 
-Most real programs run more than one pipeline: loom DAGs fan out but do not
-fan back in, so a fan-out and the synthesis that fuses its results are two
-runs — and a retry, an A/B, or a nightly loop are more. Point them all at one
-handler and the constellation view keeps a **universe**: one sky per run,
-retained whole, rather than the latest run overwriting the last.
+Most real programs run more than one pipeline. Loom DAGs fan out but do not fan
+back in, so a fan-out and the synthesis that fuses its results are two runs —
+and a retry, an A/B, or a nightly loop are more.
+
+`loom.Run` provisions everything a pipeline needs and releases it afterwards,
+which is right for one pipeline and wrong for several, because none of what it
+provisions is a property of a pipeline. A rate limit belongs to an *account*, a
+dollar ceiling to a *wallet*, a cache to *work already done*. Two `Run` calls
+give you two of each, and every duplicate is a bug waiting for load: together
+they exceed a limit neither individually violates, each enforces a ceiling so
+neither enforces yours, neither can replay the other's work, and nothing
+schedules them against each other.
+
+A **fleet** holds those once and lends them to every agent on it:
+
+```go
+fleet, _ := loom.NewFleet(
+    loom.WithRegistry(reg),
+    loom.WithWorkers(8),                               // slots for the whole fleet
+    loom.WithFleetBudget(core.Budget{MaxCostUSD: 20}), // one ceiling, every agent
+    loom.WithStateDir("./state"),                      // one cache, every agent
+    loom.WithEventHandler(v.Handle),                   // one universe in the view
+    loom.WithTopic("findings"),                        // a board they can read
+)
+defer fleet.Close()
+
+desk := fleet.Go(ctx, wireDesk())          // returns immediately
+for _, b := range beats {
+    fleet.Go(ctx, beatPipeline(b))         // all running at once
+}
+
+// Fan-in, which a single DAG cannot express: each beat posts as it lands, and
+// the synthesis reads the snapshot — pinned by content hash, so its cache key
+// changes when the board does.
+fleet.Await(ctx, "findings", len(beats))
+page, _ := fleet.Run(ctx, frontPage())
+
+fmt.Print(fleet.Report())
+```
+
+Slots go to the agent whose program has been served least rather than the one
+that queued first, so a short agent overtakes a long one instead of inheriting
+its completion time. The report shows both halves of that — `service` is the
+slot-time an agent was given, `jct` what a caller waited:
+
+```
+fleet  6 agents · 6 slots · 4.096s
+agent                stages  tasks   tokens   cost($)   service      wait       jct
+wire-desk                 2     60     5166    0.0070   12.833s    3.913s    4.093s
+beat-markets              3      7      426    0.0025    3.434s     1.33s    2.396s
+beat-policy               3      7      424    0.0025      3.4s    1.425s    2.379s
+beat-tech                 3      7      417    0.0024    3.307s    1.474s    2.346s
+front-page                2      1      208    0.0083    1.363s      19ms    1.382s
+wire-recheck              2     60        0    0.0000       8ms        0s       2ms
+slots 6 occupied 99% of 4.096s · 142 tasks admitted
+fleet budget $5.0000, spent $0.0226 (0%) across every agent
+blackboard: 1 topic(s), 3 post(s), read by reference
+```
+
+The beats were launched *after* the 60-task wire desk had claimed every slot and
+still finished in roughly half its time; `wire-recheck` reran the desk's whole
+input for zero model calls, because the cache belongs to the fleet rather than
+to the run that filled it. [`examples/newsroom`](./examples/newsroom) is that
+run end to end, offline, and [docs/ASYNC.md](docs/ASYNC.md) is the design.
+
+### Watching them
+
+Point every agent at one handler and the constellation view keeps a
+**universe**: one sky per run, retained whole, rather than the latest run
+overwriting the last. A fleet does this by construction, since it publishes
+every agent onto one bus.
 
 ```go
 v := viz.New()                    // viz.New(viz.Retain(30)) to hold more
@@ -429,13 +528,20 @@ caches warm.
 
 - Both drivers execute tasks through the same `Scheduler.RunTask`, so retry,
   escalation, admission control, and the budget governor cannot drift between
-  barrier and streaming execution.
+  barrier and streaming execution. `loom.Run` is a fleet of one, built through
+  the same construction path, so what a run and an agent share cannot drift
+  either.
+- A fleet's agents coordinate at agent boundaries, not inside a task. A task
+  that could publish mid-run would make its own cached result depend on
+  execution order, and a task replayed from cache would not publish at all — so
+  the board's contents would depend on how warm the cache happened to be.
 
 The scaling path (remote worker fleets, shared object-store CAS, WASM
 sandboxes with grant-derived imports) is laid out in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distributed-system),
 and the inference-engine lineage — what Loom borrows from vLLM/SGLang and
-what it deliberately leaves out — in [docs/INFERENCE.md](docs/INFERENCE.md).
+what it deliberately leaves out — in [docs/INFERENCE.md](docs/INFERENCE.md) for
+the call and [docs/ASYNC.md](docs/ASYNC.md) for the program.
 
 The dimension Loom does not yet have is **iteration**: records flow forward
 once, so nothing can look at a stage's output and decide to go around again.

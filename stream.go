@@ -45,7 +45,13 @@ func (d *driver) stream(ctx context.Context) error {
 	if workers <= 0 {
 		workers = 8
 	}
+	// On a fleet the pool is shared with every other agent, so the slots this
+	// run claims are slots another run cannot — which is the point. Alone, the
+	// engine provisions its own and the fairness policy is inert.
 	engine := runtime.NewEngine(&d.sched, workers)
+	if d.pool != nil {
+		engine = runtime.NewEngineOn(d.pool, &d.sched)
+	}
 
 	// One pipe per stage, created up front so a producer never races its
 	// consumer's construction. Each pipe has exactly one writer: a stage's

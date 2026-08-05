@@ -21,13 +21,20 @@ the ones that aren't — says why not.
 | **Continuous batching** — a finished sequence leaves the batch immediately; a waiting one takes its slot | Head-of-line blocking; idle capacity behind a straggler | **Streaming driver** — records flow downstream on completion, stages overlap, one global slot pool | ✅ `loom.WithStreaming` |
 | **Chunked prefill / scheduling budget** — admit work against a token budget | Overrunning provider or device limits | Per-model token-bucket admission control (requests/min and tokens/min) | ✅ `runtime` |
 | **Speculative decoding** — a cheap draft model proposes, a strong one verifies | Paying frontier-model prices for easy tokens | Escalation ladder: run cheap, escalate on *semantically* invalid output | ✅ `runtime`, `model` |
-| **Preemption / priority scheduling** | Fairness and tail latency across tenants | Not implemented — FIFO within the slot pool | ❌ |
+| **Priority scheduling** — order work so short jobs are not stuck behind long ones | Fairness and completion time across tenants | **Program-fair admission** — `runtime.Pool` admits a contended slot to the agent with the least attained service | ✅ `runtime/pool.go` |
+| **Preemption** — evict work already running | Tail latency under contention | Not implemented — a task that has been admitted runs to completion | ❌ |
 | **KV cache eviction (LRU)** | Bounded cache memory | Not implemented — the result cache is unbounded | ❌ |
 | **Disaggregated prefill/decode** | Different hardware profiles per phase | No analog — Loom does not own the decode loop | n/a |
 
-Two entries in that table were the gaps this work closed, and they are the
-two the serving world talks about most: sharing the prefix, and never
-waiting on a barrier.
+Two entries in that table were the gaps the prefix/streaming work closed, and
+they are the two the serving world talks about most: sharing the prefix, and
+never waiting on a barrier.
+
+A third — priority scheduling — was closed later, and it belongs to a different
+altitude. It only means anything once more than one pipeline is in flight, and
+[ASYNC.md](./ASYNC.md) is about that level: the program rather than the call as
+the unit of scheduling, one quota and one ceiling across concurrent agents, and
+the blackboard they use to reach each other's conclusions.
 
 ---
 
@@ -177,11 +184,13 @@ governor cannot drift between them.
 
 ## What is deliberately not here
 
-**Preemption and priority.** Serving engines preempt low-priority sequences
-to bound tail latency across tenants. Loom's slot pool is FIFO. This matters
-for a multi-tenant deployment and not much for a single run, so it belongs
-with the remote-executor work, where a shared admission service is the right
-place to enforce it.
+**Preemption.** Serving engines preempt low-priority sequences mid-flight to
+bound tail latency. Loom's unit of admission is a whole model call, and
+cancelling one wastes what it has already spent — so fairness is enforced
+*between* calls instead, which bounds waiting rather than tail latency. Priority
+between concurrent pipelines is implemented (see
+[ASYNC.md](./ASYNC.md#admitting-slots-by-attained-service)); preemption within
+one is not.
 
 **Cache eviction.** The result cache is unbounded, which is correct for a
 run and wrong for a long-lived worker fleet. Bounding it means an eviction
