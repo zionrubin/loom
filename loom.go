@@ -12,7 +12,6 @@ package loom
 import (
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -22,7 +21,6 @@ import (
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
-	"github.com/zionrubin/loom/ops"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
 	"github.com/zionrubin/loom/runtime"
@@ -43,9 +41,14 @@ type Config struct {
 	ContinueOnError bool
 	Tools           []executor.Tool
 	Broadcasts      map[string]any
+	Topics          map[string]bool
 	EventHandler    func(observe.Event)
 	Streaming       bool
 	BatchWait       time.Duration
+	// AdmissionAging tunes a fleet's slot-admission fairness (zero = the
+	// runtime default). It has no effect on a single Run, whose tasks all
+	// belong to one program and therefore tie.
+	AdmissionAging float64
 
 	// Explain-only settings. They configure the pre-flight projection and are
 	// ignored by Run, so one config can describe a run and be asked what that
@@ -120,6 +123,46 @@ func WithBroadcast(name string, value any) Option {
 	}
 }
 
+// WithFleetBudget caps what a whole fleet may spend, across every agent on it.
+//
+// It is WithRunBudget under the name that says what it means on a fleet: the
+// governor is shared, so the ceiling is the fleet's rather than each agent's.
+// That distinction is the reason a fleet exists — a budget enforced once per
+// pipeline is not a budget on the work, it is a budget multiplied by however
+// many pipelines happen to be running.
+func WithFleetBudget(b core.Budget) Option { return WithRunBudget(b) }
+
+// WithAdmissionAging tunes how fast a fleet's queued tasks earn priority
+// credit for waiting (default runtime.DefaultAging).
+//
+// A fleet admits a contended slot to the agent that has been served least, so
+// a short agent overtakes a long one instead of queueing behind it. Aging is
+// what bounds the other side of that trade: an agent is held back by at most
+// its own attained service divided by this rate, however many fresh agents
+// arrive while it waits. Raise it for a fleet that agents keep joining
+// indefinitely, where the incumbents need protecting; leave it alone for a
+// fleet whose agents are launched together and drain.
+func WithAdmissionAging(rate float64) Option {
+	return func(c *Config) { c.AdmissionAging = rate }
+}
+
+// WithTopic declares a blackboard topic on a fleet, so an agent may read it
+// before anything has been posted to it.
+//
+// Posting to a topic declares it too (see Fleet.Post). Declaring it up front is
+// for the agent that runs first: it should find an empty board rather than fail
+// to compile against a name nobody has defined yet.
+func WithTopic(names ...string) Option {
+	return func(c *Config) {
+		if c.Topics == nil {
+			c.Topics = map[string]bool{}
+		}
+		for _, n := range names {
+			c.Topics[n] = true
+		}
+	}
+}
+
 // WithStreaming replaces the stage-barrier driver with pipelined execution:
 // a record becomes eligible for the next stage the moment its own task
 // completes, instead of when its whole stage does.
@@ -166,126 +209,25 @@ type RunResult struct {
 
 // Run executes a pipeline to completion (or budget/failure abort, in which
 // case partial results are returned along with the error).
+//
+// Everything a run needs is provisioned for it and released afterwards: a rate
+// limiter, a budget governor, a result cache, a set of execution slots. That is
+// the right scope for one pipeline. When a process runs several at once those
+// same things need to be shared instead — one quota, one ceiling, one cache,
+// one bounded set of slots scheduled fairly between them — which is what a
+// Fleet is. Run is a fleet of one, built through the same path so the two
+// cannot drift apart.
 func Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*RunResult, error) {
 	cfg := Config{Workers: 8, Retry: runtime.DefaultRetry}
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if cfg.Registry == nil {
-		cfg.Registry = model.NewRegistry()
-	}
-
-	// --- Wiring ---------------------------------------------------------
-	bus := observe.NewBus()
-	defer bus.Close()
-	collector := observe.NewCollector()
-	bus.On(collector.Handle)
-	if cfg.EventHandler != nil {
-		bus.On(cfg.EventHandler)
-	}
-
-	audit := &security.AuditLog{}
-	broker := security.NewStaticBroker(cfg.Secrets, audit)
-	lineage := &store.Lineage{}
-
-	casDir, cacheDir := "", ""
-	if cfg.StateDir != "" {
-		casDir = cfg.StateDir + "/cas"
-		cacheDir = cfg.StateDir
-	}
-	cas, err := store.NewCAS(casDir)
+	h, err := newHost(cfg)
 	if err != nil {
 		return nil, err
 	}
-	cache, err := store.NewCache(cas, cacheDir)
-	if err != nil {
-		return nil, err
-	}
-	defer cache.Close()
-
-	// Broadcasts are stored once, before anything runs: from here on tasks
-	// carry content hashes, not copies.
-	broadcasts := store.NewBroadcasts(cas)
-	for _, name := range slices.Sorted(maps.Keys(cfg.Broadcasts)) {
-		if _, err := broadcasts.Register(name, cfg.Broadcasts[name]); err != nil {
-			return nil, err
-		}
-	}
-
-	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(broadcasts.Hashes()))
-	if err != nil {
-		return nil, err
-	}
-	runners, err := ops.BuildRunners(pl)
-	if err != nil {
-		return nil, err
-	}
-
-	client := &executor.ModelClient{Registry: cfg.Registry, Broker: broker, Audit: audit, Bus: bus}
-	local := &executor.Local{
-		Runners: runners, Client: client, Tools: executor.NewToolSet(cfg.Tools...),
-		Broadcasts: broadcasts,
-		Audit:      audit, Cache: cache, Lineage: lineage, Bus: bus,
-	}
-	governor := runtime.NewGovernor(cfg.RunBudget)
-	limiter := runtime.NewRateLimiter()
-
-	sched := runtime.Scheduler{
-		Workers: cfg.Workers, Retry: cfg.Retry, Limiter: limiter,
-		Governor: governor, Registry: cfg.Registry, Exec: local, Bus: bus,
-		ContinueOnError: cfg.ContinueOnError,
-	}
-
-	// --- Drive stages in topological order ------------------------------
-	runID := core.NewID("run")
-	driverName := "barrier"
-	if cfg.Streaming {
-		driverName = "streaming"
-	}
-	// The driver is part of what a viewer is looking at: the same pipeline
-	// under streaming shows overlapping stages and shared execution slots,
-	// and that is only legible if the view knows which one ran. The pipeline's
-	// name rides along for the same reason: a process that runs several needs
-	// them told apart by something other than a random run ID.
-	bus.Publish(observe.Event{Type: observe.RunStarted, RunID: runID, Pipeline: p.Name, Kind: driverName})
-
-	// Announce the shared values after the run header (which opens the run in
-	// an observer) and before any task runs, so a viewer sees what the run
-	// agreed to share before it sees anything read it.
-	for _, e := range broadcasts.Entries() {
-		bus.Publish(observe.Event{
-			Type: observe.BroadcastRegistered, RunID: runID,
-			Broadcast: e.Name, Artifact: e.Hash, Bytes: e.Bytes,
-			Detail: observe.Clip(e.JSON),
-		})
-	}
-
-	d := &driver{
-		plan: pl, runID: runID, cfg: cfg, sched: sched, bus: bus,
-		outputs: map[string][]core.Record{},
-	}
-
-	run := d.barrier
-	if cfg.Streaming {
-		run = d.stream
-	}
-	runErr := run(ctx)
-
-	bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID, Pipeline: p.Name})
-	res := &RunResult{
-		RunID:        runID,
-		StageOutputs: d.outputs,
-		Report:       collector.Report(),
-		Failures:     d.failures,
-		Lineage:      lineage.Entries(),
-		Audit:        audit.Entries(),
-		Broadcasts:   broadcasts.Hashes(),
-		Spent:        governor.Spent(),
-	}
-	if term := pl.Terminal(); len(term) == 1 {
-		res.Output = d.outputs[term[0]]
-	}
-	return res, runErr
+	defer h.close()
+	return h.launch(ctx, core.NewID("run"), p, h.cfg, nil)
 }
 
 // driver holds the state a run's execution strategy accumulates. Both
@@ -298,6 +240,9 @@ type driver struct {
 	cfg   Config
 	sched runtime.Scheduler
 	bus   *observe.Bus
+	// pool, when set, is the slot pool this run shares with the other agents
+	// of a fleet. Nil means the streaming driver provisions its own.
+	pool *runtime.Pool
 
 	mu       sync.Mutex
 	outputs  map[string][]core.Record

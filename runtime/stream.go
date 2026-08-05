@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -15,40 +14,46 @@ import (
 //
 // Where Scheduler.ExecuteAll owns a batch from first task to last — every
 // worker idle until the whole stage is submitted, and the stage unfinished
-// until its slowest task returns — an Engine holds a fixed set of execution
+// until its slowest task returns — an Engine draws on a Pool of execution
 // slots that any stage may claim at any time. A task becomes eligible the
 // moment its input record exists, and a freed slot goes to whatever work is
 // waiting, which may belong to a stage that started long after the one still
 // draining. That is the difference between running a pipeline as a sequence
 // of barriers and running it as one continuously-fed engine.
 //
-// The slot count is the run's concurrency ceiling. Admission control, the
+// The pool's slot count is the concurrency ceiling. Admission control, the
 // budget governor, and class-aware recovery are unchanged: Engine delegates
 // each task to the same Scheduler.RunTask that the batch path uses, so a
 // task cannot tell which driver submitted it.
+//
+// A pool may be shared by several engines, which is how a fleet of concurrent
+// pipelines occupies one bounded set of slots instead of one set each. When it
+// is, admission stops being first-come-first-served and starts being fair
+// across programs — see Pool.
 type Engine struct {
 	sched *Scheduler
-	// slots holds the names of the free execution slots. Taking a slot is
-	// both the admission gate and the assignment of an identity: the name
-	// travels with the task as its executor, so occupancy is observable —
-	// which slot ran what, and how busy each one stayed — exactly as it is
-	// for the batch path's named workers.
-	slots chan string
+	pool  *Pool
 
 	wg sync.WaitGroup
 }
 
-// NewEngine returns an engine with n execution slots, backed by sched.
+// NewEngine returns an engine with a private pool of n execution slots.
 func NewEngine(sched *Scheduler, n int) *Engine {
-	if n <= 0 {
-		n = 8
-	}
-	slots := make(chan string, n)
-	for i := 1; i <= n; i++ {
-		slots <- fmt.Sprintf("e%d", i)
-	}
-	return &Engine{sched: sched, slots: slots}
+	return NewEngineOn(NewPool(n), sched)
 }
+
+// NewEngineOn returns an engine drawing on an existing pool, so several
+// engines — one per concurrently running pipeline, each with its own executor
+// and runners — share one bounded set of slots and one fairness policy.
+func NewEngineOn(pool *Pool, sched *Scheduler) *Engine {
+	if pool == nil {
+		pool = NewPool(0)
+	}
+	return &Engine{sched: sched, pool: pool}
+}
+
+// Pool returns the slot pool this engine draws on.
+func (e *Engine) Pool() *Pool { return e.pool }
 
 // Submit claims a slot and runs t, invoking done with the outcome when it
 // finishes. It blocks only while every slot is busy — that wait is the
@@ -67,18 +72,18 @@ func (e *Engine) Submit(ctx context.Context, t task.Task, done func(task.Result,
 		Stage: t.Stage, TaskID: t.ID, Records: len(t.Input),
 		Input: recordsJSON(t.Input), InputIDs: recordIDs(t.Input)})
 
-	var slot string
-	select {
-	case slot = <-e.slots:
-	case <-ctx.Done():
-		done(task.Result{}, core.Transient(ctx.Err()))
+	// The program a task is admitted against is its run: one pipeline is one
+	// program, and its completion time is what a caller waits on.
+	lease, err := e.pool.Acquire(ctx, t.Envelope.RunID)
+	if err != nil {
+		done(task.Result{}, err)
 		return
 	}
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		res, _, err := e.sched.RunTask(ctx, t, slot)
-		e.slots <- slot
+		res, _, err := e.sched.RunTask(ctx, t, lease.Slot())
+		lease.Release()
 		done(res, err)
 	}()
 }
