@@ -165,7 +165,8 @@ func (c *Catalog) Call(ctx context.Context, server, tool string, args map[string
 	if !ok {
 		return CallResult{}, core.Permanent(fmt.Errorf("mcp: server %q is not configured", server))
 	}
-	return p.call(ctx, tool, args)
+	res, _, err := p.call(ctx, tool, args)
+	return res, err
 }
 
 // ReadResource reads an MCP resource and returns its content as a
@@ -238,6 +239,22 @@ type Stats struct {
 	Calls    int           // tool calls issued
 	Errors   int           // tool calls that failed
 	Busy     time.Duration // total time held on a call slot
+	// Waited is the total time calls spent queued for a slot, and Peak the
+	// most that were ever in flight at once. Read against Slots they answer
+	// the only tuning question this design poses: was the ceiling the
+	// bottleneck, or was the server?
+	Waited time.Duration
+	Peak   int
+	Slots  int
+}
+
+// callStats is what one call cost in slot terms, handed to the caller so the
+// event it publishes can carry it.
+type callStats struct {
+	Queued   time.Duration
+	Latency  time.Duration
+	InFlight int
+	Slots    int
 }
 
 // ServerManifest is one server's discovered contract.
@@ -368,11 +385,13 @@ type pool struct {
 	subsets  map[string]string
 	closed   bool
 
-	next  atomic.Uint64
-	dials atomic.Int64
-	calls atomic.Int64
-	errs  atomic.Int64
-	busy  atomic.Int64
+	next   atomic.Uint64
+	dials  atomic.Int64
+	calls  atomic.Int64
+	errs   atomic.Int64
+	busy   atomic.Int64
+	waited atomic.Int64
+	peak   atomic.Int64
 }
 
 func newPool(s Server, secrets map[security.SecretRef]string, opts Options) *pool {
@@ -383,19 +402,76 @@ func newPool(s Server, secrets map[security.SecretRef]string, opts Options) *poo
 }
 
 func (p *pool) connect(ctx context.Context) error {
+	start := time.Now()
+	var info ServerInfo
 	for i := 0; i < p.server.sessions(); i++ {
 		s, err := p.dial(ctx)
 		if err != nil {
 			p.audit("mcp.connect", false, err.Error())
 			return err
 		}
+		info = s.ServerInfo
 		p.mu.Lock()
 		p.sessions = append(p.sessions, s)
 		p.mu.Unlock()
 	}
 	p.audit("mcp.connect", true, fmt.Sprintf("%d session(s), %d tool(s)",
 		p.server.sessions(), len(p.descs)))
+	p.announce(info, time.Since(start))
 	return nil
+}
+
+// announce publishes the connection for observers. It carries no run ID, and
+// that is the fact it is reporting: this connection was made before any run
+// started and will outlive every one of them, so an observer should hold it
+// beside the universe rather than inside one run's sky.
+func (p *pool) announce(info ServerInfo, dial time.Duration) {
+	if p.opts.Bus == nil {
+		return
+	}
+	p.mu.Lock()
+	descs, digest := append([]ToolDesc(nil), p.descs...), p.digest
+	p.mu.Unlock()
+
+	kind, where := "stdio", p.server.Command
+	if p.server.URL != "" {
+		kind, where = "http", p.server.URL
+	}
+	p.opts.Bus.Publish(observe.Event{
+		Type: observe.MCPConnected, Server: p.server.Name,
+		Kind: kind, Note: where, Artifact: digest,
+		Records: len(descs), Slots: cap(p.sem), Latency: dial,
+		Detail: observe.Clip(connectDetail(p.server, info, descs)),
+	})
+}
+
+// connectDetail is the human-readable description of a server, for an
+// inspector: what it is, how it is reached, how hard it may be pushed, and
+// what it offers.
+func connectDetail(s Server, info ServerInfo, descs []ToolDesc) string {
+	var b strings.Builder
+	name := info.Name
+	if name == "" {
+		name = s.Name
+	}
+	fmt.Fprintf(&b, "%s", name)
+	if info.Version != "" {
+		fmt.Fprintf(&b, " %s", info.Version)
+	}
+	b.WriteByte('\n')
+	if s.URL != "" {
+		fmt.Fprintf(&b, "streamable http · %s\n", s.URL)
+	} else {
+		fmt.Fprintf(&b, "stdio · %s\n", strings.TrimSpace(s.Command+" "+strings.Join(s.Args, " ")))
+	}
+	fmt.Fprintf(&b, "%d session(s), at most %d concurrent call(s)\n",
+		s.sessions(), s.maxConcurrent())
+	if len(s.Tools) > 0 {
+		fmt.Fprintf(&b, "allowlisted by this deployment: %s\n", strings.Join(s.Tools, ", "))
+	}
+	b.WriteString("\ntools:\n")
+	b.WriteString(Describe(descs))
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // dial opens one session and reconciles what it advertises with what this
@@ -504,17 +580,33 @@ func (p *pool) tools() []*Tool {
 	return out
 }
 
-// acquire takes a call slot. This is the lease: what a task holds for the
-// duration of a call, and what a fleet's agents queue for when a server is
-// saturated. It is deliberately not a connection — the session underneath is
-// shared and stays warm.
-func (p *pool) acquire(ctx context.Context) error {
+// acquire takes a call slot and reports what taking it cost. This is the
+// lease: what a task holds for the duration of a call, and what a fleet's
+// agents queue for when a server is saturated. It is deliberately not a
+// connection — the session underneath is shared and stays warm.
+//
+// The queue time it returns is the observable that makes the design tunable.
+// A call slot is cheap to hold and cheap to widen, so the only question worth
+// asking of a server is whether tasks are waiting for one; latency alone
+// cannot tell a slow server from a crowded one.
+func (p *pool) acquire(ctx context.Context) (time.Duration, int, error) {
+	start := time.Now()
 	select {
 	case p.sem <- struct{}{}:
-		return nil
 	case <-ctx.Done():
-		return core.Transient(fmt.Errorf("mcp %s: waiting for a call slot: %w", p.server.Name, ctx.Err()))
+		return time.Since(start), 0, core.Transient(
+			fmt.Errorf("mcp %s: waiting for a call slot: %w", p.server.Name, ctx.Err()))
 	}
+	inFlight := len(p.sem)
+	for {
+		peak := p.peak.Load()
+		if int64(inFlight) <= peak || p.peak.CompareAndSwap(peak, int64(inFlight)) {
+			break
+		}
+	}
+	queued := time.Since(start)
+	p.waited.Add(int64(queued))
+	return queued, inFlight, nil
 }
 
 func (p *pool) release() { <-p.sem }
@@ -577,9 +669,11 @@ func (p *pool) drop(dead *Session) {
 	_ = dead.Close()
 }
 
-func (p *pool) call(ctx context.Context, tool string, args map[string]any) (CallResult, error) {
-	if err := p.acquire(ctx); err != nil {
-		return CallResult{}, err
+func (p *pool) call(ctx context.Context, tool string, args map[string]any) (CallResult, callStats, error) {
+	queued, inFlight, err := p.acquire(ctx)
+	cs := callStats{Queued: queued, InFlight: inFlight, Slots: cap(p.sem)}
+	if err != nil {
+		return CallResult{}, cs, err
 	}
 	start := time.Now()
 	defer func() {
@@ -593,10 +687,12 @@ func (p *pool) call(ctx context.Context, tool string, args map[string]any) (Call
 	sess, err := p.session(callCtx)
 	if err != nil {
 		p.errs.Add(1)
-		return CallResult{}, err
+		cs.Latency = time.Since(start)
+		return CallResult{}, cs, err
 	}
 	p.calls.Add(1)
 	res, err := sess.Call(callCtx, tool, args)
+	cs.Latency = time.Since(start)
 	if err != nil {
 		p.errs.Add(1)
 		// A transient failure is the transport's, not the tool's: retire the
@@ -604,13 +700,13 @@ func (p *pool) call(ctx context.Context, tool string, args map[string]any) (Call
 		if core.ClassOf(err) == core.FailTransient {
 			p.drop(sess)
 		}
-		return res, err
+		return res, cs, err
 	}
-	return res, nil
+	return res, cs, nil
 }
 
 func (p *pool) readResource(ctx context.Context, uri string) ([]ResourceContent, error) {
-	if err := p.acquire(ctx); err != nil {
+	if _, _, err := p.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer p.release()
@@ -637,6 +733,8 @@ func (p *pool) stats() Stats {
 		Tools: tools, Digest: digest, Sessions: sessions,
 		Dials: int(p.dials.Load()), Calls: int(p.calls.Load()),
 		Errors: int(p.errs.Load()), Busy: time.Duration(p.busy.Load()),
+		Waited: time.Duration(p.waited.Load()), Peak: int(p.peak.Load()),
+		Slots: cap(p.sem),
 	}
 }
 
@@ -711,9 +809,8 @@ func (t *Tool) InvokeIn(ctx context.Context, env task.Envelope, taskID string, a
 	if err := t.checkContract(env); err != nil {
 		return nil, err
 	}
-	start := time.Now()
-	res, err := t.pool.call(ctx, t.desc.Name, args)
-	t.publish(env, taskID, time.Since(start), res, err)
+	res, stats, err := t.pool.call(ctx, t.desc.Name, args)
+	t.publish(env, taskID, stats, res, err)
 	if err != nil {
 		return nil, err
 	}
@@ -757,7 +854,7 @@ func grantedTools(env task.Envelope, server string) []string {
 	return out
 }
 
-func (t *Tool) publish(env task.Envelope, taskID string, latency time.Duration, res CallResult, err error) {
+func (t *Tool) publish(env task.Envelope, taskID string, stats callStats, res CallResult, err error) {
 	// A call with no run behind it — Tool.Invoke used directly — has nowhere to
 	// be attributed, and an event without a run ID would land in whichever run
 	// an observer happened to be showing.
@@ -766,7 +863,8 @@ func (t *Tool) publish(env task.Envelope, taskID string, latency time.Duration, 
 	}
 	e := observe.Event{
 		Type: observe.MCPCalled, RunID: env.RunID, Stage: env.Stage, TaskID: taskID,
-		Server: t.pool.server.Name, Tool: t.desc.Name, Latency: latency,
+		Server: t.pool.server.Name, Tool: t.desc.Name, Latency: stats.Latency,
+		Queued: stats.Queued, InFlight: stats.InFlight, Slots: stats.Slots,
 	}
 	if err != nil {
 		e.Err = err.Error()

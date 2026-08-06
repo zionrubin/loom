@@ -54,6 +54,15 @@ and registers it by content hash. The `reply` stage reads it with
 `{{broadcast "voice"}}` — one copy for the run, and part of that stage's
 fingerprint.
 
+## In the constellation view
+
+`-view` draws the server as a ring in its own band below the stage clusters,
+with dashed feeds running up to the two stages that call it. The filled arc is
+peak calls in flight against the ceiling (3 of 4 here); the dot at its centre is
+the single session all six calls shared. Press `m` for the inspector — per-tool
+timings, queue time, the stages and tasks that called it — and `s` for the run
+summary, which carries the same numbers as a table.
+
 ## Expected output
 
 ```

@@ -22,6 +22,7 @@
     --c-cached: #9085e9;
     --c-fail: #d03b3b;
     --c-shared: #2ab5a6;
+    --c-mcp: #c77dd6;
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -359,7 +360,8 @@
   <span class="li"><span class="ic" style="color:var(--c-fail)">✕</span>failed</span>
   <span class="li"><span class="ic" style="color:var(--c-running)">◇</span>executor</span>
   <span class="li"><span class="ic" style="color:var(--c-shared)">⬡</span>shared value</span>
-  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · b shared · s summary · u universe · ,. runs · esc</span>
+  <span class="li"><span class="ic" style="color:var(--c-mcp)">◎</span>mcp server</span>
+  <span class="li" style="color:var(--ink-3)"><span class="ic">ⓘ</span>click · ←→ tasks · f failed · e executors · b shared · m mcp · s summary · u universe · ,. runs · esc</span>
 </div>
 
 <div id="tooltip"></div>
@@ -403,6 +405,10 @@ const COLORS = {
   pending: '#898781', running: '#3987e5', long: '#fab219',
   retry: '#ec835a', done: '#0ca30c', cached: '#9085e9', fail: '#d03b3b',
   shared: '#2ab5a6',
+  // MCP servers get their own hue because they are the only thing on the sky
+  // that is not part of the run: an external process or endpoint the engine
+  // reaches out to, owned by the host and shared by every run in the universe.
+  mcp: '#c77dd6',
 };
 const S = {
   run: { runId: '', startedAt: 0, endedAt: 0, done: false, note: '' },
@@ -410,6 +416,11 @@ const S = {
   tasks: [], taskIx: new Map(),
   workers: [], workerIx: new Map(),
   broadcasts: [], broadcastIx: new Map(),
+  // MCP servers. Unlike everything else in this state they are not the run's:
+  // the host connects to them before the first run and keeps the connection
+  // after the last one, so the same server appears in every sky, carrying that
+  // sky's own call counters.
+  mcp: [], mcpIx: new Map(),
   // The universe: every run the server is holding. A process usually runs
   // more than one pipeline, and the sky below shows exactly one of them —
   // `viewing` — while `live` names the one still receiving events. They are
@@ -433,6 +444,7 @@ let selected = null;  // {type:'task'|'worker'|'stage', id}
 let hovered = null;           // task or worker object under the cursor
 let hoveredStage = null;      // stage object whose label is under the cursor
 let hoveredBroadcast = null;  // shared-value node under the cursor
+let hoveredMCP = null;        // MCP server node under the cursor
 let connState = 'connecting'; // connecting | live | reconnecting
 let lastPanelKey = '';
 let lastPanelHTML = '';
@@ -456,6 +468,7 @@ function clearState() {
   S.tasks = []; S.taskIx = new Map();
   S.workers = []; S.workerIx = new Map();
   S.broadcasts = []; S.broadcastIx = new Map();
+  S.mcp = []; S.mcpIx = new Map();
   detailCache.clear();
   S.layoutDirty = true; S.thresholdsDirty = true; S.lineageDirty = true; S.stageStatsDirty = true;
   chromeDirty = true;
@@ -467,6 +480,7 @@ function selectionStillValid(sel) {
   if (sel.type === 'worker') return S.workerIx.has(sel.id);
   if (sel.type === 'stage') return S.stageIx.has(sel.id);
   if (sel.type === 'broadcast') return S.broadcastIx.has(sel.id);
+  if (sel.type === 'mcp') return S.mcpIx.has(sel.id);
   return false;
 }
 
@@ -530,6 +544,7 @@ function applySnapshot(snap) {
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
   (snap.broadcasts || []).forEach(b => upsert(S.broadcasts, S.broadcastIx, b));
+  (snap.mcp || []).forEach(m => upsert(S.mcp, S.mcpIx, m));
   S.projection = snap.projection || null;
   if (keep && !selectionStillValid(keep)) dropSelection();
   refreshChrome();
@@ -585,6 +600,9 @@ function applyDelta(d) {
   }
   if (d.worker) upsert(S.workers, S.workerIx, d.worker);
   if (d.broadcast) upsert(S.broadcasts, S.broadcastIx, d.broadcast);
+  // A server delta can arrive with no run behind it — a connection is the
+  // host's, not a run's — so it lands in whichever sky is on screen.
+  if (d.mcp) { upsert(S.mcp, S.mcpIx, d.mcp); S.layoutDirty = true; }
   if (d.projection) { S.projection = d.projection; chromeDirty = true; }
   // The chrome and the inspector are DOM, and rebuilding them per event is
   // what turns a fast run into a stalled tab. Mark them dirty and let the
@@ -806,6 +824,17 @@ function computeLayout() {
     b._tx = mX + usableW * ((i + 0.5) / Math.max(bn, 1));
     b._ty = top + 16;
     if (b._x === undefined) { b._x = b._tx; b._y = b._ty; }
+  });
+
+  // MCP servers sit in their own band *below* the stage clusters and above
+  // the executor belt — the mirror of the shared-value band above them. Data
+  // is read down from a broadcast; a tool call reaches out and down to a
+  // server that is not part of the run at all.
+  const mn = S.mcp.length;
+  S.mcp.forEach((m, i) => {
+    m._tx = mX + usableW * ((i + 0.5) / Math.max(mn, 1));
+    m._ty = H - beltH - 22;
+    if (m._x === undefined) { m._x = m._tx; m._y = m._ty; }
   });
 
   const wk = S.workers.length;
@@ -1131,6 +1160,99 @@ function drawBroadcast(b, tms, focusName) {
   ctx.restore();
 }
 
+// An MCP server: a ring, because a ring is what the thing actually is. The
+// outer circle is the server's concurrency ceiling and the filled arc is the
+// most calls ever in flight at once, so the node draws the one number this
+// design rations — call slots, not connections. Sessions are the small dots
+// inside it: usually a single one, however many thousands of records ran
+// through it, which is the point.
+//
+// Dashed feeds run *up* to every stage cluster observed calling it, drifting
+// outward: the mirror of a broadcast's feeds, which drift down into the run.
+function drawMCP(m, now, tms, focusName) {
+  const lit = focusName === m.id;
+  const x = m._x, y = m._y, r = 11;
+  const since = m.lastAt ? now - m.lastAt : Infinity;
+  const hot = Math.max(0, 1 - since / 1200);   // decays after the last call
+
+  for (const sid of (m.stages || [])) {
+    const st = S.stageIx.get(sid);
+    if (!st || st._cx === undefined) continue;
+    ctx.save();
+    ctx.strokeStyle = COLORS.mcp;
+    ctx.globalAlpha = lit ? 0.5 : 0.14 + 0.28 * hot;
+    ctx.lineWidth = lit ? 1.4 : 1;
+    ctx.setLineDash([3, 7]);
+    ctx.lineDashOffset = reduceMotion ? 0 : (tms / 80) % 10;
+    ctx.beginPath();
+    ctx.moveTo(st._cx, st._cy + st._rMax * 0.55);
+    ctx.quadraticCurveTo((x + st._cx) / 2, (y + st._cy) / 2 + 18, x, y - r - 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (lit || hot > 0) glow(x, y, 30, COLORS.mcp, 0.14 + 0.26 * (lit ? 1 : hot));
+
+  // A call landing sends one expanding ripple outward, so traffic is visible
+  // as movement rather than only as a counter that has changed.
+  if (!reduceMotion && hot > 0) {
+    ctx.save();
+    ctx.strokeStyle = COLORS.mcp;
+    ctx.globalAlpha = 0.30 * hot;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(x, y, r + (1 - hot) * 16, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.mcp;
+  ctx.globalAlpha = lit ? 0.95 : 0.55;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // The occupancy arc: peak in-flight over the ceiling.
+  const slots = m.slots || 0, peak = Math.min(m.peak || 0, slots || m.peak || 0);
+  if (slots > 0 && peak > 0) {
+    ctx.strokeStyle = m.errors ? COLORS.fail : COLORS.mcp;
+    ctx.globalAlpha = lit ? 1 : 0.85;
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (peak / slots));
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+
+  // Sessions: the connections themselves, at the centre.
+  const sessions = Math.max(m.sessions || 0, 0);
+  ctx.fillStyle = COLORS.mcp;
+  ctx.globalAlpha = sessions ? (lit ? 0.9 : 0.65) : 0.25;
+  for (let i = 0; i < Math.max(sessions, 1); i++) {
+    const off = (i - (Math.max(sessions, 1) - 1) / 2) * 5;
+    ctx.beginPath();
+    ctx.arc(x + off, y, sessions ? 2.2 : 1.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = '10px ui-monospace, Menlo, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = COLORS.mcp;
+  ctx.globalAlpha = lit ? 1 : 0.75;
+  ctx.fillText(m.id, x, y + r + 13);
+  if (m.calls) {
+    ctx.globalAlpha = lit ? 0.85 : 0.5;
+    ctx.fillStyle = m.errors ? COLORS.fail : '#c3c2b7';
+    ctx.fillText(`${m.calls} call${m.calls === 1 ? '' : 's'}`, x, y + r + 25);
+  }
+  ctx.restore();
+}
+
 function draw(tms) {
   if (S.layoutDirty) computeLayout();
   if (S.thresholdsDirty) computeThresholds();
@@ -1159,6 +1281,7 @@ function draw(tms) {
   for (const t of S.tasks) { t._x += (t._tx - t._x) * .15; t._y += (t._ty - t._y) * .15; }
   for (const w of S.workers) { w._x += (w._tx - w._x) * .2; w._y += (w._ty - w._y) * .2; }
   for (const b of S.broadcasts) { b._x += (b._tx - b._x) * .2; b._y += (b._ty - b._y) * .2; }
+  for (const m of S.mcp) { m._x += (m._tx - m._x) * .2; m._y += (m._ty - m._y) * .2; }
 
   // soft pan toward the focused node if it sits outside the visible sky
   const focusObj = (selected && (selected.type === 'task' ? S.taskIx.get(selected.id)
@@ -1320,6 +1443,14 @@ function draw(tms) {
     for (const b of S.broadcasts) drawBroadcast(b, tms, focusB);
   }
 
+  // Servers draw beneath the stars for the same reason, from the other side.
+  if (S.mcp.length) {
+    const focusM = (selected && selected.type === 'mcp' ? selected.id : null)
+                || (hoveredMCP && hoveredMCP.id)
+                || null;
+    for (const m of S.mcp) drawMCP(m, now, tms, focusM);
+  }
+
   for (const t of S.tasks) drawTask(t, now, tms, lod);
   for (const w of S.workers) drawWorker(w, tms);
 
@@ -1371,6 +1502,11 @@ function hitTest(mx, my) {
     const d = (b._x - wx) ** 2 + (b._y - wy) ** 2;
     if (d < bestD) { bestD = d; best = { type: 'broadcast', obj: b }; }
   }
+  for (const m of S.mcp) {
+    if (m._x === undefined) continue;
+    const d = (m._x - wx) ** 2 + (m._y - wy) ** 2;
+    if (d < bestD) { bestD = d; best = { type: 'mcp', obj: m }; }
+  }
   if (!best) {
     for (const r of labelRects) {
       if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) {
@@ -1387,6 +1523,7 @@ canvas.addEventListener('mousemove', e => {
   hovered = hit && (hit.type === 'task' || hit.type === 'worker') ? hit.obj : null;
   hoveredStage = hit && hit.type === 'stage' ? hit.obj : null;
   hoveredBroadcast = hit && hit.type === 'broadcast' ? hit.obj : null;
+  hoveredMCP = hit && hit.type === 'mcp' ? hit.obj : null;
   canvas.style.cursor = hit ? 'pointer' : 'default';
   if (hit) {
     tooltip.style.display = 'block';
@@ -1405,6 +1542,12 @@ canvas.addEventListener('mousemove', e => {
       const b = hit.obj;
       tooltip.innerHTML = `<b>shared value ${esc(b.id)}</b><br>` +
         `${fmtBytes(b.bytes)} · stored once · ${b.readers || 0} task${b.readers === 1 ? '' : 's'} read it`;
+    } else if (hit.type === 'mcp') {
+      const m = hit.obj;
+      tooltip.innerHTML = `<b>mcp ${esc(m.id)}</b> · ${esc(m.kind || '')}<br>` +
+        `${m.sessions || 0} connection${m.sessions === 1 ? '' : 's'} for the host · ` +
+        `${m.calls || 0} call${m.calls === 1 ? '' : 's'} here` +
+        (m.errors ? ` · <span style="color:${COLORS.fail}">${m.errors} failed</span>` : '');
     } else {
       const st = hit.obj;
       tooltip.innerHTML = `<b>stage ${esc(st.id)}</b> · ${esc(st.kind || 'stage')}<br>click to inspect`;
@@ -1418,7 +1561,7 @@ canvas.addEventListener('mousemove', e => {
   }
 });
 canvas.addEventListener('mouseleave', () => {
-  hovered = null; hoveredStage = null; hoveredBroadcast = null;
+  hovered = null; hoveredStage = null; hoveredBroadcast = null; hoveredMCP = null;
   tooltip.style.display = 'none';
 });
 canvas.addEventListener('click', e => {
@@ -1472,6 +1615,9 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'b' || e.key === 'B') {
     e.preventDefault();
     cycleSelection(S.broadcasts, 'broadcast', e.shiftKey ? -1 : 1);
+  } else if (e.key === 'm' || e.key === 'M') {
+    e.preventDefault();
+    cycleSelection(S.mcp, 'mcp', e.shiftKey ? -1 : 1);
   } else if (e.key === 's' || e.key === 'S') {
     e.preventDefault();
     if (!S.run.runId) return;
@@ -1535,12 +1681,34 @@ function statusColor(t) {
   return { pending: COLORS.pending, running: COLORS.running, retrying: COLORS.retry,
            completed: COLORS.done, failed: COLORS.fail }[t.status] || COLORS.pending;
 }
+// Total MCP calls across the servers on screen, for the header chip.
+// A stdio server's endpoint is a command line, which can be a long path. The
+// tail is the part that identifies it; the full string stays in the title.
+function tailOf(s, n) {
+  return s.length <= n ? s : '…' + s.slice(s.length - n + 1);
+}
+
+function mcpCallTotal() {
+  let n = 0;
+  for (const m of S.mcp) n += m.calls || 0;
+  return n;
+}
+
 function fmtDur(ms) {
   if (ms == null || ms < 0) return '—';
   if (ms < 1000) return Math.round(ms) + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + 's';
   return Math.floor(ms / 60000) + 'm ' + Math.round((ms % 60000) / 1000) + 's';
 }
+// Tool-call times come in microseconds: a local MCP server answers in a few
+// hundred of them, and rounding that to "0ms" would report real work as none.
+function fmtUs(us) {
+  if (us == null || us < 0) return '—';
+  if (us < 1000) return us + 'µs';
+  if (us < 10000) return (us / 1000).toFixed(1) + 'ms';
+  return fmtDur(Math.round(us / 1000));
+}
+
 function fmtTok(n) {
   if (!n) return '0';
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
@@ -1669,6 +1837,7 @@ function renderPanel() {
 
   if (selected.type === 'stage') { renderStagePanel(title, body); return; }
   if (selected.type === 'broadcast') { renderBroadcastPanel(title, body); return; }
+  if (selected.type === 'mcp') { renderMCPPanel(title, body); return; }
 
   const t = S.taskIx.get(selected.id);
   if (!t) return;
@@ -1693,6 +1862,15 @@ function renderPanel() {
   if (t.usage && t.usage.cached) {
     rows.push(['shared prefix',
       `${fmtTok(t.usage.cached)} tokens served from the stage's cached prompt head`]);
+  }
+  if ((t.mcpCalls || []).length) {
+    // Named separately from model calls because they are the one kind of work
+    // this task did that cost nothing in tokens: without the row, the task's
+    // own numbers cannot account for its runtime.
+    rows.push(['mcp tools called', t.mcpCalls.map(q => {
+      const server = q.split('/')[0];
+      return jumpBtn('mcp', server, q);
+    }).join(' ')]);
   }
   if ((t.broadcasts || []).length) {
     rows.push(['shared values', t.broadcasts.map(n => jumpBtn('broadcast', n)).join(' ')]);
@@ -1820,6 +1998,96 @@ function renderBroadcastPanel(title, body) {
   setPanelHTML(body, html);
 }
 
+// The server inspector answers what the sky cannot: which tools were actually
+// called, how long each took, how long tasks queued for a slot, and what the
+// last failure said. The first block is deliberately about ownership — a
+// server appears in every run's sky because there is one connection behind all
+// of them, and that is the design rather than an artefact of the view.
+function renderMCPPanel(title, body) {
+  const m = S.mcpIx.get(selected.id);
+  if (!m) return;
+  title.textContent = 'mcp ' + m.id;
+
+  const tools = (m.byTool || []).slice().sort((a, b) => b.calls - a.calls);
+  const recent = (m.recent || []).slice().reverse();
+  const avg = m.calls ? Math.round(m.busyUs / m.calls) : 0;
+
+  const rows = [
+    ['transport', m.kind
+      ? `${esc(m.kind)}${m.endpoint ? ' · <span class="mono" title="' + esc(m.endpoint) + '">' + esc(tailOf(m.endpoint, 44)) + '</span>' : ''}`
+      : '—'],
+    ['connections', `${m.sessions || 0} for the whole host` +
+      (m.dials > m.sessions ? ` · ${m.dials - m.sessions} reconnect${m.dials - m.sessions === 1 ? '' : 's'}` : '')],
+    ['tools offered', String(m.tools || 0)],
+  ];
+  if (m.slots) {
+    rows.push(['call slots', `${m.peak || 0} of ${m.slots} ever in flight at once`]);
+  }
+  rows.push(['calls from this run', String(m.calls || 0) + (m.errors ? ` · ${m.errors} failed` : '')]);
+  if (m.calls) {
+    rows.push(['time in calls', `${fmtUs(m.busyUs)} · ${fmtUs(avg)} average`]);
+    // Only call it contention when it actually is: a few microseconds is the
+    // cost of taking an uncontended semaphore, and reporting that as a
+    // bottleneck would send someone tuning a number that is already right.
+    const contended = m.busyUs > 0 && m.queueUs > m.busyUs / 10;
+    rows.push(['queued for a slot', !m.queueUs
+      ? 'never — a slot was always free'
+      : contended
+        ? `${fmtUs(m.queueUs)} — tasks are waiting on the ceiling, not the server`
+        : `${fmtUs(m.queueUs)} — negligible; a slot was effectively always free`]);
+  }
+  if (m.digest) rows.push(['tool contract', `<span class="mono">${esc(m.digest.slice(0, 16))}…</span>`]);
+  if (m.dialMs) rows.push(['handshake', `${m.dialMs}ms, paid once at provisioning`]);
+
+  let html = `<span class="status-chip" style="color:${COLORS.mcp};border-color:${COLORS.mcp}55">◎ mcp server</span>`;
+  if (m.errors) html += `<span class="status-chip" style="color:${COLORS.fail};border-color:${COLORS.fail}55">${m.errors} failed</span>`;
+  html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
+
+  if (m.lastErr) html += `<h4>last error</h4><pre class="err">${esc(m.lastErr)}</pre>`;
+
+  html += `<h4>tools called · ${tools.length}</h4>`;
+  html += tools.length
+    ? '<table class="rounds"><tr><th>tool</th><th>calls</th><th>avg</th><th>max</th></tr>' +
+      tools.map(t => `<tr><td class="mono">${esc(t.name)}</td>` +
+        `<td>${t.calls}${t.errors ? ` <span style="color:${COLORS.fail}">(${t.errors}✕)</span>` : ''}</td>` +
+        `<td>${fmtUs(t.calls ? Math.round(t.totalUs / t.calls) : 0)}</td><td>${fmtUs(t.maxUs)}</td></tr>`).join('') +
+      '</table>'
+    : `<div class="lineage"><span class="none">no calls in this run</span></div>`;
+
+  html += `<h4>called by stages</h4><div class="lineage">` +
+    ((m.stages || []).length
+      ? m.stages.map(sid => jumpBtn('stage', sid)).join('')
+      : `<span class="none">connected, not yet called</span>`) +
+    '</div>';
+
+  if ((m.tasks || []).length) {
+    html += `<h4>called by tasks</h4><div class="lineage">` +
+      m.tasks.map(tid => {
+        const t = S.taskIx.get(tid);
+        return jumpBtn('task', tid, `${tid}${t ? ' · ' + t.stage : ''}`);
+      }).join('') + '</div>';
+  }
+
+  if (recent.length) {
+    html += `<h4>recent calls</h4><table class="rounds"><tr><th>tool</th><th>task</th><th>took</th><th>queued</th></tr>` +
+      recent.map(c => `<tr><td class="mono">${esc(c.tool)}${c.err ? ` <span style="color:${COLORS.fail}">✕</span>` : ''}</td>` +
+        `<td>${c.taskId ? jumpBtn('task', c.taskId, c.taskId) : '—'}</td>` +
+        `<td>${fmtUs(c.us)}</td><td>${c.queueUs ? fmtUs(c.queueUs) : '—'}</td></tr>`).join('') +
+      '</table>';
+  }
+
+  if (m.detail) {
+    html += `<h4>server</h4><details><summary>transport, limits and tool schemas</summary>` +
+      `<pre>${esc(m.detail)}</pre></details>`;
+  }
+  html += `<h4>why one connection</h4><div class="lineage"><span class="none">` +
+    `connected once per host, before any run, and shared by every agent on it — a ` +
+    `connection belongs to a server process and an account, not to a pipeline. MCP ` +
+    `multiplexes on request id, so a task leases a call slot rather than a connection, ` +
+    `and the ring above is that ceiling</span></div>`;
+  setPanelHTML(body, html);
+}
+
 function summarizeIDs(ids) {
   if (!ids || !ids.length) return 'records';
   const shown = ids.slice(0, 6).join(', ');
@@ -1912,6 +2180,13 @@ function renderStagePanel(title, body) {
       `${st.savedUsd >= 0 ? '' : '−'}$${Math.abs(st.savedUsd || 0).toFixed(5)}` +
       (st.savedUsd < 0 ? ' <span class="none">(entry not yet reused)</span>'
                        : ` <span class="none">(${share}% of prompt tokens)</span>`)]);
+  }
+  const servers = S.mcp.filter(m => (m.stages || []).includes(st.id));
+  if (servers.length) {
+    rows.push(['mcp servers', servers.map(m => {
+      const calls = (m.recent || []).filter(c => c.stage === st.id).length;
+      return jumpBtn('mcp', m.id, m.id);
+    }).join(' ')]);
   }
   const reads = S.broadcasts.filter(b => (b.stages || []).includes(st.id));
   if (reads.length) {
@@ -2128,6 +2403,30 @@ function renderSummary() {
       `; each value's hash is part of its readers' cache fingerprints — edit one and exactly those results recompute.</div>`;
   }
 
+  if (S.mcp.length) {
+    html += '<h4>mcp servers · connected once, shared by every run on this host</h4>' +
+      '<table><tr><th>server</th><th>transport</th><th>connections</th><th>calls</th>' +
+      '<th>failed</th><th>time in calls</th><th>queued for a slot</th><th>peak / slots</th></tr>';
+    let calls = 0, busy = 0;
+    for (const m of S.mcp) {
+      calls += m.calls || 0;
+      busy += m.busyUs || 0;
+      html += `<tr><td>${jumpBtn('mcp', m.id)}</td>` +
+        `<td>${esc(m.kind || '—')}</td>` +
+        `<td>${m.sessions || 0}${m.dials > m.sessions ? ` (+${m.dials - m.sessions} redial)` : ''}</td>` +
+        `<td>${m.calls || 0}</td>` +
+        `<td>${m.errors ? `<span style="color:${COLORS.fail}">${m.errors}</span>` : '—'}</td>` +
+        `<td>${m.calls ? fmtUs(m.busyUs) : '—'}</td>` +
+        `<td>${m.queueUs ? fmtUs(m.queueUs) : '—'}</td>` +
+        `<td>${m.slots ? `${m.peak || 0} / ${m.slots}` : '—'}</td></tr>`;
+    }
+    html += '</table>';
+    html += `<div class="note">${calls} tool call${calls === 1 ? '' : 's'} costing ` +
+      `<span class="save">no tokens and no dollars</span>, and ${fmtUs(busy)} of wall-clock ` +
+      `the cost table above cannot explain. Connections are the host's, not this run's: a task ` +
+      `leases a call slot, so <b>peak / slots</b> is the number to widen if tasks are queueing.</div>`;
+  }
+
   if (S.workers.length) {
     html += '<h4>executors</h4><table><tr><th>executor</th><th>tasks done</th>' +
       '<th>failed</th><th>busy</th><th>utilization</th></tr>';
@@ -2291,7 +2590,11 @@ function refreshChrome() {
           (p.floorMs ? ` · rate-limit floor ${fmtDur(p.floorMs)}` : '') +
           (p.budgetUsd && !p.fitsBudget ? ` · over the ${fmtCost(p.budgetUsd)} budget` : '') +
           ` — waiting for the run</code>`
-        : `<h2>Listening for a Loom run</h2><code>loom.Run(ctx, p, loom.WithEventHandler(viz.Handle), …)</code>`;
+        : S.mcp.length
+          ? `<h2>Connected to ${S.mcp.length} MCP server${S.mcp.length === 1 ? '' : 's'}</h2>` +
+            `<code>${S.mcp.map(m => esc(m.id) + ' · ' + (m.tools || 0) + ' tools').join(' · ')}` +
+            ` — connected before the run, waiting for it</code>`
+          : `<h2>Listening for a Loom run</h2><code>loom.Run(ctx, p, loom.WithEventHandler(viz.Handle), …)</code>`;
     if (empty.dataset.html !== emptyHTML) {
       empty.innerHTML = emptyHTML;
       empty.dataset.html = emptyHTML;
@@ -2379,7 +2682,9 @@ function refreshChrome() {
              cost > S.projection.ceilingUsd ? 'projected · OVER' : 'projected',
              cost > S.projection.ceilingUsd ? 'accent-fail' : '')
       : '') +
-    (S.broadcasts.length ? stat(String(S.broadcasts.length), 'shared') : '');
+    (S.broadcasts.length ? stat(String(S.broadcasts.length), 'shared') : '') +
+    (S.mcp.length ? stat(mcpCallTotal() ? `${S.mcp.length}·${mcpCallTotal()}` : String(S.mcp.length),
+                         'mcp', S.mcp.some(m => m.errors) ? 'accent-fail' : '') : '');
   const statsEl = document.getElementById('stats');
   if (statsEl.dataset.html !== statsHTML) {
     statsEl.innerHTML = statsHTML;

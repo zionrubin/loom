@@ -30,7 +30,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"time"
 
 	loom "github.com/zionrubin/loom"
 	"github.com/zionrubin/loom/core"
@@ -87,6 +89,9 @@ func main() {
 	if *state != "" {
 		opts = append(opts, loom.WithStateDir(*state))
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	if *view != "" {
 		v := viz.New()
 		url, err := v.Start(*view)
@@ -94,10 +99,19 @@ func main() {
 			log.Fatal(err)
 		}
 		fmt.Printf("constellation view: %s\n\n", url)
+		// Wait for a browser before running: this pipeline finishes in
+		// milliseconds, and the sky filling is most of what there is to watch.
+		// (A fleet shows more here — NewFleet connects its servers before any
+		// agent starts, so the empty sky already names them.)
+		waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+		if v.AwaitViewer(waitCtx) {
+			time.Sleep(800 * time.Millisecond)
+		}
+		cancelWait()
 		opts = append(opts, loom.WithEventHandler(v.Handle))
 	}
 
-	res, err := loom.Run(context.Background(), desk(), opts...)
+	res, err := loom.Run(ctx, desk(), opts...)
 	if err != nil {
 		log.Fatalf("run: %v", err)
 	}
@@ -114,6 +128,14 @@ func main() {
 	}
 	if len(res.MCP) > 0 && res.MCP[0].Calls == 0 {
 		fmt.Println("(every tool call was replayed from the cache — the second run is free)")
+	}
+
+	// The run is over in milliseconds but the sky is the thing you came for:
+	// the server ring, which stages called it, and the per-tool breakdown are
+	// all still there to read.
+	if *view != "" {
+		fmt.Println("\nview still serving; press m for the servers, s for the summary; ctrl-c to exit")
+		<-ctx.Done()
 	}
 }
 

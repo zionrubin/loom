@@ -611,7 +611,14 @@ func (r FleetReport) String() string {
 		if m.Dials > m.Sessions {
 			fmt.Fprintf(&b, ", %d reconnect(s)", m.Dials-m.Sessions)
 		}
-		fmt.Fprintf(&b, ", %s busy\n", m.Busy.Round(time.Millisecond))
+		fmt.Fprintf(&b, ", %s busy", m.Busy.Round(time.Millisecond))
+		// Queue time is the only tuning signal a call slot has: it says the
+		// ceiling, not the server, is what the agents were waiting on.
+		if m.Waited > 0 {
+			fmt.Fprintf(&b, ", %s queued for a slot (peak %d of %d)",
+				m.Waited.Round(time.Millisecond), m.Peak, m.Slots)
+		}
+		b.WriteByte('\n')
 	}
 	return b.String()
 }

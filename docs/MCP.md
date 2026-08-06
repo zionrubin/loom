@@ -234,20 +234,54 @@ what the rest of the framework already knows how to reason about.
 
 ## 6. Observability
 
-- **`mcp.called`** events carry server, tool, latency, and error, attributed to
-  the run, stage, and task that made the call. The collector folds them into
-  `StageStats.ToolCalls` and `ToolTime`, and the run report ends with a line
-  saying how many tool calls a run made and how long it spent in them. That line
-  exists because tool calls are the only work in Loom that costs **no tokens**:
-  a report that only totalled money would explain a stage bounded by a slow
-  server as a fast stage.
-- **Connections are not run events.** They are made before any run starts and
-  outlive every run on the host, so they land in the audit log
-  (`mcp.connect`, subject: the server name) rather than in a run's event stream,
-  alongside the `secret.resolve` lines for the credentials they consumed.
+- **`mcp.called`** events carry server, tool, latency, **queue time**, and the
+  in-flight count against the ceiling, attributed to the run, stage, and task
+  that made the call. The collector folds them into `StageStats.ToolCalls` and
+  `ToolTime`, and the run report ends with a line saying how many tool calls a
+  run made and how long it spent in them. That line exists because tool calls
+  are the only work in Loom that costs **no tokens**: a report that only
+  totalled money would explain a stage bounded by a slow server as a fast stage.
+
+  Queue time is the tuning signal, and it is the one the design's shape
+  demands. A call slot is cheap to hold and cheap to widen, so the only
+  question worth asking of a server is whether tasks are *waiting* for one —
+  latency alone cannot tell a slow server from a crowded one.
+- **`mcp.connected`** is the only event on the bus that carries **no run ID**,
+  and that is the fact it reports: a connection is made before any run starts
+  and outlives every run on the host. Observers hold it beside the universe
+  rather than inside one sky. It also lands in the audit log (`mcp.connect`,
+  subject: the server name), next to the `secret.resolve` lines for the
+  credentials it consumed.
 - **`RunResult.MCP`** and **`FleetReport.MCP`** report sessions, dials, calls,
-  errors, and slot-busy time per server. `dials > sessions` is the number that
-  says a server has been dropping connections.
+  errors, slot-busy time, queue time, and peak occupancy against the ceiling per
+  server. `dials > sessions` is the number that says a server has been dropping
+  connections; `peak / slots` is the number to widen if tasks are queueing.
+- **In the constellation view**, a server is a **ring** drawn in its own band
+  below the stage clusters — the mirror of the shared-value band above them,
+  because a broadcast feeds *down* into the run while a tool call reaches *out*
+  to something that is not part of the run at all. The ring is not decoration:
+  its circumference is the server's concurrency ceiling and the filled arc is
+  the most calls ever in flight at once, so the node draws the quantity this
+  design actually rations. The dots at its centre are the sessions — usually
+  one, however many thousands of records went through it, which is the point.
+  A call sends a ripple outward, and the dashed feeds run up to every stage
+  observed calling it.
+
+  Press `m` to cycle the servers. The inspector carries the identity (transport,
+  sessions, reconnects, handshake cost, tool-contract digest), this run's
+  traffic (calls, failures, time in calls, queue time, peak against the
+  ceiling), a **per-tool breakdown** — which tool is slow is a question a single
+  server-wide average cannot answer — the stages and tasks that called it, and a
+  tail of recent calls with their timings. Times are in microseconds, because a
+  local stdio server answers in a few hundred of them and "0ms" reads as broken
+  rather than as fast.
+
+  Because a connection is the host's, the same server appears in **every** run's
+  sky, carrying that run's own counters — and the fleet case shows it plainly:
+  the connection is made before the first agent starts, so an empty universe
+  already names what the process is wired to. Each task's inspector lists the
+  MCP tools it called, because that is the only work a task does that leaves no
+  trace in its token or cost columns.
 - **`Explain`** compiles MCP declarations without connecting — a projection
   that dials a server has broken its own promise. Names and allowlists still
   validate; the descriptor digests do not exist, so a stage that declares MCP
@@ -285,6 +319,7 @@ what the rest of the framework already knows how to reason about.
 | `plan/plan.go` | `resolveMCP`: declarations → grants, egress, digest, fingerprint. |
 | `executor/executor.go` | `NetworkTool` (egress check) and `ScopedTool` (envelope-aware invocation). |
 | `fleet.go` | `host.connectMCP` / `readMCPResources`: provisioning, shared by every agent. |
+| `viz` | `MCPInfo` and the server ring: host-level inventory, per-run traffic, the inspector. |
 
 `examples/mcp-desk` is the whole thing running offline: a real child-process
 server, a per-record tool call, a model-chosen call, a resource-as-broadcast,

@@ -64,16 +64,21 @@ const (
 	// and one that does not is the case the round cap exists for.
 	RoundStarted  EventType = "round.started"
 	RoundFinished EventType = "round.finished"
-	// MCPCalled reports one tool call to an MCP server: which server, which
-	// tool, how long it took, and whether it failed. It is the only event on
-	// this bus that describes work with no token cost, which is the point —
-	// a stage's wall-clock can be dominated by tools that cost nothing, and
-	// the cost report alone would never show it.
+	// MCPConnected announces one MCP server the host has connected to: its
+	// transport, the tools it offers, the digest plans are compiled against,
+	// and the ceiling on concurrent calls to it.
 	//
-	// Connecting to a server is deliberately not an event here. A connection
-	// is made before any run starts and outlives every run on the host, so it
-	// belongs to the audit log (action "mcp.connect") rather than to any one
-	// run's event stream.
+	// It is the only event on this bus that carries no RunID, and that is what
+	// it means: a connection is made before any run starts and outlives every
+	// run on the host, so it belongs to the host rather than to a run.
+	// Observers should hold it beside the universe rather than inside one sky.
+	MCPConnected EventType = "mcp.connected"
+	// MCPCalled reports one tool call to an MCP server: which server, which
+	// tool, how long it waited for a call slot, how long the call took, and
+	// whether it failed. It is the only event on this bus that describes work
+	// with no token cost, which is the point — a stage's wall-clock can be
+	// dominated by tools that cost nothing, and the cost report alone would
+	// never show it.
 	MCPCalled EventType = "mcp.called"
 	// StageConverged closes an iterative stage with the reason it stopped
 	// (Note), the number of rounds it took, and the size of the graph it left
@@ -118,9 +123,20 @@ type Event struct {
 	// snapshot (topic@n) that later agents pin, with Artifact its content hash.
 	Topic string `json:"topic,omitempty"`
 	Posts int    `json:"posts,omitempty"`
-	// Server and Tool name the MCP server and tool on mcp.called.
+	// Server and Tool name the MCP server and tool on mcp.* events.
 	Server string `json:"server,omitempty"`
 	Tool   string `json:"tool,omitempty"`
+	// Queued is how long a tool call waited for one of its server's call
+	// slots before it could run (mcp.called). It is the number that says
+	// whether a server's concurrency bound is the pipeline's bottleneck —
+	// latency alone cannot distinguish a slow server from a busy one.
+	Queued time.Duration `json:"queued,omitempty"`
+	// InFlight is how many calls that server was carrying when this one
+	// started, and Slots its ceiling (mcp.connected carries Slots alone).
+	// Together they are the occupancy of the semaphore a task leases from,
+	// which is what this design rations instead of connections.
+	InFlight int `json:"in_flight,omitempty"`
+	Slots    int `json:"slots,omitempty"`
 	// Round is the 1-based superstep number on round.* events, and the total
 	// number of rounds on stage.converged. Messages is how many messages were
 	// delivered into the round.

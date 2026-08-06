@@ -173,7 +173,12 @@ Continuum — and says which rows are honestly still empty.
   server recomputes exactly the stages that could have called the tools that
   changed**. A model that *chooses* a tool is two stages (`Infer` → `mcp.Dispatch`)
   rather than a loop hidden inside a task, so the choice is data in the record
-  and the call is an ordinary scheduled task. See [docs/MCP.md](docs/MCP.md).
+  and the call is an ordinary scheduled task. In the constellation view a server
+  is a **ring** in its own band below the stage clusters — the mirror of the
+  shared-value band above them — whose filled arc is the peak calls in flight
+  against the ceiling, with the sessions as dots at its centre; press `m` for
+  the inspector's per-tool breakdown, queue time, and callers. See
+  [docs/MCP.md](docs/MCP.md).
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
