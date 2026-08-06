@@ -48,6 +48,7 @@ type StageOpts struct {
 	Sandbox     task.SandboxProfile
 	Grants      []security.Capability
 	Broadcasts  []string // run-level shared values this stage may read
+	MCP         []MCPUse // MCP servers and tools this stage may call
 	Version     string   // content-version for Go-func stages; enables caching
 	NoCache     bool
 	// NoPrefixCache opts the stage out of provider prompt-prefix caching.
@@ -83,6 +84,41 @@ func WithGrants(caps ...security.Capability) Option {
 // invalidates the cached results that saw it.
 func WithBroadcast(names ...string) Option {
 	return func(o *StageOpts) { o.Broadcasts = append(o.Broadcasts, names...) }
+}
+
+// MCPUse is one stage's declaration of an MCP server it may call, and
+// optionally the specific tools on it.
+type MCPUse struct {
+	Server string   `json:"server"`
+	Tools  []string `json:"tools,omitempty"`
+}
+
+// WithMCP declares that this stage's tasks may call tools on an MCP server
+// registered with loom.WithMCPServer. Naming tools narrows the grant to
+// exactly those; naming none grants every tool the server offers, which is
+// convenient and less than least privilege.
+//
+//	src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+//	    out, err := s.Invoke(ctx, mcp.ToolName("catalog", "lookup_sku"),
+//	        map[string]any{"sku": r.String("sku")})
+//	    ...
+//	}, pipeline.WithMCP("catalog", "lookup_sku"), pipeline.WithVersion("v1"))
+//
+// Declaring is what produces the grant, the egress entry for a networked
+// server, and the fingerprint component: the digest of the tools' descriptors
+// joins this stage's fingerprint, so upgrading the server recomputes exactly
+// the stages that could have called the tools that changed and leaves the rest
+// of the cache warm. A server nobody registered fails compilation rather than
+// the first record that reaches it.
+//
+// Tool calls are side effects, and a cached stage does not repeat them. Give a
+// stage that must call its tools on every run pipeline.WithNoCache; a stage
+// left cacheable is asserting that replaying the recorded result is as good as
+// calling again, which for a lookup is usually true and for a write never is.
+func WithMCP(server string, tools ...string) Option {
+	return func(o *StageOpts) {
+		o.MCP = append(o.MCP, MCPUse{Server: server, Tools: tools})
+	}
 }
 
 // WithVersion declares a content version for Go-function stages, enabling

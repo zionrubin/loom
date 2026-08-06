@@ -19,6 +19,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
@@ -40,6 +41,8 @@ type Config struct {
 	StateDir        string
 	ContinueOnError bool
 	Tools           []executor.Tool
+	MCPServers      []mcp.Server
+	MCPResources    []MCPResource
 	Broadcasts      map[string]any
 	Topics          map[string]bool
 	EventHandler    func(observe.Event)
@@ -99,6 +102,51 @@ func WithContinueOnError() Option { return func(c *Config) { c.ContinueOnError =
 // capability.
 func WithTools(tools ...executor.Tool) Option {
 	return func(c *Config) { c.Tools = append(c.Tools, tools...) }
+}
+
+// WithMCPServer registers Model Context Protocol servers whose tools stages
+// may call after declaring them with pipeline.WithMCP.
+//
+// The connections are made once, here, before anything runs — one set for the
+// whole host, shared by every agent on a fleet. That is the same reasoning
+// that gives a fleet one rate limiter and one budget governor: a connection is
+// a property of an account and a server process, not of a pipeline, and a
+// second copy of one is a second copy of its quota. A misconfigured server
+// therefore fails the run at provisioning rather than at the first record that
+// reaches it, and no task ever pays for a handshake.
+//
+// What a task gets is not a connection but a lease on a call slot, bounded per
+// server (mcp.Server.MaxConcurrent, defaulting to the engine's slot count), so
+// a fleet of agents cannot collectively hit a server harder than one of them
+// could. Credentials named in the descriptor are resolved through the run's
+// broker here and reach the connection only: no task, op, or executor ever
+// holds them.
+func WithMCPServer(servers ...mcp.Server) Option {
+	return func(c *Config) { c.MCPServers = append(c.MCPServers, servers...) }
+}
+
+// MCPResource binds an MCP resource to a broadcast name.
+type MCPResource struct {
+	Name   string // the broadcast name stages declare
+	Server string // the MCP server holding it
+	URI    string // the resource URI
+}
+
+// WithMCPResource reads a resource from an MCP server once at provisioning and
+// registers it as a broadcast under name — so a document that lives behind a
+// server becomes an ordinary shared value: stored once by content hash,
+// referenced rather than copied by every task that declares it with
+// pipeline.WithBroadcast, and folded into those stages' fingerprints so editing
+// it upstream recomputes exactly the stages that read it.
+//
+// It is read once per run rather than per task on purpose. A resource read
+// inside a task would be a network call per record whose result silently joins
+// a cached artifact; read here it is a value with a hash, which is what the
+// rest of the framework already knows how to reason about.
+func WithMCPResource(name, server, uri string) Option {
+	return func(c *Config) {
+		c.MCPResources = append(c.MCPResources, MCPResource{Name: name, Server: server, URI: uri})
+	}
 }
 
 // WithBroadcast registers a value shared by every task that declares it with
@@ -204,7 +252,11 @@ type RunResult struct {
 	Lineage      []store.LineageEntry
 	Audit        []security.AuditEntry
 	Broadcasts   map[string]string // shared value name → content hash
-	Spent        core.Usage
+	// MCP reports each configured MCP server's connection accounting: how many
+	// sessions were opened, how many calls went through them, and how long the
+	// run spent waiting on tools that cost no tokens.
+	MCP   []mcp.Stats
+	Spent core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.
@@ -474,6 +526,13 @@ func stageDetail(s *pipeline.Stage) string {
 	if len(s.Opts.Broadcasts) > 0 {
 		names := slices.Sorted(slices.Values(s.Opts.Broadcasts))
 		line("broadcasts readable: %s", strings.Join(slices.Compact(names), ", "))
+	}
+	for _, use := range s.Opts.MCP {
+		if len(use.Tools) == 0 {
+			line("mcp %s: every tool the server offers", use.Server)
+			continue
+		}
+		line("mcp %s: %s", use.Server, strings.Join(use.Tools, ", "))
 	}
 	if s.Opts.BatchSize > 1 {
 		line("batch: %d records per task", s.Opts.BatchSize)

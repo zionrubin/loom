@@ -64,6 +64,17 @@ const (
 	// and one that does not is the case the round cap exists for.
 	RoundStarted  EventType = "round.started"
 	RoundFinished EventType = "round.finished"
+	// MCPCalled reports one tool call to an MCP server: which server, which
+	// tool, how long it took, and whether it failed. It is the only event on
+	// this bus that describes work with no token cost, which is the point —
+	// a stage's wall-clock can be dominated by tools that cost nothing, and
+	// the cost report alone would never show it.
+	//
+	// Connecting to a server is deliberately not an event here. A connection
+	// is made before any run starts and outlives every run on the host, so it
+	// belongs to the audit log (action "mcp.connect") rather than to any one
+	// run's event stream.
+	MCPCalled EventType = "mcp.called"
 	// StageConverged closes an iterative stage with the reason it stopped
 	// (Note), the number of rounds it took, and the size of the graph it left
 	// behind. Convergence and exhaustion produce the same records, so the
@@ -107,6 +118,9 @@ type Event struct {
 	// snapshot (topic@n) that later agents pin, with Artifact its content hash.
 	Topic string `json:"topic,omitempty"`
 	Posts int    `json:"posts,omitempty"`
+	// Server and Tool name the MCP server and tool on mcp.called.
+	Server string `json:"server,omitempty"`
+	Tool   string `json:"tool,omitempty"`
 	// Round is the 1-based superstep number on round.* events, and the total
 	// number of rounds on stage.converged. Messages is how many messages were
 	// delivered into the round.
@@ -228,9 +242,15 @@ type StageStats struct {
 	// Rounds counts the supersteps an iterative stage ran (0 for every other
 	// kind of stage). Tasks and cost are already per stage; this is what says
 	// whether they were spent once or ten times over.
-	Rounds   int
-	Started  time.Time
-	Finished time.Time
+	Rounds int
+	// ToolCalls counts MCP tool calls the stage's tasks made, and ToolTime the
+	// wall-clock they took. They buy nothing in tokens and can dominate a
+	// stage's duration, so a report that only totalled cost would explain a
+	// slow stage as a fast one.
+	ToolCalls int
+	ToolTime  time.Duration
+	Started   time.Time
+	Finished  time.Time
 
 	latencies []time.Duration
 }
@@ -286,6 +306,17 @@ func (r RunReport) PrefixSavedUSD() float64 {
 	return total
 }
 
+// ToolCalls sums the MCP tool calls the run made and the time they took.
+func (r RunReport) ToolCalls() (int, time.Duration) {
+	var calls int
+	var dur time.Duration
+	for _, s := range r.Stages {
+		calls += s.ToolCalls
+		dur += s.ToolTime
+	}
+	return calls, dur
+}
+
 // Duration is total run wall time.
 func (r RunReport) Duration() time.Duration {
 	if r.Started.IsZero() || r.Finished.IsZero() {
@@ -317,6 +348,10 @@ func (r RunReport) String() string {
 		if s.Rounds > 0 {
 			fmt.Fprintf(&b, "%s: %d rounds\n", s.Stage, s.Rounds)
 		}
+	}
+	if calls, dur := r.ToolCalls(); calls > 0 {
+		fmt.Fprintf(&b, "mcp: %d tool call(s), %s spent in them (no tokens, no cost)\n",
+			calls, dur.Round(time.Millisecond))
 	}
 	return b.String()
 }
@@ -374,6 +409,10 @@ func (c *Collector) Handle(e Event) {
 		c.stage(e.Stage).CacheHits++
 	case RoundFinished:
 		c.stage(e.Stage).Rounds++
+	case MCPCalled:
+		s := c.stage(e.Stage)
+		s.ToolCalls++
+		s.ToolTime += e.Latency
 	case ModelCalled:
 		s := c.stage(e.Stage)
 		s.ModelCalls++

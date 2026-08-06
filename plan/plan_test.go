@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/security"
@@ -372,5 +373,115 @@ func TestPrefixCacheEnabledOnlyWhenShared(t *testing.T) {
 		if !tk.Envelope.CachePrefix {
 			t.Errorf("task %d: prefix caching off despite %d tasks sharing the prefix", i, len(many))
 		}
+	}
+}
+
+// manifest builds a discovered manifest for a server offering two tools, as
+// the host's catalog would after connecting.
+func manifest(t *testing.T, extra string) mcp.Manifest {
+	t.Helper()
+	return mcp.Manifest{"catalog": mcp.ServerManifest{
+		Name:     "catalog",
+		Endpoint: "mcp.example",
+		Tools: []mcp.ToolDesc{
+			{Name: "lookup_sku", Description: "resolve a sku" + extra},
+			{Name: "stock_level", Description: "units on hand"},
+		},
+		Discovered: true,
+	}}
+}
+
+func mcpStage(t *testing.T, tools ...string) *StagePlan {
+	t.Helper()
+	p := pipeline.New("t")
+	src := p.FromRecords("src", nil)
+	src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+		return r, nil
+	}, pipeline.WithMCP("catalog", tools...), pipeline.WithVersion("v1"))
+
+	pl, err := Compile(p, reg(t), WithMCP(manifest(t, "")))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	return pl.ByID["enrich"]
+}
+
+// An MCP declaration produces exactly three things in the envelope: a grant per
+// declared tool, the server's host on the egress allowlist, and the digest of
+// the contract the stage was compiled against. It carries no connection.
+func TestEnvelopeCarriesMCPByReference(t *testing.T) {
+	env := mcpStage(t, "lookup_sku").Envelope("run1", nil)
+
+	if !env.Grants.Has(security.ToolCap("mcp/catalog/lookup_sku")) {
+		t.Error("envelope missing the declared tool grant")
+	}
+	if env.Grants.Has(security.ToolCap("mcp/catalog/stock_level")) {
+		t.Error("declaring one tool must not grant its neighbours")
+	}
+	if !env.Egress.Allowed("mcp.example") {
+		t.Errorf("the server's host must be on the egress allowlist: %v", env.Egress.Hosts)
+	}
+	if got := env.MCP["catalog"]; got == "" {
+		t.Error("envelope must pin the tool-descriptor digest")
+	}
+}
+
+// The digest joins the fingerprint, so a server whose tools changed is a
+// different operation — while a stage that declared a different tool on the
+// same server is unaffected by the change.
+func TestMCPDigestNarrowsCacheInvalidation(t *testing.T) {
+	p := func(t *testing.T, m mcp.Manifest, tools ...string) *StagePlan {
+		t.Helper()
+		pl := pipeline.New("t")
+		src := pl.FromRecords("src", nil)
+		src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+			return r, nil
+		}, pipeline.WithMCP("catalog", tools...), pipeline.WithVersion("v1"))
+		compiled, err := Compile(pl, reg(t), WithMCP(m))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return compiled.ByID["enrich"]
+	}
+
+	before, after := manifest(t, ""), manifest(t, " (now with locale)")
+	if a, b := p(t, before, "lookup_sku"), p(t, after, "lookup_sku"); a.Fingerprint == b.Fingerprint {
+		t.Error("a changed tool descriptor must change the fingerprint of a stage that declared it")
+	}
+	if a, b := p(t, before, "stock_level"), p(t, after, "stock_level"); a.Fingerprint != b.Fingerprint {
+		t.Error("a stage that never declared the changed tool must keep its cached results")
+	}
+
+	// A pipeline with no MCP fingerprints exactly as it did before the feature
+	// existed, so adopting MCP elsewhere leaves existing caches warm.
+	plain := pipeline.New("t")
+	plain.FromRecords("src", nil).Map("x", func(r core.Record) (core.Record, error) { return r, nil },
+		pipeline.WithVersion("v1"))
+	withCatalog, err := Compile(plain, reg(t), WithMCP(manifest(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := Compile(plain, reg(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withCatalog.ByID["x"].Fingerprint != without.ByID["x"].Fingerprint {
+		t.Error("a stage that declares no MCP must fingerprint identically either way")
+	}
+}
+
+func TestMCPUnknownServerAndToolFailCompilation(t *testing.T) {
+	build := func(server string, tools ...string) *pipeline.Pipeline {
+		p := pipeline.New("t")
+		p.FromRecords("src", nil).MapTools("enrich",
+			func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) { return r, nil },
+			pipeline.WithMCP(server, tools...))
+		return p
+	}
+	if _, err := Compile(build("nope"), reg(t), WithMCP(manifest(t, ""))); err == nil {
+		t.Error("an unregistered server must fail compilation")
+	}
+	if _, err := Compile(build("catalog", "no_such_tool"), reg(t), WithMCP(manifest(t, ""))); err == nil {
+		t.Error("a tool the server does not offer must fail compilation")
 	}
 }
