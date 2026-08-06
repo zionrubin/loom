@@ -9,6 +9,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/zionrubin/loom/algo"
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
@@ -451,8 +452,122 @@ func (e *explainer) stage(sp *plan.StagePlan) (StageProjection, error) {
 
 	case pipeline.KindReduceAI:
 		e.reduce(sp, input, &out)
+
+	case pipeline.KindIterate:
+		e.iterate(sp, input, &out)
 	}
 	return out, nil
+}
+
+// iterate projects an iterative stage: cost per round, multiplied out to the
+// round cap.
+//
+// The round count is the one thing a plan genuinely cannot know — it is a
+// property of the data and of a model's judgement about it — so the projection
+// does not pretend to. It prices MaxRounds rounds, which is the number
+// HaltWhen.Budget needs and the only one that is safe to be wrong about in the
+// direction it is wrong: a loop that converges early costs less than this, and
+// under-counting a loop is how a budget gets set below what the first
+// unconverged run will spend.
+//
+// Round 0 is exact rather than assumed. An algorithm's Seed is a pure function
+// of the vertex table, so the projection calls it and counts the frontier it
+// returns instead of guessing that every record starts active — a stage seeded
+// from one vertex of a thousand is projected as one call, not a thousand.
+func (e *explainer) iterate(sp *plan.StagePlan, input []core.Record, out *StageProjection) {
+	s := sp.Stage
+	spec := s.Iterate
+	rounds := spec.Halt.MaxRounds
+
+	frontier := len(input)
+	if tbl, err := newVertexTable(input); err != nil {
+		e.warnf("stage %q: %v; the projection assumes every record starts active", s.ID, err)
+	} else if msgs, err := spec.Algorithm.Seed(tbl); err != nil {
+		e.warnf("stage %q: the %s algorithm's Seed failed during projection (%v), "+
+			"so round 0 is assumed to start every record", s.ID, spec.Algorithm.Name(), err)
+	} else {
+		seen := map[string]bool{}
+		for _, m := range msgs {
+			seen[m.To] = true
+		}
+		frontier = len(seen)
+	}
+
+	// How wide a later round can get. A frontier cap bounds it outright; a
+	// closed graph bounds it at the vertex count, because a message can only
+	// wake a vertex that exists. A stage that can grow and has no cap has no
+	// bound at all, and saying so is the whole job here.
+	bound := spec.MaxFrontier
+	switch {
+	case bound > 0:
+		if spec.Grow == nil {
+			bound = min(bound, len(input))
+		}
+	case spec.Grow == nil:
+		bound = len(input)
+	default:
+		bound = frontier
+		out.Estimated = true
+		e.warnf("stage %q can create vertices (Grow) and sets no MaxFrontier, so its "+
+			"frontier — and its cost — is unbounded by the plan: this row prices %d "+
+			"round(s) at round 0's frontier of %d and is a floor, not a ceiling "+
+			"(set pipeline.IterateSpec.MaxFrontier to bound it)", s.ID, rounds, frontier)
+	}
+
+	out.Calls = frontier + (rounds-1)*bound
+	// One vertex per task, whatever the stage's batch size: the loop forces it
+	// so that per-vertex cache keys stay per-vertex.
+	out.Tasks = out.Calls
+
+	if len(sp.Candidates) == 0 {
+		return
+	}
+	info := sp.Candidates[0]
+	out.Model = info.ID
+	out.CachePrefix = out.Tasks > 1 && !s.Opts.NoPrefixCache && !spec.Step.Binding.IsZero()
+
+	maxTokens := spec.Step.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+	expected := max(1, int(e.ratio*float64(maxTokens)))
+	shared := model.EstimateTokens(spec.Step.System) +
+		model.EstimateTokens(e.renderPrefix(s.ID, spec.Step.Prefix, spec.Step.Context, sp.Broadcasts))
+
+	// Round 0's prompts, measured against the records that will produce them
+	// with the empty inbox a seeded vertex actually reads.
+	seeded := make([]core.Record, 0, len(input))
+	for _, r := range input {
+		c := r.Clone()
+		c.Data[algo.FieldInbox] = []string{}
+		c.Data[algo.FieldSenders] = []string{}
+		seeded = append(seeded, c)
+	}
+	perRound := e.renderPrompts(s.ID, spec.Step.Prompt, seeded, sp.Broadcasts)
+
+	// Later rounds carry inboxes, and an inbox is model output: its size is not
+	// derivable from the plan any more than a response length is. Repeating
+	// round 0's prompt sizes is therefore a floor on the prompt side, and it is
+	// named as one rather than presented as a measurement.
+	prompts := make([]int, 0, out.Calls)
+	for i := 0; i < out.Calls; i++ {
+		if len(perRound) == 0 {
+			break
+		}
+		prompts = append(prompts, perRound[i%len(perRound)])
+	}
+	if rounds > 1 && spec.MaxInbox != 1 {
+		e.warnf("stage %q prices every round at round 0's prompt sizes, but rounds "+
+			"after the first also carry an inbox, whose size is model output: the "+
+			"prompt side of this row is a floor (pipeline.IterateSpec.MaxInbox bounds it)",
+			s.ID)
+	}
+
+	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	// The vertices the stage leaves behind, standing in for downstream stages.
+	// A stage that grows its graph leaves more than this, and the warning
+	// above says so.
+	e.recs[s.ID] = e.inferOutputs(s.ID, &spec.Step, input, expected)
 }
 
 // applyFused runs a fused stage's pure functions for real. They are ordinary
@@ -556,7 +671,7 @@ func (e *explainer) infer(sp *plan.StagePlan, input []core.Record, out *StagePro
 	prompts := e.renderPrompts(s.ID, spec.Prompt, input, sp.Broadcasts)
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
-	e.recs[s.ID] = e.inferOutputs(s, input, expected)
+	e.recs[s.ID] = e.inferOutputs(s.ID, spec, input, expected)
 }
 
 // reduce projects a hierarchical AI reduce: each level groups the level below
@@ -756,30 +871,33 @@ func estimateEach(prompt string, n int) []int {
 // reading this stage's output measures a prompt of the right order — the
 // alternative, an empty field, would under-count every prompt after the first
 // inference in a chain.
-func (e *explainer) inferOutputs(s *pipeline.Stage, input []core.Record, expected int) []core.Record {
-	field := s.Infer.OutputField
+// The spec is passed rather than read off the stage because an iterative
+// stage's step is an InferSpec too, and stands in for its vertices the same
+// way.
+func (e *explainer) inferOutputs(stageID string, spec *pipeline.InferSpec, input []core.Record, expected int) []core.Record {
+	field := spec.OutputField
 	if field == "" {
 		field = "output"
 	}
-	sample, sampled := e.cfg.StageSamples[s.ID]
-	if s.Infer.ParseJSON && !sampled {
+	sample, sampled := e.cfg.StageSamples[stageID]
+	if spec.ParseJSON && !sampled {
 		// This is the one way a projection can be wrong in the dangerous
 		// direction. A downstream Filter testing a field the model was going to
 		// invent sees it missing, drops every record, and everything past it
 		// projects as no work at all — so the total understates the run rather
 		// than bounding it. Say so, and say how to fix it.
-		e.tainted[s.ID] = true
+		e.tainted[stageID] = true
 		e.warnf("stage %q parses its output as JSON, so the fields it adds to each "+
 			"record are not knowable from the plan: stages below it are estimated, "+
 			"and a filter testing one of those fields will drop every record here "+
 			"while keeping them in the real run. Name the fields with "+
-			"loom.WithStageSample(%q, ...) to project them exactly", s.ID, s.ID)
+			"loom.WithStageSample(%q, ...) to project them exactly", stageID, stageID)
 	}
 	placeholder := strings.Repeat("x", 4*expected)
 	out := make([]core.Record, 0, len(input))
 	for _, r := range input {
 		nr := r.Clone()
-		if s.Infer.ParseJSON {
+		if spec.ParseJSON {
 			for k, v := range sample {
 				nr.Data[k] = v
 			}

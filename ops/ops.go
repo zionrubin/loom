@@ -38,6 +38,23 @@ func BuildRunners(pl *plan.Plan) (map[string]executor.OpRunner, error) {
 				return nil, err
 			}
 			runners[s.ID] = &inferRunner{spec: s.Infer, tmpl: tmpl, prefix: prefix}
+		case pipeline.KindIterate:
+			// A round's task is a per-record inference, so it runs on the
+			// inference runner unchanged. What makes it a round is the
+			// driver's loop around it and the inbox the driver wrote into the
+			// record — neither of which the op needs to know about, which is
+			// why iteration required no new execution machinery.
+			step := &s.Iterate.Step
+			tmpl, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(step.Prompt)
+			if err != nil {
+				return nil, err
+			}
+			prefix, err := parsePrefix(s.ID, step.Prefix)
+			if err != nil {
+				return nil, err
+			}
+			runners[s.ID] = &inferRunner{spec: step, tmpl: tmpl, prefix: prefix}
 		case pipeline.KindReduceAI:
 			tmpl, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
 				Parse(s.Reduce.Prompt)
