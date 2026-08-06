@@ -437,9 +437,13 @@ dollar-bounded halting, cost per round that *falls* as vertices go quiet and
 their cache keys stop changing, envelope containment for a program that
 discovers its own targets, and lineage across hops.
 
-Still open in this phase: the constellation view drawing supersteps as
-concentric orbits, and the inbox tree-reduce for high-degree vertices (today a
-cap, which is blunt but reported).
+The constellation view draws such a stage as concentric orbits — one ring per
+superstep, the live ring turning, the outer rings thinning as vertices go quiet
+— with the per-round frontier and the halt reason in the stage inspector, in the
+colour that says whether the loop converged or was cut off.
+
+Still open in this phase: the inbox tree-reduce for high-degree vertices (today
+a cap, which is blunt but reported).
 
 **Also on the roadmap:**
 - **Semantic caching** — embedding-similarity lookup in front of the exact
@@ -470,6 +474,6 @@ OpenAI providers, and cross-restart cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
-operators, priority/preemptive scheduling, result-cache eviction, the inbox
-tree-reduce for high-degree vertices, and superstep orbits in the constellation
-view. The interfaces above are the contract those implementations plug into.
+operators, priority/preemptive scheduling, result-cache eviction, and the inbox
+tree-reduce for high-degree vertices. The interfaces above are the contract
+those implementations plug into.

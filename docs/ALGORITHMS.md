@@ -342,10 +342,55 @@ budget is set from.
 | `round.finished` | round number, vertices that completed, usage |
 | `stage.converged` | total rounds, final graph size, halt reason |
 
-These are the only events describing a stage that runs more than once, and the
-pair is what makes convergence *observable* rather than inferable: a frontier
+These are the only events describing a stage that runs more than once, and
+they are what makes convergence *observable* rather than inferable: a frontier
 that shrinks round over round is a computation settling, and one that does not
 is the case the round cap exists for.
+
+### In the constellation view
+
+The view (`viz`) draws an iterative stage as **concentric orbits** — one ring
+per superstep, round 1 innermost, the live ring dashed and turning while the
+loop runs. Convergence is then something you watch rather than something you
+reconstruct afterwards: the outer rings carry fewer stars than the ones inside
+them, and a ring that does not thin is a loop that is not settling.
+
+```sh
+go run ./examples/multi-hop -view localhost:8077 -slow 900ms
+```
+
+Every task is stamped with the superstep it ran in — a round is a barrier, so
+the round open when a task was scheduled is the round it belongs to — which is
+what the rings are laid out from and what the task inspector shows.
+
+The stage label carries the outcome (`explore ⟳5 · converged`), and the stage
+inspector carries the mechanism: the per-round table of active vertices,
+messages and cost, with bars whose widths are the frontier, under a plain
+sentence about the halt.
+
+```
+SUPERSTEPS · 5                       SUPERSTEPS · 2
+ROUND ACTIVE MSGS COST               ROUND ACTIVE MSGS COST
+1     2      0    $0.0005 ▬▬▬        1     2      0    $0.0005 ▬▬▬
+2     4      8    $0.0008 ▬▬▬▬▬▬     2     4      8    $0.0008 ▬▬▬▬▬▬
+3     3      6    $0.0006 ▬▬▬▬▬
+4     2      2    $0.0004 ▬▬▬        halted  rounds — hit the round cap —
+5     1      1    $0.0002 ▬                  it did NOT converge
+
+halted  quiet — a round produced no    frontier is still at its widest (4):
+        messages; the computation      nothing has gone quiet yet — this
+        converged                      loop was cut off, not finished
+
+frontier peaked at 4, down to 1:
+vertices are going quiet, so each
+round costs less than the one before
+```
+
+Those two are the same pipeline over the same corpus, at `-rounds 5` and
+`-rounds 2`. They return records that look alike; the reason is the only thing
+that says one of them answered the question. It is coloured accordingly —
+green for the two halts that mean converged, amber for the two that mean cut
+off — because that distinction is the one a viewer must never have to infer.
 
 `RunResult.Iteration(stage)` is the same thing after the fact:
 

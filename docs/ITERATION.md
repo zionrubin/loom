@@ -299,11 +299,20 @@ actually spent    0 tokens / $0.0000 over 5 round(s), halted: quiet
 15 task(s) replayed from the result cache
 ```
 
-Still open, and still a natural addition: the constellation view drawing
-supersteps as concentric orbits, so convergence is something you *watch* — the
-outer rings thinning as vertices go quiet. The events it needs now exist
-(`round.started`, `round.finished`, `stage.converged`), so this is a view
-change rather than an engine one.
+The constellation view draws the supersteps as concentric orbits, exactly as
+this section asked for: one ring per round, round 1 innermost, the live ring
+dashed and turning, and the outer rings thinning as vertices go quiet.
+
+```sh
+go run ./examples/multi-hop -view localhost:8077 -slow 900ms
+```
+
+Convergence is something you watch there rather than tally afterwards. The
+stage inspector carries the rest — active vertices, messages and cost per
+round, with bars whose widths are the frontier — under the halt reason in plain
+words. Run the same pipeline at `-rounds 2` and that panel turns amber and says
+the loop was cut off rather than finished, which is the one thing the records
+themselves cannot tell you.
 
 ## 7. What this is deliberately not
 

@@ -128,6 +128,19 @@
   .kv dt { color: var(--ink-3); }
   .kv dd { color: var(--ink-2); font-variant-numeric: tabular-nums; word-break: break-word; }
   .kv dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  /* Supersteps of an iterative stage. The bar column is the point: the
+     numbers say what each round cost, the widths say whether it converged. */
+  table.rounds { width: 100%; border-collapse: collapse; font-size: 11.5px;
+                 font-variant-numeric: tabular-nums; }
+  table.rounds th { color: var(--ink-3); font-weight: 400; text-align: left;
+                    font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+                    padding-bottom: 3px; }
+  table.rounds td { color: var(--ink-2); padding: 1px 8px 1px 0; white-space: nowrap; }
+  table.rounds tr.live td { color: #8fb8ff; }
+  table.rounds td.bar { width: 46%; padding-right: 0; }
+  table.rounds td.bar span { display: block; height: 6px; border-radius: 3px;
+                             background: rgba(143,184,255,.34); }
+  table.rounds tr.live td.bar span { background: rgba(143,184,255,.7); }
   #panel h4 {
     font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
     color: var(--ink-3); margin: 16px 0 6px;
@@ -682,7 +695,39 @@ function hash(s) {
   return (h >>> 0);
 }
 
+// Why an iterative stage stopped. Two of these mean it finished and two mean
+// it was cut off, and the records it leaves behind are identical either way —
+// which is exactly why the view says it in words rather than making a viewer
+// infer it from a round count.
+const HALT_WHY = {
+  quiet: 'a round produced no messages; the computation converged',
+  fixpoint: 'every vertex had already run on that exact state and inbox',
+  rounds: 'hit the round cap — it did NOT converge',
+  budget: 'hit the stage budget or the run governor — it did NOT converge',
+  failed: 'a round could not complete',
+};
+function haltColor(h) {
+  return h === 'quiet' || h === 'fixpoint' ? COLORS.done
+       : h === 'failed' ? COLORS.fail : COLORS.long;
+}
+// On the sky there is room for the outcome but not for the mechanism, and the
+// mechanism's names read wrong beside a round count — "⟳2 rounds" looks like a
+// number, not like the reason the loop stopped. The precise term is kept in the
+// inspector, where it comes with the sentence that explains it.
+const HALT_SHORT = {
+  quiet: 'converged', fixpoint: 'converged',
+  rounds: 'hit round cap', budget: 'hit budget', failed: 'failed',
+};
+
 const GOLDEN = 2.39996322973;
+
+// orbitRadius places superstep n's ring inside a stage's cluster. The
+// innermost ring is held off the centre, or a round that ran a single vertex
+// would put it exactly on the cluster's midpoint and read as no ring at all.
+function orbitRadius(st, n) {
+  const rounds = Math.max(st._rounds || 1, 1);
+  return st._rMax * (0.34 + 0.66 * (n - 0.5) / rounds);
+}
 function computeLayout() {
   const panelOpen = typeof panel !== 'undefined' && panel.classList.contains('open');
   // On narrow viewports the inspector covers most of the sky; keep the full
@@ -697,13 +742,29 @@ function computeLayout() {
   // the sky (edges reroute to the nearest visible upstream ancestor).
   const visible = S.stages.filter(st => counts.get(st.id));
   const k = Math.max(visible.length, 1);
-  S.stages.forEach(st => { st._cx = undefined; });
+  S.stages.forEach(st => { st._cx = undefined; st._rounds = 0; });
+
+  // An iterative stage is not one cluster of tasks but a sequence of them, so
+  // it is laid out as concentric orbits — one ring per superstep, round 1
+  // innermost. That makes convergence something you *watch* rather than
+  // something you read off a counter afterwards: the outer rings carry fewer
+  // stars than the ones inside them, and a ring that does not thin is a loop
+  // that is not settling.
+  const ringN = new Map(), ringSeen = new Map(), lastRound = new Map();
+  S.tasks.forEach(t => {
+    if (!t.round) return;
+    const key = t.stage + '\u0000' + t.round;
+    ringN.set(key, (ringN.get(key) || 0) + 1);
+    lastRound.set(t.stage, Math.max(lastRound.get(t.stage) || 0, t.round));
+  });
+
   visible.forEach((st, i) => {
     const fx = (i + 0.5) / k;
     st._cx = mX + usableW * fx;
     st._cy = midY - Math.sin(Math.PI * fx) * (H * 0.07)
            + ((hash(st.id) % 100) / 100 - 0.5) * (H * 0.10);
     st._rMax = Math.max(34, Math.min(usableW / k * 0.40, (H - top - beltH) * 0.30));
+    st._rounds = lastRound.get(st.id) || 0;
   });
 
   const idxIn = new Map();
@@ -712,6 +773,24 @@ function computeLayout() {
     const i = idxIn.get(t.stage) || 0;
     idxIn.set(t.stage, i + 1);
     if (!st || st._cx === undefined) { t._tx = mX + usableW / 2; t._ty = midY; return; }
+
+    if (t.round && st._rounds) {
+      const key = t.stage + '\u0000' + t.round;
+      const n = ringN.get(key) || 1;
+      const j = ringSeen.get(key) || 0;
+      ringSeen.set(key, j + 1);
+      const r = orbitRadius(st, t.round);
+      // Spread the ring's vertices evenly and turn each round a little, so
+      // successive orbits do not line their stars up into spokes.
+      const th = (j / n) * Math.PI * 2 + t.round * 0.7 + (hash(t.stage) % 628) / 100;
+      t._tx = st._cx + r * Math.cos(th);
+      t._ty = st._cy + r * Math.sin(th) * 0.86;
+      // A vertex enters at the centre and eases out to its ring: a round is
+      // work sent outward from the stage, and it reads that way.
+      if (t._x === undefined) { t._x = st._cx; t._y = st._cy; }
+      return;
+    }
+
     const count = counts.get(t.stage) || 1;
     const r = st._rMax * Math.sqrt((i + 0.65) / Math.max(count, 7));
     const th = i * GOLDEN + (hash(t.stage) % 628) / 100;
@@ -1115,10 +1194,46 @@ function draw(tms) {
     ctx.stroke();
   }
 
+  // Superstep orbits. Drawn under everything else, and drawn at all only for
+  // stages that ran more than once — the ring is the round, and the stars on
+  // it are the vertices that were still active when it came around.
+  for (const st of S.stages) {
+    if (st._cx === undefined || !st._rounds) continue;
+    const halted = !!st.halt;
+    for (let n = 1; n <= st._rounds; n++) {
+      const r = orbitRadius(st, n);
+      // The newest ring is the live one while the loop is running: brighter,
+      // and turning. Once it has halted every ring is history and reads flat.
+      const live = !halted && n === st._rounds;
+      ctx.strokeStyle = live ? 'rgba(143,184,255,.30)' : 'rgba(140,160,220,.11)';
+      ctx.lineWidth = 1;
+      if (live && !reduceMotion) {
+        ctx.setLineDash([4, 8]);
+        ctx.lineDashOffset = -(tms / 220) % 12;
+      }
+      ctx.beginPath();
+      ctx.ellipse(st._cx, st._cy, r, r * 0.86, 0, 0, 6.2832);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Number the rings when there is room to read them.
+      if (st._rounds <= 8 && !lod) {
+        ctx.save();
+        ctx.font = '9px system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = live ? 'rgba(143,184,255,.6)' : 'rgba(140,160,220,.28)';
+        ctx.fillText(String(n), st._cx + r + 3, st._cy + 3);
+        ctx.restore();
+      }
+    }
+  }
+
   // intra-cluster web (skip on large runs)
   if (taskN < 400) {
     const perStage = new Map();
     for (const t of S.tasks) {
+      // An iterative stage's structure is its orbits; threading its tasks in
+      // arrival order would draw lines across the rings and hide them.
+      if (t.round) continue;
       const prev = perStage.get(t.stage);
       if (prev) {
         ctx.strokeStyle = 'rgba(140,160,220,.06)';
@@ -1169,7 +1284,12 @@ function draw(tms) {
   for (const st of S.stages) {
     if (st._cx === undefined) continue;
     const stats = stageStats.get(st.id) || { total: 0, settled: 0 };
-    const label = `${st.id}  ${stats.settled}/${stats.total} ⓘ`;
+    // An iterative stage names its rounds, and once it has stopped it names
+    // *why* — converging and running out of budget leave the same stars behind,
+    // so the reason is the only thing that tells them apart.
+    const loop = st._rounds
+      ? `⟳${st._rounds}${st.halt ? ' · ' + (HALT_SHORT[st.halt] || st.halt) : ''}  ` : '';
+    const label = `${st.id}  ${loop}${stats.settled}/${stats.total} ⓘ`;
     const lx = st._cx, ly = st._cy + st._rMax + 18;
     const active = hoveredStage === st || (selected && selected.type === 'stage' && selected.id === st.id);
     ctx.fillStyle = active ? '#c3c2b7' : (st.status === 'done' ? '#5f5e58' : '#898781');
@@ -1562,6 +1682,7 @@ function renderPanel() {
     ['attempts', `${t.attempts || 0}${t.retries ? ` <span style="color:${COLORS.retry}">(${t.retries} ${t.retries === 1 ? 'retry' : 'retries'})</span>` : ''}`],
     ['records in', String(t.records || 0)],
     ['records out', t.outputIds ? String(t.outputIds.length) : '—'],
+    ...(t.round ? [['superstep', `round ${t.round} of ${jumpBtn('stage', t.stage)}`]] : []),
     ['runtime', (t.endedAt ? '' : '⏱ ') + fmtDur(runtime)],
     ['last latency', t.latencyMs ? fmtDur(t.latencyMs) : '—'],
     ['model calls', String(t.calls || 0)],
@@ -1735,6 +1856,7 @@ function renderStagePanel(title, body) {
   const dur = st.startedAt ? (st.endedAt || now) - st.startedAt : null;
   const statusTxt = st.status === 'done' ? '✦ done' : '◉ running';
 
+  const rounds = st.rounds || [];
   const rows = [
     ['kind', esc(st.kind || '—')],
     ['upstream', st.upstream ? jumpBtn('stage', st.upstream) : '— (pipeline root)'],
@@ -1748,6 +1870,14 @@ function renderStagePanel(title, body) {
     ['cost', fmtCost(cost)],
     ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
   ];
+  if (rounds.length) {
+    rows.splice(2, 0,
+      ['rounds', `${rounds.length}${st.halt ? '' : ' <span class="none">· still running</span>'}`],
+      ['halted', st.halt
+        ? `<span style="color:${haltColor(st.halt)}">${esc(st.halt)}</span> ` +
+          `<span class="none">— ${esc(HALT_WHY[st.halt] || '')}</span>`
+        : '<span class="none">— still iterating</span>']);
+  }
   // What this stage was projected to cost, beside what it is costing. The
   // comparison is the point: a stage tracking its forecast needs no attention,
   // and one running past it is the thing you want to find while there is still
@@ -1789,6 +1919,41 @@ function renderStagePanel(title, body) {
   }
   let html = `<span class="status-chip" style="color:${st.status === 'done' ? COLORS.done : COLORS.running}">${statusTxt}</span>`;
   html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
+
+  // The per-round shape. A total says what the loop cost; only the sequence
+  // says whether it was converging — a frontier that narrows is settling, one
+  // that holds steady is oscillating, and one that grows is the case the
+  // frontier cap exists for. The bars are widths, so the slope is the thing
+  // you see first.
+  if (rounds.length) {
+    const peak = Math.max(...rounds.map(r => r.active), 1);
+    html += `<h4>supersteps · ${rounds.length}</h4><table class="rounds">` +
+      '<tr><th>round</th><th>active</th><th>msgs</th><th>cost</th><th></th></tr>' +
+      rounds.map(r => {
+        const running = !r.endedAt;
+        const w = Math.max(2, Math.round(100 * r.active / peak));
+        return `<tr${running ? ' class="live"' : ''}>` +
+          `<td>${r.n}</td><td>${r.active}</td>` +
+          `<td>${r.messages || 0}</td>` +
+          `<td>${r.endedAt ? fmtCost(r.costUsd || 0) : '⏱'}</td>` +
+          `<td class="bar"><span style="width:${w}%"></span></td></tr>`;
+      }).join('') + '</table>';
+    // Read the shape against its peak, not its first round. A walk that goes
+    // 2 → 4 → 3 → 2 → 1 converged; comparing only its ends would call that
+    // "narrowed 2 → 1" and miss both the discovery and the settling.
+    const last = rounds[rounds.length - 1].active;
+    if (rounds.length > 1) {
+      html += `<div class="none" style="margin-top:6px">` +
+        (last < peak
+          ? `frontier peaked at ${peak}, down to ${last}: vertices are going ` +
+            `quiet, so each round costs less than the one before it`
+          : `frontier is still at its widest (${peak}): nothing has gone quiet yet` +
+            (st.halt === 'rounds' || st.halt === 'budget'
+              ? ` — this loop was cut off, not finished` : '')) +
+        `</div>`;
+    }
+  }
+
   if (st.detail) html += `<h4>what this stage does</h4><pre>${esc(st.detail)}</pre>`;
   if (failedTasks.length) {
     html += `<h4>failed tasks</h4><div class="lineage">` +

@@ -90,10 +90,29 @@ actually spent    0 tokens / $0.0000 over 5 round(s), halted: quiet
 Five rounds replay for free, because a vertex's cache key is its state and its
 inbox rather than the round it is in.
 
+## Watching it
+
+```sh
+go run ./examples/multi-hop -view localhost:8077 -slow 900ms
+```
+
+The constellation view draws the iterative stage as **concentric orbits** — one
+ring per superstep, round 1 innermost, the live ring dashed while it turns. The
+outer rings carry fewer stars than the ones inside them, which is convergence,
+seen rather than tallied. `-slow` is what makes it watchable at all: nine papers
+over five rounds is otherwise four milliseconds of work.
+
+Click the `explore` label for the per-round table — active vertices, messages,
+cost, and a bar whose width is the frontier — under the halt reason in plain
+words. Run it again with `-rounds 2` and the same panel turns amber: *hit the
+round cap — it did NOT converge*.
+
 ## Flags
 
 | flag | |
 |---|---|
+| `-view ADDR` | serve the constellation view, e.g. `localhost:8077`; it keeps serving after the run so the orbits stay readable |
+| `-slow D` | simulated per-call latency, e.g. `900ms`, so the rounds are watchable |
 | `-state DIR` | persistent cache directory; run twice to see the replay |
 | `-rounds N` | the superstep cap (default 5). Set it to 2 and the walk halts on `rounds` instead of `quiet`, never reaches `p7`, and the synthesis says outright that the question is not settled — the same pipeline over the same corpus, unable to answer because it was stopped one hop short |
 | `-budget USD` | the stage budget (default 2.00). Set it low and the loop halts on `budget` — and the pipeline continues with what the loop reached, which is the distinction from the run governor |

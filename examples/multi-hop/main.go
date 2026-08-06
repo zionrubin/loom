@@ -47,14 +47,19 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"time"
 
 	loom "github.com/zionrubin/loom"
 	"github.com/zionrubin/loom/algo"
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/viz"
 )
 
 const question = "Does sparse retrieval actually reduce end-to-end latency, " +
@@ -106,6 +111,8 @@ func main() {
 	state := flag.String("state", "", "directory for the persistent cache (rerun to replay for free)")
 	rounds := flag.Int("rounds", 5, "maximum supersteps")
 	budget := flag.Float64("budget", 2.00, "stage budget in USD")
+	addr := flag.String("view", "", "serve the constellation view on this address, e.g. localhost:8077")
+	slow := flag.Duration("slow", 0, "simulated per-call latency, so the rounds are watchable")
 	flag.Parse()
 
 	p, err := build(*rounds, *budget)
@@ -113,8 +120,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// The constellation view draws an iterative stage as concentric orbits —
+	// one ring per superstep, round 1 innermost — so convergence is something
+	// you watch rather than read off a counter afterwards: the outer rings
+	// carry fewer stars than the ones inside them. Pair it with -slow, or the
+	// whole walk is over before the first frame.
+	var handle func(observe.Event)
+	if *addr != "" {
+		v := viz.New()
+		url, err := v.Start(*addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("constellation view: %s\n", url)
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 30*time.Second)
+		if v.AwaitViewer(waitCtx) {
+			time.Sleep(800 * time.Millisecond) // a beat, so the empty sky is visible first
+		}
+		cancelWait()
+		handle = v.Handle
+	}
+
 	opts := []loom.Option{
-		loom.WithRegistry(registry()),
+		loom.WithRegistry(registry(*slow)),
 		loom.WithBroadcast("question", question),
 		loom.WithRunBudget(core.Budget{MaxCostUSD: 5}),
 		// The step parses its output as JSON, so the fields it adds are chosen
@@ -129,6 +157,11 @@ func main() {
 	if *state != "" {
 		opts = append(opts, loom.WithStateDir(*state))
 	}
+	if handle != nil {
+		// Explain publishes on the same bus, so the view holds the forecast
+		// before the sky has anything in it and reads the run against it.
+		opts = append(opts, loom.WithEventHandler(handle))
+	}
 
 	// Price the loop before running it. The round count is not knowable, so
 	// this prices the cap — deliberately an over-estimate, and the only
@@ -140,12 +173,23 @@ func main() {
 	fmt.Print(proj)
 	fmt.Println()
 
-	res, err := loom.Run(context.Background(), p, opts...)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	res, err := loom.Run(ctx, p, opts...)
 	if err != nil {
 		log.Fatalf("run: %v", err)
 	}
 
 	report(res, proj)
+
+	// A converged loop is worth reading after it stops — the orbits are still
+	// there, and the halt reason is the thing you came for — so the view keeps
+	// serving until you leave rather than vanishing with the process.
+	if *addr != "" {
+		fmt.Println("view still serving; ctrl-c to exit")
+		<-ctx.Done()
+	}
 }
 
 func build(rounds int, budget float64) (*pipeline.Pipeline, error) {
@@ -296,7 +340,10 @@ func clipTo(s string, n int) string {
 // this example is about — the projection, the stage budget, the admission
 // floor — are all computed from the registry. A free model would make every
 // one of them zero and the demonstration vacuous.
-func registry() *model.Registry {
+// latency, when non-zero, slows every simulated call so a run is watchable in
+// the constellation view. A five-round walk over nine papers is otherwise done
+// in four milliseconds.
+func registry(latency time.Duration) *model.Registry {
 	reg := model.NewRegistry()
 	for _, m := range []struct {
 		id      string
@@ -313,7 +360,8 @@ func registry() *model.Registry {
 	} {
 		if err := reg.Register(model.Info{
 			ID: m.id, Tier: m.tier, Pricing: m.pricing, Limits: m.limits,
-			Provider: model.NewMock(m.id, model.WithHandler(answer)),
+			Provider: model.NewMock(m.id,
+				model.WithHandler(answer), model.WithLatency(latency)),
 		}); err != nil {
 			log.Fatal(err)
 		}

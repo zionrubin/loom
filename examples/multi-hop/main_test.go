@@ -21,7 +21,7 @@ func runRounds(t *testing.T, rounds int, opts ...loom.Option) *loom.RunResult {
 		t.Fatalf("build: %v", err)
 	}
 	base := []loom.Option{
-		loom.WithRegistry(registry()),
+		loom.WithRegistry(registry(0)),
 		loom.WithBroadcast("question", question),
 		loom.WithRunBudget(core.Budget{MaxCostUSD: 5}),
 	}
@@ -128,7 +128,7 @@ func TestProjectionBoundsTheRun(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	opts := []loom.Option{
-		loom.WithRegistry(registry()),
+		loom.WithRegistry(registry(0)),
 		loom.WithBroadcast("question", question),
 		loom.WithStageSample("explore", map[string]any{
 			"finding": strings.Repeat("x", 120), "follow": []any{"p4"},

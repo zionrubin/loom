@@ -89,6 +89,9 @@ Continuum — and says which rows are honestly still empty.
   always apply — quiet, a round cap, a stage budget — and the stage reports which
   one stopped it, because converging and running out of money produce identical
   records.
+  The constellation view draws such a stage as concentric orbits — one ring per
+  superstep, the outer rings thinning as vertices go quiet — with the per-round
+  frontier and the halt reason in the stage inspector.
 - **Least-privilege task envelopes** — every task carries an explicit,
   serializable declaration of its model binding, capability grants, secret
   references, egress allowlist, context bundle, budget, and sandbox
@@ -205,6 +208,13 @@ go run ./examples/multi-hop
 # the same, twice, to see a converged loop replay for nothing
 go run ./examples/multi-hop -state /tmp/loom-hop
 go run ./examples/multi-hop -state /tmp/loom-hop   # 0 tokens, $0.0000
+
+# watch it converge: the constellation view draws an iterative stage as
+# concentric orbits, one ring per superstep, the live ring turning — the outer
+# rings thinning as vertices go quiet. Click the stage for the per-round table
+# and the halt reason; rerun with -rounds 2 to see the same panel say the loop
+# was cut off rather than finished
+go run ./examples/multi-hop -view localhost:8077 -slow 900ms
 
 # live constellation view: watch a run as a sky of task/executor stars —
 # pulsing while running, ringed when slow, flashing on completion, red on

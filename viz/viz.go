@@ -116,6 +116,10 @@ type Node struct {
 	CacheHit  bool     `json:"cacheHit,omitempty"`
 	// Broadcasts names the run-level shared values this task actually read.
 	Broadcasts []string `json:"broadcasts,omitempty"`
+	// Round is the superstep this task belongs to, 1-based, on an iterative
+	// stage (0 everywhere else). It is what lets the view draw a stage that
+	// ran more than once as something other than one undifferentiated cluster.
+	Round int `json:"round,omitempty"`
 	// Error intentionally has no omitempty: it clears when a retry succeeds,
 	// and clients that merge deltas must see the transition back to "".
 	Error string     `json:"error"`
@@ -191,6 +195,30 @@ type StageInfo struct {
 	// against what it was expected to cost while it is still running, rather
 	// than only in hindsight.
 	Proj *StageProjection `json:"proj,omitempty"`
+
+	// Rounds is the per-superstep shape of an iterative stage (pipeline.Iterate),
+	// empty for every other kind. Halt is why the loop stopped, once it has.
+	//
+	// A loop's output cannot be read on its own: the same records come back
+	// whether it settled in three rounds or was cut off mid-argument by the
+	// round cap. The rounds are that difference, and they are a list rather
+	// than a total because the signal in an iterative workload is a slope —
+	// a frontier that narrows is converging, one that does not is the case the
+	// cap exists for.
+	Rounds []RoundInfo `json:"rounds,omitempty"`
+	Halt   string      `json:"halt,omitempty"`
+}
+
+// RoundInfo is one superstep of an iterative stage.
+type RoundInfo struct {
+	N         int     `json:"n"`                  // 1-based superstep number
+	Active    int     `json:"active"`             // vertices that ran
+	Messages  int     `json:"messages,omitempty"` // messages delivered into the round
+	Done      int     `json:"done,omitempty"`     // vertices that completed
+	Tokens    int     `json:"tokens,omitempty"`
+	CostUSD   float64 `json:"costUsd,omitempty"`
+	StartedAt int64   `json:"startedAt,omitempty"`
+	EndedAt   int64   `json:"endedAt,omitempty"`
 }
 
 // StageProjection is one stage's forecast, published before the run by
@@ -371,6 +399,16 @@ type runState struct {
 	shared   []*BroadcastInfo
 	sharedIx map[string]*BroadcastInfo
 
+	// round is the superstep each iterative stage is currently in, so the
+	// tasks it schedules can be attributed to it.
+	//
+	// A round is a barrier — every task of superstep N is built, submitted and
+	// settled between that stage's round.started and round.finished — so the
+	// stage's current round is the round of any task it schedules. Keyed by
+	// stage rather than held as one value because a streaming run can have two
+	// iterative stages in flight at once.
+	round map[string]int
+
 	// The forecast this run was measured against (loom.Explain), and the
 	// run-level half of it. Held per run so a second pipeline's prediction
 	// never lands on the first one's stages.
@@ -395,6 +433,7 @@ func newRunState(hdr runHeader) *runState {
 		workIx:   map[string]*WorkerInfo{},
 		sharedIx: map[string]*BroadcastInfo{},
 		byStatus: map[string]int{},
+		round:    map[string]int{},
 	}
 }
 
@@ -608,6 +647,35 @@ func (s *Server) Handle(e observe.Event) {
 		st := r.stageLocked(e.Stage)
 		st.Status = "done"
 		st.EndedAt = now
+		delete(r.round, e.Stage)
+		d.Stage = st
+
+	case observe.RoundStarted:
+		st := r.stageLocked(e.Stage)
+		r.round[e.Stage] = e.Round
+		st.Rounds = append(st.Rounds, RoundInfo{
+			N: e.Round, Active: e.Records, Messages: e.Messages, StartedAt: now,
+		})
+		d.Stage = st
+
+	case observe.RoundFinished:
+		st := r.stageLocked(e.Stage)
+		if ri := roundOf(st, e.Round); ri != nil {
+			ri.Done = e.Records
+			ri.EndedAt = now
+			ri.Tokens = e.Usage.TotalTokens()
+			ri.CostUSD = e.Usage.CostUSD
+		}
+		d.Stage = st
+
+	case observe.StageConverged:
+		// Why the loop stopped. Converging and running out of budget return
+		// the same records, so this is the only thing that tells them apart —
+		// which makes it the one field of an iterative stage a viewer must not
+		// have to infer.
+		st := r.stageLocked(e.Stage)
+		st.Halt = e.Note
+		delete(r.round, e.Stage)
 		d.Stage = st
 
 	case observe.TaskScheduled:
@@ -615,7 +683,13 @@ func (s *Server) Handle(e observe.Event) {
 		n.Records = e.Records
 		n.Input = e.Input
 		n.InputIDs = e.InputIDs
-		logf(n, now, "scheduled (%d record%s)", e.Records, plural(e.Records))
+		n.Round = r.round[e.Stage]
+		if n.Round > 0 {
+			logf(n, now, "scheduled in round %d (%d vertex%s)", n.Round,
+				e.Records, map[bool]string{true: "", false: "es"}[e.Records == 1])
+		} else {
+			logf(n, now, "scheduled (%d record%s)", e.Records, plural(e.Records))
+		}
 		d.Task = n
 
 	case observe.TaskStarted:
@@ -951,6 +1025,16 @@ func (r *runState) stageLocked(id string) *StageInfo {
 	r.stageIx[id] = st
 	r.stages = append(r.stages, st)
 	return st
+}
+
+// roundOf finds a stage's record of one superstep.
+func roundOf(st *StageInfo, n int) *RoundInfo {
+	for i := range st.Rounds {
+		if st.Rounds[i].N == n {
+			return &st.Rounds[i]
+		}
+	}
+	return nil
 }
 
 func (r *runState) nodeLocked(id, stage string) *Node {
