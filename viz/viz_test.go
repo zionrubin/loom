@@ -794,3 +794,127 @@ func TestNoProjectionIsAbsentFromSnapshot(t *testing.T) {
 		t.Errorf("unprojected stage carries a proj key:\n%s", blob)
 	}
 }
+
+// feedRounds drives one iterative stage through three supersteps with a
+// shrinking frontier, the shape a converging loop actually makes.
+func feedRounds(v *Server) {
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_i", Pipeline: "walk", Time: at(1000)})
+	v.Handle(observe.Event{Type: observe.StageStarted, RunID: "run_i", Stage: "explore",
+		Kind: "iterate", Detail: "iterative · bsp algorithm", Time: at(1001)})
+
+	for _, r := range []struct{ n, active, msgs int }{{1, 3, 0}, {2, 2, 5}, {3, 1, 2}} {
+		v.Handle(observe.Event{Type: observe.RoundStarted, RunID: "run_i", Stage: "explore",
+			Round: r.n, Records: r.active, Messages: r.msgs, Time: at(int64(1000 + r.n*100))})
+		for i := 0; i < r.active; i++ {
+			id := fmt.Sprintf("t%d_%d", r.n, i)
+			v.Handle(observe.Event{Type: observe.TaskScheduled, RunID: "run_i", Stage: "explore",
+				TaskID: id, Records: 1, Time: at(int64(1000 + r.n*100 + 1))})
+			v.Handle(observe.Event{Type: observe.TaskStarted, RunID: "run_i", Stage: "explore",
+				TaskID: id, Worker: "w1", Attempt: 1, Time: at(int64(1000 + r.n*100 + 2))})
+			v.Handle(observe.Event{Type: observe.TaskCompleted, RunID: "run_i", Stage: "explore",
+				TaskID: id, Worker: "w1", Attempt: 1, Time: at(int64(1000 + r.n*100 + 50))})
+		}
+		v.Handle(observe.Event{Type: observe.RoundFinished, RunID: "run_i", Stage: "explore",
+			Round: r.n, Records: r.active, Time: at(int64(1000 + r.n*100 + 60)),
+			Usage: core.Usage{InputTokens: 10 * r.active, OutputTokens: r.active, CostUSD: 0.001 * float64(r.active)}})
+	}
+	v.Handle(observe.Event{Type: observe.StageConverged, RunID: "run_i", Stage: "explore",
+		Round: 3, Records: 6, Note: "quiet", Time: at(1400)})
+	v.Handle(observe.Event{Type: observe.StageFinished, RunID: "run_i", Stage: "explore", Time: at(1401)})
+	v.Handle(observe.Event{Type: observe.RunFinished, RunID: "run_i", Pipeline: "walk", Time: at(1402)})
+}
+
+// A loop's output cannot be read on its own: the same records come back
+// whether it settled or was cut off by the round cap. The view has to carry
+// the per-round shape and the halt reason, or it is showing one stage that
+// happened to run a lot of tasks.
+func TestRoundsReachTheView(t *testing.T) {
+	v := New()
+	defer v.Close()
+	feedRounds(v)
+
+	rec := httptest.NewRecorder()
+	v.ServeHTTP(rec, httptest.NewRequest("GET", "/api/state?run=run_i", nil))
+	var snap struct {
+		Stages []StageInfo `json:"stages"`
+		Tasks  []struct {
+			ID    string `json:"id"`
+			Round int    `json:"round"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var st *StageInfo
+	for i := range snap.Stages {
+		if snap.Stages[i].ID == "explore" {
+			st = &snap.Stages[i]
+		}
+	}
+	if st == nil {
+		t.Fatal("no explore stage in the snapshot")
+	}
+	if st.Halt != "quiet" {
+		t.Errorf("halt = %q, want %q", st.Halt, "quiet")
+	}
+	if len(st.Rounds) != 3 {
+		t.Fatalf("rounds = %d, want 3", len(st.Rounds))
+	}
+	for i, want := range []struct{ active, msgs, done int }{{3, 0, 3}, {2, 5, 2}, {1, 2, 1}} {
+		got := st.Rounds[i]
+		if got.N != i+1 || got.Active != want.active || got.Messages != want.msgs || got.Done != want.done {
+			t.Errorf("round %d = %+v, want n=%d active=%d msgs=%d done=%d",
+				i+1, got, i+1, want.active, want.msgs, want.done)
+		}
+		if got.EndedAt == 0 || got.CostUSD == 0 {
+			t.Errorf("round %d has no end time or cost: %+v", i+1, got)
+		}
+	}
+
+	// Every task is attributed to the superstep it ran in, which is what the
+	// concentric-orbit layout is drawn from. A round is a barrier, so this is
+	// exactly the round that was open when the task was scheduled.
+	byRound := map[int]int{}
+	for _, task := range snap.Tasks {
+		byRound[task.Round]++
+	}
+	for round, want := range map[int]int{1: 3, 2: 2, 3: 1} {
+		if byRound[round] != want {
+			t.Errorf("round %d holds %d tasks, want %d (all: %v)", round, byRound[round], want, byRound)
+		}
+	}
+	if byRound[0] != 0 {
+		t.Errorf("%d tasks of an iterative stage carry no round", byRound[0])
+	}
+}
+
+// A stage that is not iterative must be unchanged by any of this: no rounds,
+// no halt, and no round stamped onto its tasks.
+func TestNonIterativeStagesCarryNoRounds(t *testing.T) {
+	v := New()
+	defer v.Close()
+	feedLifecycle(v)
+
+	rec := httptest.NewRecorder()
+	v.ServeHTTP(rec, httptest.NewRequest("GET", "/api/state?run=run_1", nil))
+	var snap struct {
+		Stages []StageInfo `json:"stages"`
+		Tasks  []struct {
+			Round int `json:"round"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, st := range snap.Stages {
+		if len(st.Rounds) != 0 || st.Halt != "" {
+			t.Errorf("stage %q gained rounds/halt: %+v / %q", st.ID, st.Rounds, st.Halt)
+		}
+	}
+	for _, task := range snap.Tasks {
+		if task.Round != 0 {
+			t.Errorf("a non-iterative task carries round %d", task.Round)
+		}
+	}
+}

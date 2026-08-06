@@ -205,6 +205,20 @@ type RunResult struct {
 	Audit        []security.AuditEntry
 	Broadcasts   map[string]string // shared value name → content hash
 	Spent        core.Usage
+	// Iterations reports how each iterative stage ran: rounds, per-round
+	// frontier sizes, and which bound halted it. Empty for a pipeline with no
+	// Iterate stage.
+	Iterations []IterationReport
+}
+
+// Iteration returns the report for one iterative stage.
+func (r *RunResult) Iteration(stage string) (IterationReport, bool) {
+	for _, it := range r.Iterations {
+		if it.Stage == stage {
+			return it, true
+		}
+	}
+	return IterationReport{}, false
 }
 
 // Run executes a pipeline to completion (or budget/failure abort, in which
@@ -244,9 +258,10 @@ type driver struct {
 	// of a fleet. Nil means the streaming driver provisions its own.
 	pool *runtime.Pool
 
-	mu       sync.Mutex
-	outputs  map[string][]core.Record
-	failures []runtime.Failure
+	mu         sync.Mutex
+	outputs    map[string][]core.Record
+	failures   []runtime.Failure
+	iterations []IterationReport
 }
 
 func (d *driver) record(stage string, recs []core.Record) {
@@ -324,6 +339,13 @@ func (d *driver) barrier(ctx context.Context) error {
 				return fmt.Errorf("combine %q: %w", s.ID, err)
 			}
 			d.record(s.ID, folded)
+
+		case pipeline.KindIterate:
+			out, err := d.iterate(ctx, sp, input, d.barrierRunner(stageSched))
+			d.record(s.ID, out)
+			if err != nil {
+				return err
+			}
 
 		case pipeline.KindReduceAI:
 			cur := input
@@ -420,6 +442,29 @@ func stageDetail(s *pipeline.Stage) string {
 			line("shared prefix (rendered once per task, cacheable):\n%s", s.Reduce.Prefix)
 		}
 		line("prompt template:\n%s", s.Reduce.Prompt)
+	case pipeline.KindIterate:
+		spec := s.Iterate
+		line("iterative · %s algorithm · %s", spec.Algorithm.Name(), bindingDetail(spec.Step.Binding))
+		line("one call per active vertex per round, at most %d rounds", spec.Halt.MaxRounds)
+		if b := budgetDetail(spec.Halt.Budget); b != "" {
+			line("stage budget: %s", b)
+		}
+		if spec.MaxFrontier > 0 {
+			line("frontier: at most %d vertices per round", spec.MaxFrontier)
+		}
+		if spec.MaxInbox > 0 {
+			line("inbox: at most %d messages per vertex", spec.MaxInbox)
+		}
+		if spec.Grow != nil {
+			line("open world: messages may create vertices the input did not contain")
+		}
+		if spec.Step.ParseJSON {
+			line("output: JSON parsed and merged into the vertex")
+		}
+		if spec.Step.Prefix != "" {
+			line("shared prefix (rendered once per task, cacheable):\n%s", spec.Step.Prefix)
+		}
+		line("vertex program:\n%s", spec.Step.Prompt)
 	case pipeline.KindCombine:
 		line("pairwise fold over all records (driver-executed)")
 	default:

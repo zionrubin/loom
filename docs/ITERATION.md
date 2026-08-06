@@ -166,7 +166,8 @@ Stated plainly, because a design that only lists its strengths isn't one:
 
 ## 6. Where to start
 
-Four steps, in dependency order. The first is in this change.
+Four steps, in dependency order. All four are now implemented; each section
+below records what shipped and where it diverged from the plan.
 
 ### Step 0 — `loom.Explain` *(implemented)*
 
@@ -235,35 +236,83 @@ versus actual*, and the machinery for that comparison now exists.
 The example above earns its keep immediately: the reduce tree costs **22×**
 the classification stage that feeds it, which is not where anyone looks first.
 
-### Step 1 — the fixpoint driver
+### Steps 1 and 2 — the loop and the graph operator *(implemented)*
 
-A third driver beside barrier and streaming: run a sub-pipeline repeatedly
-until a predicate, a superstep cap, or the budget stops it. No graph, no
-messages, no inbox.
+These arrived together rather than in sequence, and the reason is worth
+recording: the fixpoint driver was proposed as a way to settle iteration's
+semantics with no graph in the way, and building it revealed that the graph was
+never the hard part. Cache keys, per-round charging, halting and round events
+are settled the same way whether a message travels along an edge or back to the
+vertex that sent it. So instead of a third driver, iteration became a third
+*operator* — `pipeline.Iterate` — and the part that varies between a fixpoint
+and a graph traversal was factored out into a seam.
 
-This is where iteration's semantics get settled with nothing else in the way —
-how cache keys incorporate the superstep, how the governor is charged per
-round, how a run resumes from superstep 4 of 6, what the event bus emits so
-the constellation view can draw rounds. Small, and every decision in it is
-load-bearing for step 2.
+That seam is `algo.Algorithm`: two methods over plain data that decide, round
+by round, which records run next and what they carry. The engine keeps
+everything expensive — task building, scheduling, budget, caching, quiescence,
+halting — and the algorithm keeps only the routing. Three ship, covering three
+shapes: `BSP` (message passing over a graph, the primitive sketched in §3),
+`Refine` (a vertex looping on itself — step 1's fixpoint driver, now a
+nine-line algorithm rather than a driver), and `Beam` (frontier search that
+grows its own graph).
 
-### Step 2 — messages and the graph operator
+The full design is in [ALGORITHMS.md](./ALGORITHMS.md). What §3 called
+`p.Graph(...)` is `p.Iterate(...)` with `algo.NewBSP(...)`, which is that
+sketch with the control flow pulled out of it.
 
-Add the inbox, edges, canonical message ordering, vote-to-halt, and
-`MaxMessages`. `GraphSpec` as sketched above. The inbox tree-reduce for
-high-degree vertices.
+Everything §5 called genuinely hard is handled, and one of them better than
+proposed:
 
-### Step 3 — the proving example
+- **Message explosion** — `BSPConfig.MaxMessages` per vertex and
+  `IterateSpec.MaxFrontier` per round. The second is the one that bounds the
+  bill; the first alone does not, since a thousand vertices emitting a legal two
+  messages each is a two-thousand-call round.
+- **Inbox growth** — `IterateSpec.MaxInbox`, with truncation counted and
+  reported. The tree-reduce remains the sharp fix and remains a ReduceAI stage.
+- **Oscillation** — better than the superstep cap this document settled for. A
+  vertex's (state, inbox) is hashed against *every* input it has run on, so a
+  repeat is a local fixpoint and the vertex is not scheduled at all. That costs
+  one hash rather than one cache lookup, and catches cycles of any period — a
+  two-cycle repeats an input that comparing against the previous round would
+  miss. A round in which every vertex quiesces halts as `fixpoint`.
+- **Projecting an unknown number of rounds** — exactly as this document
+  proposed: `Explain` prices `MaxRounds` rounds, with round 0's frontier
+  computed exactly by calling the algorithm's `Seed` (it is a pure function, so
+  the projection can just ask). A stage that can grow its graph and caps nothing
+  is marked as unbounded rather than given a confident number.
 
-Multi-hop research over the corpus `examples/research` already ships:
-50 papers, a real question, citations discovered by the model rather than
-declared up front. Success is a claim that could not have been produced in one
-pass, with lineage showing the hops that produced it — and a second run after
-editing one paper that recomputes a handful of vertices instead of the graph.
+### Step 3 — the proving example *(implemented)*
 
-The constellation view needs one addition and it is a natural one: supersteps
-as concentric orbits, so convergence is something you *watch* — the outer
-rings thinning as vertices go quiet.
+`examples/multi-hop` walks a citation graph to answer a research question,
+with the traversal chosen by the model rather than declared. It reaches a paper
+three hops from the seeds that no seed cites, and the synthesis rests on it —
+a claim no single pass could have produced. One cited paper is outside the
+corpus and the walk creates it. The frontier goes 2 → 4 → 3 → 2 → 1: growing
+while discovering, shrinking while converging.
+
+```
+$ go run ./examples/multi-hop -state /tmp/hop
+actually spent    2164 tokens / $0.0202 over 5 round(s), halted: quiet
+
+$ go run ./examples/multi-hop -state /tmp/hop      # again
+actually spent    0 tokens / $0.0000 over 5 round(s), halted: quiet
+15 task(s) replayed from the result cache
+```
+
+The constellation view draws the supersteps as concentric orbits, exactly as
+this section asked for: one ring per round, round 1 innermost, the live ring
+dashed and turning, and the outer rings thinning as vertices go quiet.
+
+```sh
+go run ./examples/multi-hop -view localhost:8077 -slow 900ms
+```
+
+Convergence is something you watch there rather than tally afterwards. The
+stage inspector carries the rest — active vertices, messages and cost per
+round, with bars whose widths are the frontier — under the halt reason in plain
+words. Run the same pipeline at `-rounds 2` and that panel turns amber and says
+the loop was cut off rather than finished, which is the one thing the records
+themselves cannot tell you.
 
 ## 7. What this is deliberately not
 
@@ -279,6 +328,8 @@ rings thinning as vertices go quiet.
 
 ---
 
-Read next: [ARCHITECTURE.md](./ARCHITECTURE.md) for the components this builds
-on, and [INFERENCE.md](./INFERENCE.md) for the serving-engine lineage that
-produced the caching and batching machinery the loop depends on.
+Read next: [ALGORITHMS.md](./ALGORITHMS.md) for the seam this design became and
+how to write an algorithm for it, [ARCHITECTURE.md](./ARCHITECTURE.md) for the
+components it builds on, and [INFERENCE.md](./INFERENCE.md) for the
+serving-engine lineage that produced the caching and batching machinery the loop
+depends on.

@@ -277,7 +277,66 @@ Four cooperating mechanisms, all exercised by tests:
   one record remains. O(log_FanIn n) sequential depth, each level fully
   parallel and cache-eligible.
 
-### 4.11 Projection (`loom.Explain`)
+### 4.11 Iteration and the algorithm seam (`algo`, `pipeline.Iterate`)
+
+Everything above describes one forward pass. `pipeline.Iterate` is the operator
+for computations whose next step depends on the last one's answer — a fixpoint,
+usually over a graph — and `algo.Algorithm` is the seam that decides *which*
+computation.
+
+The framework had two extension points and neither was this one. `Executor`
+decides where a task runs; `OpRunner` decides what one task does. Between them
+they cover a pipeline's whole cost and none of its shape, because the shape was
+fixed at "walk the DAG once". An `Algorithm` is two methods over plain data —
+`Seed` returns the messages that make round 0, `Route` consumes a completed
+round and returns the messages that make the next — and returning none halts
+the computation. It never schedules, never spends, never calls a model. Three
+ship: `BSP` (Pregel over edges), `Refine` (a vertex critiquing itself), and
+`Beam` (frontier search that grows its own graph).
+
+**A round is a stage batch.** Every active vertex's call is one task through
+the same scheduler both drivers use, so admission control, class-aware retry,
+the escalation ladder, the governor, the cache, lineage and the event stream
+apply to a superstep without any of them learning what a superstep is. The loop
+itself is driver-agnostic: it hands each round's tasks to a runner the driver
+supplies, so barrier and streaming cannot drift apart on it any more than they
+can on ReduceAI's levels.
+
+Three properties carry the design, and each is a consequence of machinery §4.7
+already had:
+
+- **The cache key is (op fingerprint, vertex state, inbox)** — deliberately not
+  the round. Convergence means vertices stop changing, so a converged vertex's
+  key stops changing and re-running it is free. Cost per round *falls* as the
+  computation settles, which is the opposite of the usual economics of
+  iterative model work. Rerunning a converged loop costs nothing at all, and
+  editing one vertex recomputes what its *messages* reached rather than what
+  was touched.
+- **Quiescence beats caching.** Before building a round's tasks the engine
+  checks whether each vertex has already run on this exact (state, inbox); a
+  repeat is a local fixpoint and the task is never built. Checking against every
+  input the vertex has seen, not just the last, catches oscillation of any
+  period. This rests on the vertex program being a function of (state, inbox) —
+  the contract the operator declares, and the reason the round number is not
+  offered in template scope.
+- **The envelope contains a self-directed loop.** A vertex program that follows
+  a reference it invented is a program choosing its own next input. `Grow`
+  decides whether that creates a vertex or is dropped and counted, and whatever
+  it creates runs under the envelope assembled before round zero: the same
+  grants, the same deny-by-default egress allowlist, the same budget. Discovery
+  widens what the computation reads, never what it may reach.
+
+Three halt conditions apply at once — quiet, a round cap, a stage budget — and
+the stage reports which one stopped it, because convergence and exhaustion
+produce identical records. The round cap is required at compile time. Two caps
+bound the fan-out: `MaxMessages` per vertex, which is necessary and
+insufficient, and `MaxFrontier` per round, which is what makes the stage's worst
+case `MaxFrontier × MaxRounds` and therefore priceable.
+
+Full design in [ALGORITHMS.md](./ALGORITHMS.md); the reasoning behind choosing
+this primitive is in [ITERATION.md](./ITERATION.md).
+
+### 4.12 Projection (`loom.Explain`)
 
 Everything above is measured after the fact. `Explain` is the same accounting
 run forward: it compiles the pipeline exactly as `Run` does, then walks the
@@ -364,18 +423,27 @@ and cost-based model routing (route records to cheaper models and escalate
 only the hard ones, the escalation ladder generalized from recovery to
 policy).
 
-**Phase 5 — iteration.** The dimension the DAG cannot express at all: a stage
-cannot look at its own output and decide to run again. Deep research, entity
-resolution, knowledge-graph construction, and refine-until-good are all
-fixpoints, and most are fixpoints over a graph. The proposed primitive is
-bulk-synchronous message passing — Pregel supersteps whose vertex program is a
-model call — which lands on the existing scheduler unchanged (a superstep is a
-stage, a vertex's call is a task) and inherits the four properties that make a
-paid loop safe: dollar-bounded halting, cost per round that *falls* as
-vertices go quiet and their cache keys stop changing, envelope containment for
-a program that discovers its own egress targets, and lineage across hops. The
-full design, the hard parts, and the four-step path are in
-[ITERATION.md](./ITERATION.md).
+**Phase 5 — iteration (implemented).** The dimension the DAG could not express
+at all: a stage looking at its own output and deciding to run again. Deep
+research, entity resolution, knowledge-graph construction, and refine-until-good
+are all fixpoints, and most are fixpoints over a graph. `pipeline.Iterate`
+(§4.11) is that primitive, generalized one step further than
+[ITERATION.md](./ITERATION.md) proposed: rather than a graph operator, an
+operator whose *control flow* is a plug-in, so bulk-synchronous message passing
+is one algorithm among several rather than the only shape available. It landed
+on the existing scheduler unchanged — a superstep is a stage, a vertex's call is
+a task — and inherits the four properties that make a paid loop safe:
+dollar-bounded halting, cost per round that *falls* as vertices go quiet and
+their cache keys stop changing, envelope containment for a program that
+discovers its own targets, and lineage across hops.
+
+The constellation view draws such a stage as concentric orbits — one ring per
+superstep, the live ring turning, the outer rings thinning as vertices go quiet
+— with the per-round frontier and the halt reason in the stage inspector, in the
+colour that says whether the loop converged or was cut off.
+
+Still open in this phase: the inbox tree-reduce for high-degree vertices (today
+a cap, which is blunt but reported).
 
 **Also on the roadmap:**
 - **Semantic caching** — embedding-similarity lookup in front of the exact
@@ -398,11 +466,14 @@ executor, capability/secret/egress/broadcast/audit security, CAS + persistent
 cache + lineage, content-hash-referenced broadcast values, shared prompt
 prefixes with provider prompt-cache accounting, streaming (continuously
 batched) execution alongside the barrier driver, pre-flight cost projection
-(`loom.Explain`), event bus + run reports, tree AI-reduce, mock, Anthropic,
-and OpenAI providers, and cross-restart cache resume.
+(`loom.Explain`), event bus + run reports, tree AI-reduce, iterative execution
+with a pluggable algorithm seam (`pipeline.Iterate` + `algo`, with BSP, refine
+and beam algorithms, quiescence detection, three-way halting, fan-out caps,
+open-world growth, per-round projection and round events), mock, Anthropic, and
+OpenAI providers, and cross-restart cache resume.
 
-Designed but not yet implemented: iterative/graph execution (phase 5, see
-[ITERATION.md](./ITERATION.md)), remote executor backends, shared state
+Designed but not yet implemented: remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
-operators, priority/preemptive scheduling, and result-cache eviction. The
-interfaces above are the contract those implementations plug into.
+operators, priority/preemptive scheduling, result-cache eviction, and the inbox
+tree-reduce for high-degree vertices. The interfaces above are the contract
+those implementations plug into.

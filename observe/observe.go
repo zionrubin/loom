@@ -54,6 +54,21 @@ const (
 	// handler and it sees expected against actual, live.
 	StageProjected EventType = "stage.projected"
 	RunProjected   EventType = "run.projected"
+	// RoundStarted and RoundFinished bracket one superstep of an iterative
+	// stage (pipeline.Iterate): how many vertices are active, how many
+	// messages reached them, and what the round cost.
+	//
+	// They are the only events that describe a stage running more than once,
+	// and the pair is what makes convergence observable rather than inferable
+	// — a frontier that shrinks round over round is a computation settling,
+	// and one that does not is the case the round cap exists for.
+	RoundStarted  EventType = "round.started"
+	RoundFinished EventType = "round.finished"
+	// StageConverged closes an iterative stage with the reason it stopped
+	// (Note), the number of rounds it took, and the size of the graph it left
+	// behind. Convergence and exhaustion produce the same records, so the
+	// reason is the only thing that distinguishes them.
+	StageConverged EventType = "stage.converged"
 )
 
 // Event is one observation. Fields are populated as relevant per type.
@@ -90,10 +105,15 @@ type Event struct {
 	// Topic names the blackboard topic on blackboard.posted, and Posts is how
 	// many entries it holds after the append — together they identify the
 	// snapshot (topic@n) that later agents pin, with Artifact its content hash.
-	Topic   string        `json:"topic,omitempty"`
-	Posts   int           `json:"posts,omitempty"`
-	Usage   core.Usage    `json:"usage,omitempty"`
-	Latency time.Duration `json:"latency,omitempty"`
+	Topic string `json:"topic,omitempty"`
+	Posts int    `json:"posts,omitempty"`
+	// Round is the 1-based superstep number on round.* events, and the total
+	// number of rounds on stage.converged. Messages is how many messages were
+	// delivered into the round.
+	Round    int           `json:"round,omitempty"`
+	Messages int           `json:"messages,omitempty"`
+	Usage    core.Usage    `json:"usage,omitempty"`
+	Latency  time.Duration `json:"latency,omitempty"`
 	// Saved is what this model call's prompt-prefix cache activity was worth
 	// in dollars against paying the full input rate (model.called). Negative
 	// while a freshly written entry is still unamortized.
@@ -205,8 +225,12 @@ type StageStats struct {
 	// the difference between what its cached prompt tokens cost and what
 	// they would have cost at the full input rate.
 	PrefixSavedUSD float64
-	Started        time.Time
-	Finished       time.Time
+	// Rounds counts the supersteps an iterative stage ran (0 for every other
+	// kind of stage). Tasks and cost are already per stage; this is what says
+	// whether they were spent once or ten times over.
+	Rounds   int
+	Started  time.Time
+	Finished time.Time
 
 	latencies []time.Duration
 }
@@ -289,6 +313,11 @@ func (r RunReport) String() string {
 		fmt.Fprintf(&b, "prefix cache: %d tokens served from shared prefixes, $%.4f saved\n",
 			t.CacheReadTokens, saved)
 	}
+	for _, s := range r.Stages {
+		if s.Rounds > 0 {
+			fmt.Fprintf(&b, "%s: %d rounds\n", s.Stage, s.Rounds)
+		}
+	}
 	return b.String()
 }
 
@@ -343,6 +372,8 @@ func (c *Collector) Handle(e Event) {
 		c.stage(e.Stage).Retries++
 	case CacheHit:
 		c.stage(e.Stage).CacheHits++
+	case RoundFinished:
+		c.stage(e.Stage).Rounds++
 	case ModelCalled:
 		s := c.stage(e.Stage)
 		s.ModelCalls++
