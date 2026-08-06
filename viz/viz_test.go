@@ -918,3 +918,221 @@ func TestNonIterativeStagesCarryNoRounds(t *testing.T) {
 		}
 	}
 }
+
+// --- MCP servers ---------------------------------------------------------
+
+func connectMCP(v *Server) {
+	v.Handle(observe.Event{
+		Type: observe.MCPConnected, Server: "catalog", Kind: "stdio",
+		Note: "npx -y @example/catalog-mcp", Artifact: "digest0000000000",
+		Records: 3, Slots: 4, Latency: 40 * time.Millisecond,
+		Detail: "catalog 1.0\nstdio · npx", Time: at(900),
+	})
+}
+
+func mcpCall(v *Server, run, stage, task, tool string, ms int64, queued int64, err string) observe.Event {
+	return observe.Event{
+		Type: observe.MCPCalled, RunID: run, Stage: stage, TaskID: task,
+		Server: "catalog", Tool: tool, Slots: 4, InFlight: 2, Bytes: 12,
+		Latency: time.Duration(ms) * time.Millisecond,
+		Queued:  time.Duration(queued) * time.Millisecond,
+		Err:     err, Time: at(2000 + ms),
+	}
+}
+
+// A connection is the host's: it is made before any run exists, and conjuring
+// a sky for it would put a run in the universe that never happened.
+func TestMCPConnectionBelongsToTheHostNotARun(t *testing.T) {
+	v := New()
+	connectMCP(v)
+
+	v.mu.Lock()
+	runs, cur := len(v.runs), v.cur
+	servers := len(v.servers)
+	v.mu.Unlock()
+
+	if runs != 0 || cur != nil {
+		t.Fatalf("connecting opened %d run(s); a connection is not a run", runs)
+	}
+	if servers != 1 {
+		t.Fatalf("host servers = %d, want 1", servers)
+	}
+
+	// It is still visible: an empty universe should say what it is wired to.
+	var snap Snapshot
+	v.mu.Lock()
+	blob := v.snapshotLocked(nil)
+	v.mu.Unlock()
+	if err := json.Unmarshal(blob, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.MCP) != 1 || snap.MCP[0].ID != "catalog" {
+		t.Fatalf("empty-universe snapshot omits the server: %+v", snap.MCP)
+	}
+	if snap.MCP[0].Tools != 3 || snap.MCP[0].Slots != 4 || snap.MCP[0].Kind != "stdio" {
+		t.Fatalf("server identity lost: %+v", snap.MCP[0])
+	}
+}
+
+// Every run's sky opens already knowing the servers, because the connection
+// predates it — and each run counts only its own calls against it.
+func TestMCPServersSeedEveryRun(t *testing.T) {
+	v := New()
+	connectMCP(v)
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Pipeline: "a", Time: at(1000)})
+	v.Handle(mcpCall(v, "run_1", "enrich", "task_a", "lookup", 12, 0, ""))
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_2", Pipeline: "b", Time: at(3000)})
+
+	v.mu.Lock()
+	r1, r2 := v.runIx["run_1"], v.runIx["run_2"]
+	v.mu.Unlock()
+
+	if len(r1.servers) != 1 || len(r2.servers) != 1 {
+		t.Fatalf("servers per run = %d / %d, want 1 each", len(r1.servers), len(r2.servers))
+	}
+	if r2.servers[0].Tools != 3 || r2.servers[0].Kind != "stdio" {
+		t.Fatalf("the second run did not inherit the server's identity: %+v", r2.servers[0])
+	}
+	if r1.servers[0].Calls != 1 {
+		t.Fatalf("run_1 calls = %d, want 1", r1.servers[0].Calls)
+	}
+	if r2.servers[0].Calls != 0 {
+		t.Fatalf("run_2 inherited run_1's traffic: %d calls", r2.servers[0].Calls)
+	}
+}
+
+func TestMCPCallsAreTracked(t *testing.T) {
+	v := New()
+	connectMCP(v)
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Pipeline: "a", Time: at(1000)})
+	v.Handle(mcpCall(v, "run_1", "enrich", "task_a", "lookup", 10, 0, ""))
+	v.Handle(mcpCall(v, "run_1", "enrich", "task_b", "lookup", 30, 5, ""))
+	v.Handle(mcpCall(v, "run_1", "call", "task_c", "stock", 20, 0, "boom"))
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	m := v.runIx["run_1"].servers[0]
+
+	if m.Calls != 3 || m.Errors != 1 {
+		t.Fatalf("calls/errors = %d/%d, want 3/1", m.Calls, m.Errors)
+	}
+	if m.BusyUS != 60_000 || m.QueueUS != 5_000 {
+		t.Fatalf("busy/queue = %d/%d µs, want 60000/5000", m.BusyUS, m.QueueUS)
+	}
+	if m.Peak != 2 || m.Slots != 4 {
+		t.Fatalf("peak/slots = %d/%d, want 2/4", m.Peak, m.Slots)
+	}
+	if m.LastErr != "boom" {
+		t.Fatalf("last error = %q", m.LastErr)
+	}
+	if len(m.Stages) != 2 {
+		t.Fatalf("stages = %v, want both callers", m.Stages)
+	}
+
+	// Per tool, because "which tool is slow" is the question a single
+	// server-wide average cannot answer.
+	byTool := map[string]ToolStat{}
+	for _, ts := range m.ByTool {
+		byTool[ts.Name] = ts
+	}
+	if got := byTool["lookup"]; got.Calls != 2 || got.TotalUS != 40_000 || got.MaxUS != 30_000 {
+		t.Fatalf("lookup stats = %+v", got)
+	}
+	if got := byTool["stock"]; got.Calls != 1 || got.Errors != 1 {
+		t.Fatalf("stock stats = %+v", got)
+	}
+	if len(m.Recent) != 3 || m.Recent[2].Tool != "stock" {
+		t.Fatalf("recent tail = %+v", m.Recent)
+	}
+
+	// And the call belongs to the task too: a tool call is the only work a
+	// task does that leaves no trace in the cost column.
+	n := v.runIx["run_1"].taskIx["task_a"]
+	if len(n.MCPCalls) != 1 || n.MCPCalls[0] != "catalog/lookup" {
+		t.Fatalf("task mcp calls = %v", n.MCPCalls)
+	}
+	var logged bool
+	for _, l := range n.Log {
+		if strings.Contains(l.Msg, "mcp catalog/lookup") && strings.Contains(l.Msg, "no tokens") {
+			logged = true
+		}
+	}
+	if !logged {
+		t.Fatalf("the task log does not explain the tool call: %+v", n.Log)
+	}
+}
+
+// A call that arrives without a preceding connection event still lands: the
+// view must not depend on having seen provisioning.
+func TestMCPCallWithoutConnectionEvent(t *testing.T) {
+	v := New()
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Pipeline: "a", Time: at(1000)})
+	v.Handle(mcpCall(v, "run_1", "enrich", "task_a", "lookup", 10, 0, ""))
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	servers := v.runIx["run_1"].servers
+	if len(servers) != 1 || servers[0].Calls != 1 {
+		t.Fatalf("servers = %+v", servers)
+	}
+}
+
+// A reconnect mid-run is visible in the run being watched.
+func TestMCPReconnectUpdatesTheLiveRun(t *testing.T) {
+	v := New()
+	connectMCP(v)
+	v.Handle(observe.Event{Type: observe.RunStarted, RunID: "run_1", Pipeline: "a", Time: at(1000)})
+	connectMCP(v)
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	m := v.runIx["run_1"].servers[0]
+	if m.Dials != 2 {
+		t.Fatalf("dials = %d, want 2 after a reconnect", m.Dials)
+	}
+	if len(v.runs) != 1 {
+		t.Fatalf("a reconnect opened %d runs", len(v.runs))
+	}
+}
+
+// The UI is an embedded single file with no build step, so nothing checks that
+// it reads the fields the Go side emits. This does: every JSON name the MCP
+// delta carries must appear in the page, so renaming one here without renaming
+// it there fails the build rather than silently drawing a blank server.
+func TestUIReadsTheMCPWireFields(t *testing.T) {
+	page, err := uiFS.ReadFile("ui.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := json.Marshal(&MCPInfo{
+		ID: "s", Kind: "stdio", Endpoint: "e", Detail: "d", Digest: "h",
+		Tools: 1, Sessions: 1, Dials: 1, DialMS: 1, Calls: 1, Errors: 1,
+		BusyUS: 1, QueueUS: 1, Slots: 1, Peak: 1, LastAt: 1,
+		Stages: []string{"a"}, Tasks: []string{"t"},
+		ByTool: []ToolStat{{Name: "x", Calls: 1, Errors: 1, TotalUS: 1, MaxUS: 1}},
+		Recent: []MCPCall{{Tool: "x", US: 1, QueueUS: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(blob, &fields); err != nil {
+		t.Fatal(err)
+	}
+	// Nested field names matter as much as the top-level ones.
+	names := []string{"totalUs", "maxUs", "queueUs", "us"}
+	for k := range fields {
+		names = append(names, k)
+	}
+	for _, name := range names {
+		if !strings.Contains(string(page), name) {
+			t.Errorf("ui.html never reads MCPInfo field %q — the view will draw it as missing", name)
+		}
+	}
+	// And the node has to be drawn by something.
+	for _, fn := range []string{"function drawMCP(", "function renderMCPPanel(", "'mcp'"} {
+		if !strings.Contains(string(page), fn) {
+			t.Errorf("ui.html is missing %q", fn)
+		}
+	}
+}

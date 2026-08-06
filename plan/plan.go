@@ -12,6 +12,7 @@ import (
 	"text/template"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/security"
@@ -25,7 +26,13 @@ type StagePlan struct {
 	Fingerprint string
 	Candidates  []model.Info      // resolved binding ladder for AI stages
 	Broadcasts  map[string]string // declared shared values → content hash
-	Cacheable   bool
+	// MCP maps each declared MCP server to the digest of the tool descriptors
+	// this stage was compiled against; MCPTools are the qualified tool names it
+	// may invoke, and MCPHosts the endpoints its egress policy must allow.
+	MCP       map[string]string
+	MCPTools  []string
+	MCPHosts  []string
+	Cacheable bool
 
 	// built counts the tasks this stage has produced across every call to
 	// BuildTasks. It is what makes the prefix-cache break-even test work
@@ -41,6 +48,7 @@ type Option func(*compileOpts)
 
 type compileOpts struct {
 	broadcasts map[string]string
+	mcp        mcp.Manifest
 }
 
 // WithBroadcasts supplies the run's registered shared values as name →
@@ -50,6 +58,18 @@ type compileOpts struct {
 // invalidates exactly the cached results that could have observed it.
 func WithBroadcasts(hashes map[string]string) Option {
 	return func(o *compileOpts) { o.broadcasts = hashes }
+}
+
+// WithMCP supplies the run's MCP servers as a discovered manifest. A stage may
+// only declare a server present here, and the digest of the tool descriptors it
+// declares is folded into its fingerprint — so replacing a server's tools
+// invalidates exactly the cached results that could have called them.
+//
+// The manifest is plain data rather than a live catalog, which is what lets
+// Explain compile the same pipeline from configuration alone
+// (mcp.Declared) without opening a socket.
+func WithMCP(m mcp.Manifest) Option {
+	return func(o *compileOpts) { o.mcp = m }
 }
 
 // Plan is the compiled pipeline.
@@ -166,6 +186,10 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			return nil, err
 		}
 		sp.Broadcasts = bcast
+
+		if err := resolveMCP(sp, co.mcp); err != nil {
+			return nil, err
+		}
 
 		switch s.Kind {
 		case pipeline.KindInfer:
@@ -338,6 +362,7 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 			o.NoCache = true
 		}
 		o.Broadcasts = append(o.Broadcasts, s.Opts.Broadcasts...)
+		o.MCP = append(o.MCP, s.Opts.MCP...)
 		if s.Opts.Budget.MaxDuration > 0 {
 			o.Budget.MaxDuration = s.Opts.Budget.MaxDuration
 		}
@@ -389,6 +414,93 @@ func resolveBroadcasts(s *pipeline.Stage, registered map[string]string) (map[str
 	return out, nil
 }
 
+// resolveMCP turns a stage's MCP declarations into the three things an
+// envelope needs — the tools it may invoke, the hosts it may reach, and the
+// digest of the contract it was compiled against — rejecting a server nobody
+// registered, exactly as an unregistered broadcast is rejected: a typo should
+// fail compilation, not the first record that reaches the stage.
+func resolveMCP(sp *StagePlan, manifest mcp.Manifest) error {
+	s := sp.Stage
+	if len(s.Opts.MCP) == 0 {
+		return nil
+	}
+	// A stage may declare the same server more than once — two fused stages
+	// each naming their own tools, say — so the tool sets are unioned before
+	// the digest is taken over them. A declaration that named no tools means
+	// "everything this server offers", which absorbs any narrower one.
+	wanted := map[string][]string{}
+	all := map[string]bool{}
+	var order []string
+	for _, use := range s.Opts.MCP {
+		if _, seen := wanted[use.Server]; !seen {
+			order = append(order, use.Server)
+			wanted[use.Server] = nil
+		}
+		wanted[use.Server] = append(wanted[use.Server], use.Tools...)
+		all[use.Server] = all[use.Server] || len(use.Tools) == 0
+	}
+	sort.Strings(order)
+
+	digests := make(map[string]string, len(order))
+	for _, server := range order {
+		sm, ok := manifest[server]
+		if !ok {
+			return fmt.Errorf(
+				"stage %q: MCP server %q is not registered for this run (loom.WithMCPServer)", s.ID, server)
+		}
+		tools := wanted[server]
+		if all[server] {
+			tools = nil
+		}
+		sel, err := sm.Select(tools)
+		if err != nil {
+			return fmt.Errorf("stage %q: %w", s.ID, err)
+		}
+		if len(sel) == 0 && sm.Discovered {
+			return fmt.Errorf("stage %q: MCP server %q offers no tools this stage may call", s.ID, server)
+		}
+		for _, t := range sel {
+			sp.MCPTools = append(sp.MCPTools, mcp.ToolName(server, t))
+		}
+		if h := sm.Endpoint; h != "" {
+			sp.MCPHosts = append(sp.MCPHosts, h)
+		}
+		digests[server] = sm.DigestOf(sel)
+	}
+	sort.Strings(sp.MCPTools)
+	sp.MCP = digests
+	return nil
+}
+
+// mcpKey renders a stage's MCP declarations as a deterministic fingerprint
+// component: the server, the tools, and the digest of those tools' descriptors.
+// Hashing the descriptors rather than just the names is what makes the cache
+// honest across a server upgrade — a tool whose schema changed is a different
+// operation, and results produced under the old one should not be replayed.
+func mcpKey(sp *StagePlan) []map[string]any {
+	if len(sp.MCP) == 0 {
+		return nil
+	}
+	servers := make([]string, 0, len(sp.MCP))
+	for name := range sp.MCP {
+		servers = append(servers, name)
+	}
+	sort.Strings(servers)
+	out := make([]map[string]any, 0, len(servers))
+	for _, name := range servers {
+		var tools []string
+		for _, qualified := range sp.MCPTools {
+			if srv, tool, ok := mcp.SplitToolName(qualified); ok && srv == name {
+				tools = append(tools, tool)
+			}
+		}
+		out = append(out, map[string]any{
+			"server": name, "tools": tools, "digest": sp.MCP[name],
+		})
+	}
+	return out
+}
+
 // broadcastKey renders a stage's declared broadcasts as a deterministic
 // fingerprint component. Hashing the *values* (via their content hashes), not
 // just the names, is what makes the cache honest: edit a broadcast and the
@@ -421,13 +533,16 @@ func prefixKey(prefix string, parts ...any) []any {
 	return append(parts, map[string]string{"prefix": prefix})
 }
 
-// fingerprint hashes a stage's op spec, appending the broadcast component
-// only when the stage declares one — so adding this feature leaves the
-// fingerprints (and therefore the warm caches) of existing pipelines
-// untouched.
+// fingerprint hashes a stage's op spec, appending the broadcast and MCP
+// components only when the stage declares them — so adding either feature
+// leaves the fingerprints (and therefore the warm caches) of existing
+// pipelines untouched.
 func fingerprint(sp *StagePlan, parts ...any) (string, error) {
 	if bk := broadcastKey(sp.Broadcasts); bk != nil {
 		parts = append(parts, bk)
+	}
+	if mk := mcpKey(sp); mk != nil {
+		parts = append(parts, mk)
 	}
 	return store.Key(parts...)
 }
@@ -483,6 +598,22 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		}
 	}
 
+	// MCP servers travel the same way: the grant authorizes each qualified
+	// tool name, the digest pins the contract, and the endpoint joins the
+	// egress allowlist — so a stage reaches exactly the servers it declared
+	// and exactly the tools on them, and nothing had to carry a connection.
+	var servers map[string]string
+	if len(sp.MCP) > 0 {
+		servers = make(map[string]string, len(sp.MCP))
+		for name, digest := range sp.MCP {
+			servers[name] = digest
+		}
+		for _, tool := range sp.MCPTools {
+			caps = append(caps, security.ToolCap(tool))
+		}
+		hosts = append(hosts, sp.MCPHosts...)
+	}
+
 	sandbox := s.Opts.Sandbox
 	if sandbox == "" {
 		sandbox = task.SandboxInline
@@ -496,6 +627,7 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		Egress:     security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
 		Context:    ctxBundle,
 		Broadcasts: bcast,
+		MCP:        servers,
 		Budget:     s.Opts.Budget,
 		Sandbox:    sandbox,
 	}

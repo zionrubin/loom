@@ -12,6 +12,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -141,6 +142,28 @@ type Tool interface {
 	Invoke(ctx context.Context, args map[string]any) (any, error)
 }
 
+// NetworkTool is a Tool that reaches a network host. When a registered tool
+// implements it, the host is checked against the task's egress allowlist
+// before the call — the same deny-by-default treatment a model provider's
+// endpoint gets, so a tool cannot reach further than the envelope permits.
+type NetworkTool interface {
+	Tool
+	Endpoint() string
+}
+
+// ScopedTool is a Tool that needs to know which task is calling it. The
+// executor prefers this method when a tool implements it, passing the
+// envelope and task ID after the capability and egress checks have passed.
+//
+// It exists for tools whose correctness depends on the plan, not just on the
+// arguments: an MCP tool checks that the server still offers the contract its
+// stage was compiled against, and attributes its telemetry to the run, stage,
+// and task that made the call.
+type ScopedTool interface {
+	Tool
+	InvokeIn(ctx context.Context, env task.Envelope, taskID string, args map[string]any) (any, error)
+}
+
 // FuncTool wraps a function as a Tool.
 func FuncTool(name string, fn func(ctx context.Context, args map[string]any) (any, error)) Tool {
 	return funcTool{name: name, fn: fn}
@@ -169,6 +192,26 @@ func NewToolSet(tools ...Tool) *ToolSet {
 		s.tools[t.Name()] = t
 	}
 	return s
+}
+
+// Add registers additional tools, replacing any of the same name. It is how
+// tools discovered at provisioning — an MCP server's, say — join the set the
+// executor dispatches from, without the set needing to know where they came
+// from.
+func (s *ToolSet) Add(tools ...Tool) {
+	for _, t := range tools {
+		s.tools[t.Name()] = t
+	}
+}
+
+// Names lists the registered tools in sorted order.
+func (s *ToolSet) Names() []string {
+	out := make([]string, 0, len(s.tools))
+	for name := range s.tools {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // BindTools returns the capability-checked tool surface for one task.
@@ -200,10 +243,28 @@ func (b boundTools) Invoke(ctx context.Context, name string, args map[string]any
 	if tool == nil {
 		return nil, core.Permanent(fmt.Errorf("tool %q: not registered", name))
 	}
+	// A tool that reaches the network is subject to the same deny-by-default
+	// egress policy as a model call. The planner puts the hosts of exactly the
+	// servers a stage declared on its allowlist, so a granted tool pointed at
+	// an undeclared host is a configuration change the envelope has not seen.
+	if nt, ok := tool.(NetworkTool); ok {
+		if host := nt.Endpoint(); host != "" && !b.env.Egress.Allowed(host) {
+			if b.audit != nil {
+				b.audit.Record(security.AuditEntry{
+					TaskID: b.taskID, Action: "egress", Subject: host,
+					Allowed: false, Reason: "host not on egress allowlist",
+				})
+			}
+			return nil, core.Permanent(fmt.Errorf("tool %q: egress to %q denied", name, host))
+		}
+	}
 	if b.audit != nil {
 		b.audit.Record(security.AuditEntry{
 			TaskID: b.taskID, Action: "tool.invoke", Subject: name, Allowed: true,
 		})
+	}
+	if st, ok := tool.(ScopedTool); ok {
+		return st.InvokeIn(ctx, b.env, b.taskID, args)
 	}
 	return tool.Invoke(ctx, args)
 }
