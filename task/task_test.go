@@ -21,10 +21,12 @@ func TestTaskSerializability(t *testing.T) {
 			RunID: "run_1", Stage: "classify",
 			Binding: model.Binding{Model: "small", Escalation: []string{"big"}},
 			Grants: security.NewGrantSet(
-				security.ModelCap("small"), security.SecretCap("key")),
+				security.ModelCap("small"), security.SecretCap("key"),
+				security.MemoryReadCap("kb")),
 			Egress:     security.EgressPolicy{Hosts: []string{"api.example.com"}},
 			Context:    ContextBundle{System: "sys", Fragments: []Fragment{{Name: "doc", Content: "body"}}},
 			Broadcasts: map[string]string{"taxonomy": "abc123"},
+			Memory:     map[string]uint64{"kb": 42},
 			Budget:     core.Budget{MaxDuration: 5 * time.Second, MaxAttempts: 2},
 			Sandbox:    SandboxInline,
 		},
@@ -58,6 +60,16 @@ func TestTaskSerializability(t *testing.T) {
 	}
 	// Broadcasts cross the wire as references, so a shared value costs the
 	// same on the wire whether it is a kilobyte or a gigabyte.
+	// Long-term memory crosses the wire the same way, and more so: a knowledge
+	// base cannot travel in an envelope, but the epoch that says which version
+	// of it to read can, so a task consulting months of accumulated knowledge
+	// ships as cheaply as one consulting none.
+	if back.Envelope.Memory["kb"] != 42 {
+		t.Error("memory epoch pin lost in round trip")
+	}
+	if !back.Envelope.Grants.Has(security.MemoryReadCap("kb")) {
+		t.Error("memory grant lost in round trip")
+	}
 	if back.Envelope.Broadcasts["taxonomy"] != "abc123" {
 		t.Error("broadcast references lost in round trip")
 	}

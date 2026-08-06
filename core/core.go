@@ -202,12 +202,45 @@ type Broadcaster interface {
 	Broadcast(ctx context.Context, name string) (any, error)
 }
 
+// MemoryHit is one item recalled from long-term memory: the content, how
+// close it was to the query, and the ID that identifies it.
+//
+// The ID matters as much as the text. It is a content hash, so it is stable
+// across runs and stores, and a stage that records what it recalled makes that
+// retrieval part of its own record content — and therefore part of every
+// downstream cache key. That is what lets a knowledge base grow without
+// invalidating the work of every stage that ever read it.
+type MemoryHit struct {
+	ID    string         `json:"id"`
+	Text  string         `json:"text"`
+	Score float32        `json:"score"`
+	Meta  map[string]any `json:"meta,omitempty"`
+}
+
+// Memory is the capability-checked long-term memory surface: retrieval by
+// meaning from a shared, durable knowledge base, and writes back into it.
+//
+// Reads are served as of the epoch the run pinned, so what a task recalls does
+// not depend on when it happened to run. Writes are staged and become visible
+// at the next commit — never to the run that made them — which is what keeps a
+// task's own cached result from depending on execution order.
+type Memory interface {
+	// Recall returns the k items in space nearest to query, best first. The
+	// space must be granted (security.MemoryReadCap) and declared by the
+	// stage; reading an undeclared one is a permanent failure.
+	Recall(ctx context.Context, space, query string, k int) ([]MemoryHit, error)
+	// Remember stages text into space for the next epoch and returns its
+	// content-addressed ID. Writing the same fact twice is idempotent.
+	Remember(ctx context.Context, space, text string, meta map[string]any) (string, error)
+}
+
 // Session is the capability-scoped surface handed to Go-function ops: tool
-// invocation plus broadcast reads. Every access is checked against the task's
-// envelope and audited.
+// invocation, broadcast reads, and long-term memory. Every access is checked
+// against the task's envelope and audited.
 type Session interface {
 	Tools
 	Broadcaster
+	Memory
 }
 
 // BroadcastAs reads a broadcast and converts it to T. Broadcast values make a

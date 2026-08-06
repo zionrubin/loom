@@ -12,6 +12,7 @@ package loom
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/memory"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
@@ -42,6 +44,9 @@ type Config struct {
 	Tools           []executor.Tool
 	Broadcasts      map[string]any
 	Topics          map[string]bool
+	Memory          memory.Store
+	Embedder        memory.Embedder
+	NoMemoryCommit  bool
 	EventHandler    func(observe.Event)
 	Streaming       bool
 	BatchWait       time.Duration
@@ -122,6 +127,50 @@ func WithBroadcast(name string, value any) Option {
 		c.Broadcasts[name] = value
 	}
 }
+
+// WithMemory attaches a long-term knowledge base to the run: a durable store
+// of facts that outlives it, retrieved by meaning rather than by name, and
+// shared with every other pipeline pointed at the same store.
+//
+// It is the third and longest-lived of Loom's sharing mechanisms. A broadcast
+// is one value, fixed before the run and read whole; a fleet's blackboard is
+// one process's agents reaching each other's conclusions; memory is what an
+// application knows, accumulated across runs and machines and months.
+//
+// Two rules keep it compatible with content-addressed replay, and both are
+// consequences of the store being versioned rather than merely mutable:
+//
+//   - Reads are pinned. The run fixes each space's epoch before its first task
+//     and reads it there throughout, so a commit landing mid-run — from
+//     another process sharing the store, say — cannot change what this run
+//     retrieves. The pinned epoch joins the fingerprint of every stage that
+//     reads the space.
+//   - Writes are staged. Remember stages an item for the next epoch; nothing
+//     the run writes is visible to the run that wrote it. A standalone Run
+//     commits what it staged when it finishes; on a fleet, where several
+//     agents share the store, the commit belongs to the fleet's owner
+//     (Fleet.CommitMemory) for the same reason posting to the blackboard does.
+//
+// embedder may be nil, in which case a memory.HashEmbedder is used — offline
+// and deterministic, ideal for tests and development, and lexical rather than
+// semantic, so anything whose recall quality matters wants a real one.
+func WithMemory(store memory.Store, embedder memory.Embedder) Option {
+	return func(c *Config) {
+		c.Memory = store
+		if embedder != nil {
+			c.Embedder = embedder
+		}
+	}
+}
+
+// WithoutMemoryCommit leaves a standalone run's staged memory writes
+// uncommitted, so nothing it learned becomes visible to later runs.
+//
+// It is for the run that should read the knowledge base without being trusted
+// to extend it: an evaluation, a dry run, a backfill being inspected before
+// publication. The items stay staged in the store and a later CommitMemory
+// publishes them.
+func WithoutMemoryCommit() Option { return func(c *Config) { c.NoMemoryCommit = true } }
 
 // WithFleetBudget caps what a whole fleet may spend, across every agent on it.
 //
@@ -204,7 +253,15 @@ type RunResult struct {
 	Lineage      []store.LineageEntry
 	Audit        []security.AuditEntry
 	Broadcasts   map[string]string // shared value name → content hash
-	Spent        core.Usage
+	// Memory reports the long-term memory spaces this run read and the epoch
+	// it pinned each at — the version of the knowledge base every result below
+	// was computed against.
+	Memory map[string]uint64
+	// Committed reports the epochs each space reached when the run published
+	// what it staged. Empty when the run wrote nothing, or when committing was
+	// left to the caller (WithoutMemoryCommit, or a fleet).
+	Committed map[string]uint64
+	Spent     core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.
@@ -465,6 +522,35 @@ func stageDetail(s *pipeline.Stage) string {
 			line("shared prefix (rendered once per task, cacheable):\n%s", spec.Step.Prefix)
 		}
 		line("vertex program:\n%s", spec.Step.Prompt)
+	case pipeline.KindRecall:
+		spec := s.Recall
+		k := spec.K
+		if k <= 0 {
+			k = 5
+		}
+		line("recall from long-term memory %q · %d nearest items per record", spec.Space, k)
+		if spec.MinScore > 0 {
+			line("similarity floor: %.2f", spec.MinScore)
+		}
+		if len(spec.Filter) > 0 {
+			keys := slices.Sorted(maps.Keys(spec.Filter))
+			line("metadata filter: %s", strings.Join(keys, ", "))
+		}
+		line("writes hits into %q and their IDs into %q",
+			orField(spec.OutputField, "memory"), orField(spec.IDField, "memory_ids"))
+		if spec.Require {
+			line("required: a record that recalls nothing fails")
+		}
+		line("query template:\n%s", spec.Query)
+	case pipeline.KindRemember:
+		spec := s.Remember
+		line("write into long-term memory %q, staged for the next epoch", spec.Space)
+		if len(spec.Meta) > 0 {
+			keys := slices.Sorted(maps.Keys(spec.Meta))
+			line("metadata: %s", strings.Join(keys, ", "))
+		}
+		line("item ID into %q", orField(spec.IDField, "memory_id"))
+		line("text template:\n%s", spec.Text)
 	case pipeline.KindCombine:
 		line("pairwise fold over all records (driver-executed)")
 	default:
@@ -474,6 +560,14 @@ func stageDetail(s *pipeline.Stage) string {
 	if len(s.Opts.Broadcasts) > 0 {
 		names := slices.Sorted(slices.Values(s.Opts.Broadcasts))
 		line("broadcasts readable: %s", strings.Join(slices.Compact(names), ", "))
+	}
+	if len(s.Opts.Memory) > 0 {
+		names := slices.Sorted(slices.Values(s.Opts.Memory))
+		line("memory readable: %s", strings.Join(slices.Compact(names), ", "))
+	}
+	if len(s.Opts.MemoryWrite) > 0 {
+		names := slices.Sorted(slices.Values(s.Opts.MemoryWrite))
+		line("memory writable: %s", strings.Join(slices.Compact(names), ", "))
 	}
 	if s.Opts.BatchSize > 1 {
 		line("batch: %d records per task", s.Opts.BatchSize)
@@ -488,6 +582,16 @@ func stageDetail(s *pipeline.Stage) string {
 		line("prompt-prefix caching disabled")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// orField renders a spec's output field, substituting the runner's default
+// when the author left it unset — so the description says what the pipeline
+// will actually do rather than what was typed.
+func orField(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 func bindingDetail(bind model.Binding) string {

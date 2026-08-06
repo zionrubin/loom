@@ -13,6 +13,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/memory"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/ops"
@@ -255,6 +256,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 		{probe.Tools != nil, "WithTools"},
 		{probe.Broadcasts != nil, "WithBroadcast"},
 		{probe.Topics != nil, "WithTopic"},
+		{probe.Memory != nil, "WithMemory (one knowledge base serves the fleet)"},
 		{probe.EventHandler != nil, "WithEventHandler"},
 	}
 	for _, s := range shared {
@@ -273,6 +275,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 	cfg.Workers, cfg.RunBudget = f.cfg.Workers, f.cfg.RunBudget
 	cfg.Secrets, cfg.StateDir = f.cfg.Secrets, f.cfg.StateDir
 	cfg.Tools, cfg.Broadcasts, cfg.Topics = f.cfg.Tools, f.cfg.Broadcasts, f.cfg.Topics
+	cfg.Memory, cfg.Embedder = f.cfg.Memory, f.cfg.Embedder
 	cfg.EventHandler = f.cfg.EventHandler
 	return cfg, nil
 }
@@ -626,6 +629,7 @@ type host struct {
 	gov     *runtime.Governor
 	limiter *runtime.RateLimiter
 	client  *executor.ModelClient
+	memory  *executor.MemoryClient
 	tools   *executor.ToolSet
 
 	mu     sync.Mutex
@@ -706,6 +710,19 @@ func newHost(cfg Config) (*host, error) {
 	h.client = &executor.ModelClient{
 		Registry: cfg.Registry, Broker: h.broker, Audit: audit, Bus: h.bus,
 	}
+	if cfg.Memory != nil {
+		embedder := cfg.Embedder
+		if embedder == nil {
+			// Offline and deterministic, so a pipeline with memory in it runs
+			// in a test without a key. It measures lexical overlap, not
+			// meaning — see memory.HashEmbedder.
+			embedder = memory.NewHashEmbedder(0)
+		}
+		h.memory = &executor.MemoryClient{
+			Store: cfg.Memory, Embedder: embedder, Broker: h.broker,
+			Audit: audit, Bus: h.bus,
+		}
+	}
 
 	// Broadcasts are stored before anything runs: from here on tasks carry
 	// content hashes, not copies.
@@ -752,7 +769,17 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	// agent pins the board: from here its envelopes name hashes, and later
 	// posts cannot move underneath it.
 	snapshot := h.shared.Hashes()
-	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(snapshot))
+
+	// Pinning the knowledge base is the same act as pinning the board, one
+	// order of magnitude longer-lived: every space this pipeline names is
+	// fixed at its current epoch here, and from now on the run reads that
+	// version of it however long it takes and whoever else commits meanwhile.
+	memEnv, err := h.pinMemory(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	pl, err := plan.Compile(p, cfg.Registry,
+		plan.WithBroadcasts(snapshot), plan.WithMemory(memEnv))
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +789,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	}
 
 	local := &executor.Local{
-		Runners: runners, Client: h.client, Tools: h.tools,
+		Runners: runners, Client: h.client, Memory: h.memory, Tools: h.tools,
 		Broadcasts: h.shared,
 		Audit:      h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
 	}
@@ -809,6 +836,12 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		}
 		h.bus.Publish(e)
 	}
+	for _, name := range slices.Sorted(maps.Keys(memEnv.Epochs)) {
+		h.bus.Publish(observe.Event{
+			Type: observe.MemoryPinned, RunID: runID,
+			Space: name, Epoch: memEnv.Epochs[name], Detail: memEnv.Embedder,
+		})
+	}
 
 	d := &driver{
 		plan: pl, runID: runID, cfg: cfg, sched: sched, bus: h.bus, pool: pool,
@@ -819,6 +852,20 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		run = d.stream
 	}
 	runErr := run(ctx)
+
+	// A standalone run is the only writer its store can see, so it publishes
+	// what it staged and the next run finds it. A fleet's agents share one
+	// store and one staging area, so committing at an agent's finish would
+	// publish another agent's work in progress and cut one run's output across
+	// two epochs; there the commit belongs to the fleet's owner, exactly as
+	// posting to the blackboard does.
+	var committed map[string]uint64
+	if pool == nil && !cfg.NoMemoryCommit && h.memory != nil && len(memEnv.Epochs) > 0 {
+		committed, err = h.commitMemory(ctx, runID, slices.Sorted(maps.Keys(memEnv.Epochs)))
+		if err != nil && runErr == nil {
+			runErr = err
+		}
+	}
 
 	h.bus.Publish(observe.Event{Type: observe.RunFinished, RunID: runID, Pipeline: p.Name})
 
@@ -831,12 +878,107 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		Lineage:      lineageOf(h.lineage.Entries(), runID),
 		Audit:        auditOf(h.audit.Entries(), tr),
 		Broadcasts:   snapshot,
+		Memory:       memEnv.Epochs,
+		Committed:    committed,
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {
 		res.Output = d.outputs[term[0]]
 	}
 	return res, runErr
+}
+
+// pinMemory fixes the epoch of every long-term memory space the pipeline
+// names, before any of its tasks run.
+//
+// A space nobody has committed to pins at 0 — the empty knowledge base every
+// application starts from — rather than failing, so the first run of a new
+// pipeline is not a bootstrapping problem. What does fail is a pipeline that
+// names a space with no store behind it at all, and it fails at compile time
+// in plan.resolveMemory rather than on the first record.
+func (h *host) pinMemory(ctx context.Context, p *pipeline.Pipeline) (plan.MemoryEnv, error) {
+	spaces := declaredSpaces(p)
+	if len(spaces) == 0 {
+		return plan.MemoryEnv{}, nil
+	}
+	if h.memory == nil {
+		return plan.MemoryEnv{}, fmt.Errorf(
+			"pipeline %q uses long-term memory (%s) but the run has no store: pass loom.WithMemory",
+			p.Name, strings.Join(spaces, ", "))
+	}
+	env := plan.MemoryEnv{
+		Epochs:   make(map[string]uint64, len(spaces)),
+		Embedder: h.memory.Embedder.Name(),
+		Secret:   h.memory.Embedder.Secret(),
+		Endpoint: h.memory.Embedder.Endpoint(),
+	}
+	for _, name := range spaces {
+		epoch, err := h.memory.Store.Epoch(ctx, name)
+		if err != nil {
+			return plan.MemoryEnv{}, fmt.Errorf("memory %q: %w", name, err)
+		}
+		env.Epochs[name] = epoch
+	}
+	return env, nil
+}
+
+// commitMemory publishes staged writes and announces the epochs reached.
+func (h *host) commitMemory(ctx context.Context, runID string, spaces []string) (map[string]uint64, error) {
+	reached, err := h.memory.Store.Commit(ctx, spaces...)
+	if err != nil {
+		return nil, fmt.Errorf("memory commit: %w", err)
+	}
+	for _, name := range slices.Sorted(maps.Keys(reached)) {
+		h.bus.Publish(observe.Event{
+			Type: observe.MemoryCommitted, RunID: runID,
+			Space: name, Epoch: reached[name],
+		})
+	}
+	return reached, nil
+}
+
+// declaredSpaces lists every long-term memory space a pipeline's stages name,
+// whether in a Recall/Remember spec or through WithMemory/WithMemoryWrite.
+func declaredSpaces(p *pipeline.Pipeline) []string {
+	var out []string
+	for _, s := range p.Stages() {
+		out = append(out, s.Opts.Memory...)
+		out = append(out, s.Opts.MemoryWrite...)
+		if s.Recall != nil && s.Recall.Space != "" {
+			out = append(out, s.Recall.Space)
+		}
+		if s.Remember != nil && s.Remember.Space != "" {
+			out = append(out, s.Remember.Space)
+		}
+	}
+	return slices.Compact(slices.Sorted(slices.Values(out)))
+}
+
+// CommitMemory publishes what the fleet's agents have staged into long-term
+// memory, as a new epoch of each named space (every space with staged writes
+// when none are named).
+//
+// It is the fleet's call to make rather than an agent's for the same reason
+// Post is: agents share one store, so a commit fired when one agent happens to
+// finish would publish another's work in progress and split a single run's
+// output across two epochs. Call it between waves of agents, or once after
+// Wait — and note that agents already running pinned their epochs at launch,
+// so a commit cannot disturb them either way.
+func (f *Fleet) CommitMemory(ctx context.Context, spaces ...string) (map[string]uint64, error) {
+	if f.memory == nil {
+		return nil, fmt.Errorf("fleet: no memory store configured (loom.WithMemory)")
+	}
+	return f.commitMemory(ctx, "", spaces)
+}
+
+// Memory returns the fleet's long-term memory store, for the callers that
+// need to read or seed it directly — loading a corpus before the agents run,
+// or inspecting what they concluded afterwards. Nil when the fleet has none.
+func (f *Fleet) Memory() memory.Store {
+	if f.memory == nil {
+		return nil
+	}
+	return f.memory.Store
 }
 
 // lineageOf narrows a fleet-wide lineage log to one agent's entries.

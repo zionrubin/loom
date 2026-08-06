@@ -43,6 +43,20 @@ const (
 	// the agent that posted it has usually finished, and the agents that will
 	// read it have not started.
 	BlackboardPosted EventType = "blackboard.posted"
+	// MemoryPinned announces one long-term memory space and the epoch this run
+	// reads it at, once, before any task runs — the memory equivalent of
+	// broadcast.registered, and what tells an observer which version of the
+	// knowledge base everything that follows was computed against.
+	MemoryPinned EventType = "memory.pinned"
+	// MemoryRecalled reports one retrieval: the space, how many items came
+	// back, and what the embedding cost.
+	MemoryRecalled EventType = "memory.recalled"
+	// MemoryWritten reports items staged for the next epoch by one task.
+	MemoryWritten EventType = "memory.written"
+	// MemoryCommitted reports a space's staged items becoming visible, with
+	// the epoch reached. Everything committed here is invisible to the run
+	// that wrote it and visible to the next.
+	MemoryCommitted EventType = "memory.committed"
 	// StageProjected and RunProjected carry a pre-flight cost projection
 	// (loom.Explain): what a stage and a whole pipeline are expected to spend,
 	// published before anything is spent. They are the only events on this bus
@@ -107,6 +121,12 @@ type Event struct {
 	// snapshot (topic@n) that later agents pin, with Artifact its content hash.
 	Topic string `json:"topic,omitempty"`
 	Posts int    `json:"posts,omitempty"`
+	// Space names the long-term memory space on memory.* events, Epoch the
+	// version of it in play — the epoch pinned, read, or reached by a commit —
+	// and Items how many were recalled, staged, or published.
+	Space string `json:"space,omitempty"`
+	Epoch uint64 `json:"epoch,omitempty"`
+	Items int    `json:"items,omitempty"`
 	// Round is the 1-based superstep number on round.* events, and the total
 	// number of rounds on stage.converged. Messages is how many messages were
 	// delivered into the round.

@@ -113,6 +113,17 @@ Continuum — and says which rows are honestly still empty.
   stated assumption and a **ceiling** that rests on none, because `MaxTokens`
   is a cap the provider enforces; the ceiling is the number to hand
   `WithRunBudget`, and the report says outright whether your budget covers it.
+- **Long-term memory** — a durable knowledge base shared across runs,
+  processes, and pipelines, retrieved by meaning: `Recall` pulls the top-k
+  items into a record and `Remember` writes what a run concluded back. It
+  coexists with content-addressed replay because reads are pinned to an epoch
+  and writes are staged for the next one — and because `Recall` puts the
+  retrieved item IDs *in the record*, so committing to the knowledge base
+  recomputes the cheap lookup while the expensive model call below it stays
+  cached for every record whose top-k did not move. Items are
+  content-addressed (the same fact learned twice costs one entry) and carry the
+  run, stage, task, and model that produced them. Backends plug in behind
+  `memory.Store`: exact in-process, embedded chromem-go, or a hosted index.
 - **Broadcast values** — register a lookup table, taxonomy, or rubric once
   per run with `loom.WithBroadcast`; stages opt in with
   `pipeline.WithBroadcast`. The value is stored once by content hash and
@@ -209,6 +220,15 @@ go run ./examples/multi-hop
 go run ./examples/multi-hop -state /tmp/loom-hop
 go run ./examples/multi-hop -state /tmp/loom-hop   # 0 tokens, $0.0000
 
+# long-term memory: a support desk over three days, where each day recalls
+# what the days before it concluded. The last three sections are the point —
+# the same tickets answered against an unchanged knowledge base cost 0 model
+# calls, and answered again after one new fact is committed cost exactly 1,
+# because the recalled item IDs are in the record and only one ticket's
+# retrieved set moved
+go run ./examples/longterm
+go run ./examples/longterm -backend chromem   # the embedded pure-Go vector DB
+
 # watch it converge: the constellation view draws an iterative stage as
 # concentric orbits, one ring per superstep, the live ring turning — the outer
 # rings thinning as vertices go quiet. Click the stage for the per-round table
@@ -277,6 +297,8 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `providers/openai` | Official-SDK OpenAI adapter, broker-resolved keys |
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
+| `memory` | Long-term knowledge base: epoch-versioned vector store, embedders, exact in-memory backend |
+| `memory/chromem` | Embedded pure-Go vector DB backend (chromem-go) |
 | `observe` | Event bus, metrics collector, run reports |
 | `viz` | Constellation view: live web visualization of a run (tasks and executors as stars), and the universe of every run in the process |
 | `task` | Task + envelope types (serializable — the distribution seam) |
@@ -527,6 +549,71 @@ precisely what content-addressed caching assumes away.
 into numbers on real OpenAI models: how many bytes the run avoided copying,
 which stages recompute when a shared value is edited, and a live view of
 every broadcast read.
+
+## Long-term memory: what the application knows
+
+A broadcast dies with the run and a blackboard dies with the process. For an
+application that should still know on Monday what it worked out on Friday, use
+`loom.WithMemory`: a durable knowledge base, retrieved by *meaning* rather than
+by name, shared by every pipeline pointed at the same store.
+
+```go
+store, _ := chromem.Open("./state/kb", false)     // embedded, pure Go, no server
+defer store.Close()
+
+answered := tickets.
+    Recall("similar", pipeline.RecallSpec{        // ← retrieval is a stage
+        Space: "resolutions", Query: "{{.subject}}\n{{.body}}", K: 5,
+        Filter: map[string]string{"product": "{{.product}}"},
+    }).
+    Infer("draft", pipeline.InferSpec{
+        Binding: model.Binding{Tier: model.TierBalanced},
+        Prompt:  "past resolutions:\n{{.memory}}\n\nticket: {{.subject}}",
+    })
+
+answered.Remember("learn", pipeline.RememberSpec{ // ← today's conclusion,
+    Space: "resolutions",                         //   tomorrow's context
+    Text:  "{{.subject}} → {{.output}}",
+    Meta:  map[string]string{"product": "{{.product}}"},
+})
+
+loom.Run(ctx, p, loom.WithMemory(store, openai.NewEmbedder("", 512, "")))
+```
+
+A mutable store looks incompatible with a framework whose cache is its
+checkpoint. Two rules make it work, and the second is the interesting one:
+
+- **Reads are pinned, writes are staged.** A run fixes each space's epoch
+  before its first task and reads it there throughout, so a commit landing
+  mid-run is invisible to it. `Remember` stages for the *next* epoch, so
+  nothing a run writes is visible to the run that wrote it — the blackboard's
+  publish-between-units rule, generalized to a durable store.
+- **The cache invalidates by what was retrieved, not by what changed.**
+  `Recall` writes the retrieved items' content-addressed IDs into the record,
+  so the `Infer` below inherits them in its ordinary cache key. A commit
+  therefore recomputes the *recall* — one embedding and one index lookup — and
+  recomputes the **model call only for the records whose top-k actually
+  moved**. Add ten thousand items to the knowledge base; the queries whose
+  neighbourhoods did not move replay for free.
+
+Everything else is the machinery already described. Reads and writes are
+separate capabilities (`memory:read:<space>`, `memory:write:<space>`) so a
+stage that consults the knowledge base is not thereby an author of it; the
+envelope carries the pinned epoch as a reference, so a task reading months of
+knowledge stays as shippable as one reading none; and every item records the
+run, stage, task, and model that produced it, because a knowledge base of model
+outputs is a hallucination laundering channel without provenance.
+
+Backends plug in behind `memory.Store`: `memory.InMemory` (exact, zero
+dependencies, good to ~10⁵ items) ships for tests and development,
+`memory/chromem` wraps [chromem-go](https://github.com/philippgille/chromem-go)
+for real use, and Qdrant/pgvector/Milvus adapters are the same interface.
+Embedders plug in behind `memory.Embedder`, with an offline deterministic one
+for tests and an OpenAI one for production.
+
+Full design — including why retrieval is a stage rather than a tool the model
+may call, and what `Explain` can and cannot price — in
+[docs/MEMORY.md](./docs/MEMORY.md).
 
 ### Sharing the work, not just the bytes
 

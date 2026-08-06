@@ -32,6 +32,18 @@ func ToolCap(name string) Capability { return Capability("tool:" + name) }
 // broadcast value shared across the run's tasks.
 func DataCap(name string) Capability { return Capability("data:read:" + name) }
 
+// MemoryReadCap grants recall from a long-term memory space.
+//
+// Read and write are separate capabilities because a knowledge base shared
+// between applications is exactly where they diverge: most stages should be
+// able to consult what the organization knows, and very few should be able to
+// add to it. A single "memory:<space>" grant would make every reader an
+// author.
+func MemoryReadCap(space string) Capability { return Capability("memory:read:" + space) }
+
+// MemoryWriteCap grants writing into a long-term memory space.
+func MemoryWriteCap(space string) Capability { return Capability("memory:write:" + space) }
+
 // GrantSet is an immutable set of capabilities. The zero value grants nothing.
 type GrantSet struct {
 	caps map[Capability]struct{}

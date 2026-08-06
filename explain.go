@@ -1,6 +1,7 @@
 package loom
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/zionrubin/loom/algo"
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/memory"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
@@ -250,7 +252,16 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 			return nil, err
 		}
 	}
-	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(broadcasts.Hashes()))
+	// Memory is pinned here for the same reason broadcasts are hashed here: so
+	// the plan Explain compiles — and therefore the fingerprints it reports —
+	// is the one Run would compile. Reading each space's current epoch is the
+	// only thing this touches, and it is a read.
+	memEnv, err := explainMemory(cfg, p)
+	if err != nil {
+		return nil, err
+	}
+	pl, err := plan.Compile(p, cfg.Registry,
+		plan.WithBroadcasts(broadcasts.Hashes()), plan.WithMemory(memEnv))
 	if err != nil {
 		return nil, err
 	}
@@ -355,6 +366,44 @@ func (e *explainer) warnf(format string, args ...any) {
 	e.warnings = append(e.warnings, msg)
 }
 
+// explainMemory pins the epochs a projected run would read, so the plan it
+// compiles matches the one Run compiles.
+//
+// A pipeline that names no memory space needs no store, which is what keeps
+// Explain usable on the pipelines that predate the feature. One that does but
+// has none configured fails here with the same message Run gives, because a
+// projection that quietly skipped the stage would report a run that cannot
+// happen.
+func explainMemory(cfg Config, p *pipeline.Pipeline) (plan.MemoryEnv, error) {
+	spaces := declaredSpaces(p)
+	if len(spaces) == 0 {
+		return plan.MemoryEnv{}, nil
+	}
+	if cfg.Memory == nil {
+		return plan.MemoryEnv{}, fmt.Errorf(
+			"pipeline %q uses long-term memory (%s) but the run has no store: pass loom.WithMemory",
+			p.Name, strings.Join(spaces, ", "))
+	}
+	embedder := cfg.Embedder
+	if embedder == nil {
+		embedder = memory.NewHashEmbedder(0)
+	}
+	env := plan.MemoryEnv{
+		Epochs:   make(map[string]uint64, len(spaces)),
+		Embedder: embedder.Name(),
+		Secret:   embedder.Secret(),
+		Endpoint: embedder.Endpoint(),
+	}
+	for _, name := range spaces {
+		epoch, err := cfg.Memory.Epoch(context.Background(), name)
+		if err != nil {
+			return plan.MemoryEnv{}, fmt.Errorf("memory %q: %w", name, err)
+		}
+		env.Epochs[name] = epoch
+	}
+	return env, nil
+}
+
 // decodeBroadcasts round-trips registered values through JSON the way the
 // store does, so a prefix rendering {{broadcastJSON "x"}} is measured on the
 // bytes a task would actually receive.
@@ -455,8 +504,106 @@ func (e *explainer) stage(sp *plan.StagePlan) (StageProjection, error) {
 
 	case pipeline.KindIterate:
 		e.iterate(sp, input, &out)
+
+	case pipeline.KindRecall:
+		e.recall(sp, input, &out)
+
+	case pipeline.KindRemember:
+		e.remember(sp, input, &out)
 	}
 	return out, nil
+}
+
+// recall projects a retrieval stage: one embedding call per record, and the
+// records it hands downstream carrying what it retrieved.
+//
+// Two things are unknowable here and they pull in opposite directions. The
+// embedding calls are counted but not priced, because an embedder is not a
+// registry model and has no entry to price it from — an under-count. The
+// retrieved text is not knowable at all without issuing the queries, so the
+// prompt of every stage below is projected without the context this stage
+// would have put in it — a larger under-count, and in the one direction a cost
+// projection must never be quietly wrong. Both are said out loud, the stages
+// below are marked estimated so the run's ceiling stops claiming to be a bound
+// (the same treatment ParseJSON gets, and for the same reason: this stage's own
+// counts are exact, and it is the records it hands downstream whose shape is
+// not), and loom.WithStageSample restores exactness by naming what a typical
+// recall returns.
+func (e *explainer) recall(sp *plan.StagePlan, input []core.Record, out *StageProjection) {
+	s := sp.Stage
+	spec := s.Recall
+	k := spec.K
+	if k <= 0 {
+		k = 5
+	}
+	out.Calls = len(input)
+	out.Tasks = len(input)
+
+	outField := orField(spec.OutputField, "memory")
+	idField := orField(spec.IDField, "memory_ids")
+	sample, sampled := e.cfg.StageSamples[s.ID]
+	if !sampled && len(input) > 0 {
+		e.tainted[s.ID] = true
+		e.warnf("stage %q recalls %d item(s) per record from memory %q, and what it "+
+			"retrieves is not knowable from the plan: the prompts of stages below it "+
+			"are projected without that context, so their cost is understated. Supply "+
+			"a representative recall with loom.WithStageSample(%q, map[string]any{%q: "+
+			"\"...\"}) to project them exactly", s.ID, k, spec.Space, s.ID, outField)
+	}
+	if len(input) > 0 {
+		e.warnf("stage %q issues %d embedding call(s), which are not priced here: an "+
+			"embedder is not a registry model, so its cost is absent from this "+
+			"projection and present in the run", s.ID, len(input))
+	}
+
+	ids := make([]string, k)
+	for i := range ids {
+		ids[i] = "mem_0000000000000000"
+	}
+	res := make([]core.Record, 0, len(input))
+	for _, r := range input {
+		nr := r.Clone()
+		nr.Data[outField] = ""
+		if idField != "" {
+			nr.Data[idField] = ids
+		}
+		if f := spec.ScoreField; f != "" {
+			nr.Data[f] = make([]float64, k)
+		}
+		for key, v := range sample {
+			nr.Data[key] = v
+		}
+		res = append(res, nr)
+	}
+	e.recs[s.ID] = res
+}
+
+// remember projects a memory write: one embedding call per record, records
+// passing through with the item ID attached.
+func (e *explainer) remember(sp *plan.StagePlan, input []core.Record, out *StageProjection) {
+	s := sp.Stage
+	out.Calls = len(input)
+	batch := s.Opts.BatchSize
+	if batch <= 0 {
+		batch = 1
+	}
+	out.Tasks = (len(input) + batch - 1) / batch
+	if len(input) > 0 {
+		e.warnf("stage %q embeds %d item(s) to write into memory %q, which is not "+
+			"priced here: an embedder is not a registry model, so its cost is absent "+
+			"from this projection and present in the run", s.ID, len(input), s.Remember.Space)
+	}
+
+	idField := orField(s.Remember.IDField, "memory_id")
+	res := make([]core.Record, 0, len(input))
+	for _, r := range input {
+		nr := r.Clone()
+		if idField != "" {
+			nr.Data[idField] = "mem_0000000000000000"
+		}
+		res = append(res, nr)
+	}
+	e.recs[s.ID] = res
 }
 
 // iterate projects an iterative stage: cost per round, multiplied out to the

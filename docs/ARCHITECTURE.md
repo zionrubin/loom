@@ -228,6 +228,36 @@ development, scripted failures), and `providers/anthropic` and
   write can be earned back — and the prefix joins the stage fingerprint on
   the same terms a broadcast hash does. See
   [INFERENCE.md](./INFERENCE.md#shared-memory-prefix-caching).
+- **Long-term memory** — the layer that outlives the process. A broadcast is
+  one value fixed before a run; a blackboard topic is one process's agents
+  reaching each other's conclusions; a `memory.Space` is what the
+  *application* knows, accumulated across runs and machines, too large to read
+  whole and therefore retrieved by similarity. Two properties reconcile a
+  mutable store with content-addressed replay, and both are rules stated
+  above rather than new ones. First, the store is *versioned* rather than
+  merely mutable: a run pins each space's epoch before its first task and
+  reads it there throughout, and writes are staged for the next epoch, so
+  nothing a run writes is visible to the run that wrote it — the blackboard's
+  publish-between-units-of-work rule, generalized from a process to a durable
+  store. Second, retrieval is its own stage. The pinned epoch joins the
+  fingerprint of every stage that reads the space, which alone would
+  cold-start the whole application on every commit; but a `Recall` stage
+  writes the retrieved items' content hashes *into the record*, so the
+  inference below it is keyed by its ordinary (fingerprint, input content) and
+  recomputes only for the records whose retrieved set actually moved. The
+  epoch invalidates one embedding and one index lookup; the paid call is
+  invalidated at record granularity, by content. Items are content-addressed
+  on their text and metadata, so the same conclusion reached by a hundred runs
+  costs one entry, and each carries the run, stage, task, and model that wrote
+  it — the lineage argument below, applied to a knowledge base whose entries
+  are model outputs and would otherwise be indistinguishable from what the
+  next run invents. Read and write are separate capabilities per space, and
+  the envelope carries the pinned epoch by reference for the same reason it
+  carries a broadcast hash: a task consulting months of accumulated knowledge
+  must stay as shippable to a remote worker as one consulting none. Backends
+  (exact in-process, embedded chromem-go, or a hosted index) plug in behind
+  `memory.Store` exactly as providers plug in behind `model.Provider`. See
+  [MEMORY.md](./MEMORY.md).
 - **Lineage** — every artifact records the run, stage, op fingerprint,
   model, input hashes, and broadcast hashes that produced it: reproducibility
   and audit for outputs whose provenance would otherwise be "a model said
@@ -447,7 +477,13 @@ a cap, which is blunt but reported).
 
 **Also on the roadmap:**
 - **Semantic caching** — embedding-similarity lookup in front of the exact
-  cache for near-duplicate inputs.
+  cache for near-duplicate inputs. Now one step away rather than a greenfield
+  item: §4.7's memory layer already wires an embedder and a vector store into
+  the executor, and what remains is a similarity lookup keyed on task input
+  rather than on a user query.
+- **Forgetting** — long-term memory has no retention policy and no way to mark
+  a fact superseded when a later run contradicts it. Both are needed before a
+  knowledge base can run for years rather than months.
 - **Ensemble/quorum operators** — N samples + vote or judge as a native op
   (today expressible as FlatMap → Infer → Combine).
 - **Data-access capabilities** — `data:read:<name>` exists today for
@@ -469,11 +505,14 @@ batched) execution alongside the barrier driver, pre-flight cost projection
 (`loom.Explain`), event bus + run reports, tree AI-reduce, iterative execution
 with a pluggable algorithm seam (`pipeline.Iterate` + `algo`, with BSP, refine
 and beam algorithms, quiescence detection, three-way halting, fan-out caps,
-open-world growth, per-round projection and round events), mock, Anthropic, and
-OpenAI providers, and cross-restart cache resume.
+open-world growth, per-round projection and round events), long-term memory
+(epoch-pinned reads, staged writes, `Recall`/`Remember` stages, recall-keyed
+cache invalidation, per-space read/write capabilities, item provenance, exact
+in-process and embedded chromem-go backends, offline and OpenAI embedders),
+mock, Anthropic, and OpenAI providers, and cross-restart cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
-operators, priority/preemptive scheduling, result-cache eviction, and the inbox
-tree-reduce for high-degree vertices. The interfaces above are the contract
-those implementations plug into.
+operators, priority/preemptive scheduling, result-cache eviction, memory
+retention and supersession, and the inbox tree-reduce for high-degree vertices.
+The interfaces above are the contract those implementations plug into.

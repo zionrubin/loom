@@ -61,6 +61,20 @@ type Envelope struct {
 	// of once per task. Reads additionally require the matching
 	// security.DataCap grant.
 	Broadcasts map[string]string `json:"broadcasts,omitempty"`
+	// Memory maps each long-term memory space this task may recall from to the
+	// epoch its reads are pinned to. Like Broadcasts it is a reference rather
+	// than a copy — a knowledge base cannot travel in an envelope, but the one
+	// number that says which version of it to read can, and that is what makes
+	// a task reading months of accumulated knowledge as shippable to a remote
+	// worker as one reading nothing.
+	//
+	// The pin is what keeps replay honest: a commit that lands mid-run is
+	// invisible to every task of that run, so a cached result cannot have
+	// observed a different knowledge base than a fresh execution would.
+	// Reads additionally require the matching security.MemoryReadCap grant;
+	// writes require MemoryWriteCap and carry no epoch, since they are staged
+	// for the next one.
+	Memory map[string]uint64 `json:"memory,omitempty"`
 	// CachePrefix authorizes the executor to ask the provider to cache this
 	// stage's shared prompt prefix. The planner sets it only when the stage
 	// issues more than one model call, so a cache entry is never written

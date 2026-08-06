@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/anthropics/anthropic-sdk-go v1.60.0
 	github.com/openai/openai-go/v3 v3.44.0
+	github.com/philippgille/chromem-go v0.7.0
 )
 
 require (

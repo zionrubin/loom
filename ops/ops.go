@@ -66,6 +66,26 @@ func BuildRunners(pl *plan.Plan) (map[string]executor.OpRunner, error) {
 				return nil, err
 			}
 			runners[s.ID] = &reduceRunner{spec: s.Reduce, tmpl: tmpl, prefix: prefix}
+		case pipeline.KindRecall:
+			tmpl, err := template.New(s.ID).Option("missingkey=error").Parse(s.Recall.Query)
+			if err != nil {
+				return nil, err
+			}
+			filter, err := parseFields(s.ID+".filter", s.Recall.Filter)
+			if err != nil {
+				return nil, err
+			}
+			runners[s.ID] = &recallRunner{spec: s.Recall, query: tmpl, filter: filter}
+		case pipeline.KindRemember:
+			tmpl, err := template.New(s.ID).Option("missingkey=error").Parse(s.Remember.Text)
+			if err != nil {
+				return nil, err
+			}
+			meta, err := parseFields(s.ID+".meta", s.Remember.Meta)
+			if err != nil {
+				return nil, err
+			}
+			runners[s.ID] = &rememberRunner{spec: s.Remember, text: tmpl, meta: meta}
 		case pipeline.KindSource, pipeline.KindCombine:
 			// Executed by the driver, not the scheduler.
 		}

@@ -7,6 +7,7 @@ package plan
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"text/template"
@@ -25,7 +26,15 @@ type StagePlan struct {
 	Fingerprint string
 	Candidates  []model.Info      // resolved binding ladder for AI stages
 	Broadcasts  map[string]string // declared shared values → content hash
+	Memory      map[string]uint64 // declared memory spaces → pinned epoch
+	MemoryWrite []string          // declared memory spaces this stage may write
 	Cacheable   bool
+
+	// embedSecret and embedHost are the run embedder's credential and host,
+	// copied here so Envelope can grant them to exactly the stages that touch
+	// memory without the planner's compile options travelling with the plan.
+	embedSecret security.SecretRef
+	embedHost   string
 
 	// built counts the tasks this stage has produced across every call to
 	// BuildTasks. It is what makes the prefix-cache break-even test work
@@ -41,6 +50,31 @@ type Option func(*compileOpts)
 
 type compileOpts struct {
 	broadcasts map[string]string
+	memory     MemoryEnv
+}
+
+// MemoryEnv describes the run's long-term memory facilities to the planner:
+// which spaces exist and at which epoch this run reads them, and what the
+// embedder is called and needs.
+//
+// The epochs are the reason this is compile-time input rather than a runtime
+// lookup. A stage that recalls at whatever epoch happened to be current when
+// its task ran would produce a cached result nobody could reason about; pinning
+// before the first task, and hashing the pin into the stage's fingerprint, is
+// what makes retrieval from a mutable store replayable.
+type MemoryEnv struct {
+	// Epochs maps each memory space to the epoch this run reads it at.
+	Epochs map[string]uint64
+	// Embedder names the embedding function. It joins the fingerprint of every
+	// recall stage: the same query under a different embedder has different
+	// neighbours, so its results are not interchangeable.
+	Embedder string
+	// Secret is the credential the embedder resolves, granted to exactly the
+	// stages that touch memory.
+	Secret security.SecretRef
+	// Endpoint is the host the embedder contacts, added to the egress
+	// allowlist of exactly those stages.
+	Endpoint string
 }
 
 // WithBroadcasts supplies the run's registered shared values as name →
@@ -50,6 +84,15 @@ type compileOpts struct {
 // invalidates exactly the cached results that could have observed it.
 func WithBroadcasts(hashes map[string]string) Option {
 	return func(o *compileOpts) { o.broadcasts = hashes }
+}
+
+// WithMemory supplies the run's pinned memory epochs and embedder identity. A
+// stage may only reach spaces present here, and each declared space's pinned
+// epoch is folded into the stage's fingerprint — so a commit to a space
+// invalidates exactly the stages that read it, and leaves the rest of the
+// application's cache warm.
+func WithMemory(env MemoryEnv) Option {
+	return func(o *compileOpts) { o.memory = env }
 }
 
 // Plan is the compiled pipeline.
@@ -167,6 +210,11 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 		}
 		sp.Broadcasts = bcast
 
+		sp.embedSecret, sp.embedHost = co.memory.Secret, co.memory.Endpoint
+		if err := resolveMemory(sp, co.memory.Epochs); err != nil {
+			return nil, err
+		}
+
 		switch s.Kind {
 		case pipeline.KindInfer:
 			spec := s.Infer
@@ -274,6 +322,72 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 				return nil, err
 			}
 
+		case pipeline.KindRecall:
+			spec := s.Recall
+			if spec.Space == "" {
+				return nil, fmt.Errorf("stage %q: recall without a memory space", s.ID)
+			}
+			if spec.Query == "" {
+				return nil, fmt.Errorf("stage %q: recall without a query template", s.ID)
+			}
+			if co.memory.Embedder == "" {
+				return nil, fmt.Errorf(
+					"stage %q: recall needs a memory store on the run (loom.WithMemory)", s.ID)
+			}
+			if _, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(spec.Query); err != nil {
+				return nil, fmt.Errorf("stage %q: query template: %w", s.ID, err)
+			}
+			for k, v := range spec.Filter {
+				if _, err := template.New(s.ID + ".filter." + k).
+					Option("missingkey=error").Parse(v); err != nil {
+					return nil, fmt.Errorf("stage %q: filter %q template: %w", s.ID, k, err)
+				}
+			}
+			sp.Cacheable = !s.Opts.NoCache
+			// The embedder's name is in the fingerprint because it decides what
+			// "nearest" means; the pinned epoch arrives via memoryKey below,
+			// because it decides what is there to be near.
+			sp.Fingerprint, err = fingerprint(sp, "recall", spec.Space, spec.Query,
+				spec.K, mapKey(spec.Filter), spec.MinScore, spec.OutputField,
+				spec.IDField, spec.ScoreField, spec.Require, co.memory.Embedder,
+				s.Opts.Version)
+			if err != nil {
+				return nil, err
+			}
+
+		case pipeline.KindRemember:
+			spec := s.Remember
+			if spec.Space == "" {
+				return nil, fmt.Errorf("stage %q: remember without a memory space", s.ID)
+			}
+			if spec.Text == "" {
+				return nil, fmt.Errorf("stage %q: remember without a text template", s.ID)
+			}
+			if _, err := template.New(s.ID).Funcs(pipeline.TemplateFuncs()).
+				Option("missingkey=error").Parse(spec.Text); err != nil {
+				return nil, fmt.Errorf("stage %q: text template: %w", s.ID, err)
+			}
+			for k, v := range spec.Meta {
+				if _, err := template.New(s.ID + ".meta." + k).
+					Option("missingkey=error").Parse(v); err != nil {
+					return nil, fmt.Errorf("stage %q: meta %q template: %w", s.ID, k, err)
+				}
+			}
+			// A remembered item is content-addressed and the write is
+			// idempotent, so replaying this stage from cache — and thereby not
+			// re-staging what a previous run already committed — leaves the
+			// knowledge base in the state it would have reached anyway. That is
+			// the point: a nightly pipeline over an unchanged corpus should not
+			// re-stage its whole output every night. Use WithNoCache on a stage
+			// whose writes must be attempted on every run regardless.
+			sp.Cacheable = !s.Opts.NoCache
+			sp.Fingerprint, err = fingerprint(sp, "remember", spec.Space, spec.Text,
+				mapKey(spec.Meta), spec.IDField, spec.WriteEmpty, s.Opts.Version)
+			if err != nil {
+				return nil, err
+			}
+
 		case pipeline.KindFused:
 			var names []string
 			for _, r := range s.Fused {
@@ -338,6 +452,8 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 			o.NoCache = true
 		}
 		o.Broadcasts = append(o.Broadcasts, s.Opts.Broadcasts...)
+		o.Memory = append(o.Memory, s.Opts.Memory...)
+		o.MemoryWrite = append(o.MemoryWrite, s.Opts.MemoryWrite...)
 		if s.Opts.Budget.MaxDuration > 0 {
 			o.Budget.MaxDuration = s.Opts.Budget.MaxDuration
 		}
@@ -389,6 +505,91 @@ func resolveBroadcasts(s *pipeline.Stage, registered map[string]string) (map[str
 	return out, nil
 }
 
+// resolveMemory determines which memory spaces a stage may read and write,
+// and pins each readable space to the run's epoch.
+//
+// A Recall or Remember stage grants its own space: the spec names it, so
+// requiring WithMemory to repeat it would be ceremony rather than least
+// privilege — the same reasoning that has the planner grant a stage exactly
+// its binding's models without the author listing them.
+func resolveMemory(sp *StagePlan, pinned map[string]uint64) error {
+	s := sp.Stage
+
+	reads := append([]string(nil), s.Opts.Memory...)
+	writes := append([]string(nil), s.Opts.MemoryWrite...)
+	if s.Recall != nil && s.Recall.Space != "" {
+		reads = append(reads, s.Recall.Space)
+	}
+	if s.Remember != nil && s.Remember.Space != "" {
+		writes = append(writes, s.Remember.Space)
+	}
+	if len(reads) == 0 && len(writes) == 0 {
+		return nil
+	}
+
+	if len(reads) > 0 {
+		sp.Memory = make(map[string]uint64, len(reads))
+		for _, name := range reads {
+			epoch, ok := pinned[name]
+			if !ok {
+				return fmt.Errorf("stage %q: memory space %q is not available to this run "+
+					"(configure a store with loom.WithMemory)", s.ID, name)
+			}
+			sp.Memory[name] = epoch
+		}
+	}
+	for _, name := range writes {
+		if _, ok := pinned[name]; !ok {
+			return fmt.Errorf("stage %q: memory space %q is not available to this run "+
+				"(configure a store with loom.WithMemory)", s.ID, name)
+		}
+	}
+	sort.Strings(writes)
+	sp.MemoryWrite = slices.Compact(writes)
+	return nil
+}
+
+// memoryKey renders a stage's pinned memory epochs as a deterministic
+// fingerprint component.
+//
+// Hashing the epoch is what makes retrieval from a mutable store replayable:
+// a cached recall is only reusable while the knowledge base it searched is the
+// one it searched. It is also why recall is a stage of its own — this
+// component invalidates the lookup, not the inference below it, and the
+// inference is where the money is.
+func memoryKey(m map[string]uint64) []map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]map[string]any, 0, len(names))
+	for _, n := range names {
+		out = append(out, map[string]any{"space": n, "epoch": m[n]})
+	}
+	return out
+}
+
+// mapKey renders a string map as a deterministic fingerprint component.
+func mapKey(m map[string]string) []map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]map[string]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, map[string]string{"key": k, "value": m[k]})
+	}
+	return out
+}
+
 // broadcastKey renders a stage's declared broadcasts as a deterministic
 // fingerprint component. Hashing the *values* (via their content hashes), not
 // just the names, is what makes the cache honest: edit a broadcast and the
@@ -428,6 +629,9 @@ func prefixKey(prefix string, parts ...any) []any {
 func fingerprint(sp *StagePlan, parts ...any) (string, error) {
 	if bk := broadcastKey(sp.Broadcasts); bk != nil {
 		parts = append(parts, bk)
+	}
+	if mk := memoryKey(sp.Memory); mk != nil {
+		parts = append(parts, mk)
 	}
 	return store.Key(parts...)
 }
@@ -483,6 +687,31 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		}
 	}
 
+	// Memory travels the way broadcasts do: the grant authorizes the space,
+	// the epoch says which version of it this task reads. A stage that touches
+	// memory also earns the embedder's secret and endpoint — and only such a
+	// stage does, which is the whole of least privilege here: the pipeline's
+	// other stages cannot reach the knowledge base or the embedding API at all.
+	var mem map[string]uint64
+	if len(sp.Memory) > 0 {
+		mem = make(map[string]uint64, len(sp.Memory))
+		for name, epoch := range sp.Memory {
+			mem[name] = epoch
+			caps = append(caps, security.MemoryReadCap(name))
+		}
+	}
+	for _, name := range sp.MemoryWrite {
+		caps = append(caps, security.MemoryWriteCap(name))
+	}
+	if len(sp.Memory) > 0 || len(sp.MemoryWrite) > 0 {
+		if sp.embedSecret != "" {
+			caps = append(caps, security.SecretCap(sp.embedSecret))
+		}
+		if sp.embedHost != "" {
+			hosts = append(hosts, sp.embedHost)
+		}
+	}
+
 	sandbox := s.Opts.Sandbox
 	if sandbox == "" {
 		sandbox = task.SandboxInline
@@ -496,6 +725,7 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		Egress:     security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
 		Context:    ctxBundle,
 		Broadcasts: bcast,
+		Memory:     mem,
 		Budget:     s.Opts.Budget,
 		Sandbox:    sandbox,
 	}

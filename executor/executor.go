@@ -32,10 +32,13 @@ type Executor interface {
 // while executing one task. Everything it exposes is checked against the
 // task's envelope.
 type Runtime struct {
-	Env     task.Envelope
-	TaskID  string
-	Models  *ModelClient
-	Session core.Session // grant-checked tools and broadcast reads
+	Env    task.Envelope
+	TaskID string
+	Models *ModelClient
+	// Memory is the run's long-term knowledge base, reached under the
+	// envelope's grants and at the epoch it pinned. Nil when the run has none.
+	Memory  *MemoryClient
+	Session core.Session // grant-checked tools, broadcast reads, and memory
 }
 
 // OpRunner executes one stage's operation for one task. Implementations live
@@ -289,10 +292,11 @@ func (b *boundBroadcasts) record(name string, allowed bool, reason string) {
 	}
 }
 
-// session joins the two capability-checked surfaces ops are handed.
+// session joins the capability-checked surfaces ops are handed.
 type session struct {
 	core.Tools
 	core.Broadcaster
+	core.Memory
 }
 
 // Local executes tasks in-process with the Inline sandbox profile. It
@@ -301,6 +305,7 @@ type session struct {
 type Local struct {
 	Runners    map[string]OpRunner
 	Client     *ModelClient
+	Memory     *MemoryClient
 	Tools      *ToolSet
 	Broadcasts *store.Broadcasts
 	Audit      *security.AuditLog
@@ -345,13 +350,16 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 		defer cancel()
 	}
 
+	mem := BindMemory(l.Memory, t.Envelope, t.ID)
 	rt := &Runtime{
 		Env:    t.Envelope,
 		TaskID: t.ID,
 		Models: l.Client,
+		Memory: l.Memory,
 		Session: session{
 			Tools:       BindTools(l.Tools, t.Envelope, l.Audit, t.ID),
 			Broadcaster: BindBroadcasts(l.Broadcasts, t.Envelope, l.Audit, l.Bus, t.ID),
+			Memory:      mem,
 		},
 	}
 
@@ -359,6 +367,9 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	if err != nil {
 		return task.Result{}, err
 	}
+	// Embeddings a Go-function op paid for through the session reach the
+	// governor and the run report the same way a model call's tokens do.
+	usage.Add(mem.Usage())
 
 	artifact := ""
 	if t.CacheKey != "" && l.Cache != nil {
