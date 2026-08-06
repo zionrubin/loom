@@ -257,7 +257,13 @@ what the rest of the framework already knows how to reason about.
   server. `dials > sessions` is the number that says a server has been dropping
   connections; `peak / slots` is the number to widen if tasks are queueing.
 - **In the constellation view**, a server is a **ring** drawn in its own band
-  below the stage clusters — the mirror of the shared-value band above them,
+  below the stage clusters:
+
+  ![The constellation view of a run that calls MCP tools: the inventory server
+  as a ring below the stage clusters, feeding up to the two stages that call
+  it.](../assets/mcp-constellation.png)
+
+  It is the mirror of the shared-value band above them,
   because a broadcast feeds *down* into the run while a tool call reaches *out*
   to something that is not part of the run at all. The ring is not decoration:
   its circumference is the server's concurrency ceiling and the filled arc is

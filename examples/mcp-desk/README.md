@@ -56,12 +56,41 @@ fingerprint.
 
 ## In the constellation view
 
-`-view` draws the server as a ring in its own band below the stage clusters,
-with dashed feeds running up to the two stages that call it. The filled arc is
-peak calls in flight against the ceiling (3 of 4 here); the dot at its centre is
-the single session all six calls shared. Press `m` for the inspector — per-tool
-timings, queue time, the stages and tasks that called it — and `s` for the run
-summary, which carries the same numbers as a table.
+```sh
+go run ./examples/mcp-desk -view localhost:8077
+```
+
+![The mcp-desk run in the constellation view: twelve completed tasks in four
+stage clusters, the `voice` shared value feeding down from above, and the
+`inventory` MCP server as a ring below, its dashed feeds running up to the two
+stages that call it.](../../assets/mcp-constellation.png)
+
+The server sits in its own band **below** the stage clusters — the mirror of
+the shared-value band above them, because a broadcast feeds *down* into the run
+while a tool call reaches *out* to something that is not part of the run at all.
+
+The ring is not decoration. Its circumference is the server's concurrency
+ceiling and the bright arc is the most calls ever in flight at once — three of
+four here — so the node draws the quantity this design actually rations. The
+dot at its centre is the session: **one**, shared by all six calls across twelve
+tasks. A call sends a ripple outward, and the node dims again as traffic stops.
+
+Press `m` for the inspector:
+
+<img src="../../assets/mcp-inspector.png" alt="The MCP server inspector: transport, one connection for the whole host, 3 of 4 call slots ever in flight, six calls, time in calls, queue time, the tool-contract digest, a per-tool breakdown, and the stages and tasks that called it." width="380">
+
+Everything there answers a question the sky cannot. **One connection for the
+whole host** is the architecture in one line. **3 of 4 ever in flight** is the
+number to widen if tasks are queueing — and *queued for a slot* says whether
+they are. The **per-tool breakdown** exists because "which tool is slow" is a
+question a server-wide average cannot answer. Times are in microseconds: this
+server answers in a few hundred of them, and rounding that to `0ms` would report
+real work as none.
+
+Press `s` for the run summary, which carries the same numbers as a table, and
+note where they are: in their own section, *not* in the cost table. Tool calls
+are the only work in Loom that costs no tokens, so a stage bounded by a slow
+server would otherwise look like a fast stage.
 
 ## Expected output
 

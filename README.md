@@ -663,6 +663,16 @@ Everything else follows from treating the tool set as data:
 [`examples/mcp-desk`](./examples/mcp-desk) is all of it running offline against
 a real child-process server, and [docs/MCP.md](docs/MCP.md) is the design.
 
+![The constellation view of a run that calls MCP tools: twelve completed tasks
+in four stage clusters, the shared `voice` value feeding down from above, and
+the `inventory` MCP server as a ring below, its dashed feeds running up to the
+two stages that call it.](./assets/mcp-constellation.png)
+
+The ring is the server. Its circumference is the concurrency ceiling and the
+bright arc is the most calls ever in flight at once; the dot at its centre is
+the session — one, shared by every call in the run. Press `m` for the
+inspector's per-tool timings, queue time, and callers.
+
 ## Design notes
 
 - AI operators are pure data and tasks are JSON-serializable (tested), so

@@ -136,7 +136,11 @@ func main() {
 	if *view != "" {
 		fmt.Println("\nview still serving; press m for the servers, s for the summary; ctrl-c to exit")
 		<-ctx.Done()
+		return
 	}
+	fmt.Println("\nwatch it: go run ./examples/mcp-desk -view localhost:8077")
+	fmt.Println("  the server is a ring below the stage clusters, its arc the peak calls")
+	fmt.Println("  in flight against the ceiling; press m for per-tool timings and callers")
 }
 
 // desk is the pipeline: look a SKU up, let the model choose a follow-up tool,

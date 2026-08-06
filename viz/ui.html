@@ -1206,9 +1206,12 @@ function drawMCP(m, now, tms, focusName) {
     ctx.restore();
   }
 
+  // The empty ring is drawn faint on purpose: it is the ceiling, and the
+  // occupancy arc laid over it is the reading. A ring at full strength would
+  // make a server that never used its slots look like one that saturated them.
   ctx.save();
   ctx.strokeStyle = COLORS.mcp;
-  ctx.globalAlpha = lit ? 0.95 : 0.55;
+  ctx.globalAlpha = lit ? 0.55 : 0.3;
   ctx.lineWidth = 1.4;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
