@@ -3,6 +3,7 @@ package loom
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/ops"
@@ -253,6 +255,8 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 		{probe.Secrets != nil, "WithSecrets"},
 		{probe.StateDir != "", "WithStateDir"},
 		{probe.Tools != nil, "WithTools"},
+		{probe.MCPServers != nil, "WithMCPServer (a fleet holds one set of connections)"},
+		{probe.MCPResources != nil, "WithMCPResource"},
 		{probe.Broadcasts != nil, "WithBroadcast"},
 		{probe.Topics != nil, "WithTopic"},
 		{probe.EventHandler != nil, "WithEventHandler"},
@@ -273,6 +277,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 	cfg.Workers, cfg.RunBudget = f.cfg.Workers, f.cfg.RunBudget
 	cfg.Secrets, cfg.StateDir = f.cfg.Secrets, f.cfg.StateDir
 	cfg.Tools, cfg.Broadcasts, cfg.Topics = f.cfg.Tools, f.cfg.Broadcasts, f.cfg.Topics
+	cfg.MCPServers, cfg.MCPResources = f.cfg.MCPServers, f.cfg.MCPResources
 	cfg.EventHandler = f.cfg.EventHandler
 	return cfg, nil
 }
@@ -475,6 +480,9 @@ type FleetReport struct {
 	Budget   core.Budget
 	Topics   int
 	Posts    int
+	// MCP is the fleet's connection accounting — one row per server, shared by
+	// every agent, which is the point of holding them here.
+	MCP []mcp.Stats
 }
 
 // Duration is the fleet's wall-clock span.
@@ -517,7 +525,7 @@ func (f *Fleet) Report() FleetReport {
 	rep := FleetReport{
 		Slots: f.pool.Slots(), Started: started, Pool: stats,
 		Spent: f.gov.Spent(), Budget: f.cfg.RunBudget,
-		Topics: topics, Posts: posts,
+		Topics: topics, Posts: posts, MCP: f.mcpStats(),
 	}
 	for _, a := range agents {
 		ar := AgentReport{Name: a.Name, RunID: a.RunID}
@@ -594,6 +602,24 @@ func (r FleetReport) String() string {
 	if r.Topics > 0 {
 		fmt.Fprintf(&b, "blackboard: %d topic(s), %d post(s), read by reference\n", r.Topics, r.Posts)
 	}
+	for _, m := range r.MCP {
+		fmt.Fprintf(&b, "mcp %s: %d session(s) shared by every agent, %d call(s)",
+			m.Server, m.Sessions, m.Calls)
+		if m.Errors > 0 {
+			fmt.Fprintf(&b, ", %d failed", m.Errors)
+		}
+		if m.Dials > m.Sessions {
+			fmt.Fprintf(&b, ", %d reconnect(s)", m.Dials-m.Sessions)
+		}
+		fmt.Fprintf(&b, ", %s busy", m.Busy.Round(time.Millisecond))
+		// Queue time is the only tuning signal a call slot has: it says the
+		// ceiling, not the server, is what the agents were waiting on.
+		if m.Waited > 0 {
+			fmt.Fprintf(&b, ", %s queued for a slot (peak %d of %d)",
+				m.Waited.Round(time.Millisecond), m.Peak, m.Slots)
+		}
+		b.WriteByte('\n')
+	}
 	return b.String()
 }
 
@@ -627,6 +653,12 @@ type host struct {
 	limiter *runtime.RateLimiter
 	client  *executor.ModelClient
 	tools   *executor.ToolSet
+	// mcp holds the host's connections to MCP servers, alongside the limiter
+	// and the governor and for the same reason: a connection belongs to an
+	// account and a server process rather than to a pipeline, so every agent
+	// on this host shares one set of them and one bound on their use.
+	mcp      *mcp.Catalog
+	manifest mcp.Manifest
 
 	mu     sync.Mutex
 	traces map[string]*agentTrace
@@ -707,19 +739,123 @@ func newHost(cfg Config) (*host, error) {
 		Registry: cfg.Registry, Broker: h.broker, Audit: audit, Bus: h.bus,
 	}
 
+	// MCP servers are connected before anything else, because everything else
+	// depends on what they answer: the tool set an executor can dispatch, the
+	// manifest a plan is compiled against, and any resource registered as a
+	// broadcast.
+	if err := h.connectMCP(); err != nil {
+		_ = cache.Close()
+		return nil, err
+	}
+
 	// Broadcasts are stored before anything runs: from here on tasks carry
 	// content hashes, not copies.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Broadcasts)) {
 		if _, err := h.shared.Register(name, cfg.Broadcasts[name]); err != nil {
+			_ = h.closeMCP()
 			_ = cache.Close()
 			return nil, err
 		}
 	}
+	if err := h.readMCPResources(); err != nil {
+		_ = h.closeMCP()
+		_ = cache.Close()
+		return nil, err
+	}
 	return h, nil
 }
 
+// connectMCP provisions the host's MCP connections: credentials resolved once
+// through the broker, sessions dialed, tools discovered, and the resulting
+// contract published as a manifest for the planner.
+//
+// Doing it here — at host construction, before a single task exists — is the
+// whole of the design. A connection made lazily inside a task would be made
+// once per task under load, would put a handshake on the critical path of a
+// record, and would leave a broken server to surface as a scattering of failed
+// records instead of a run that never started.
+func (h *host) connectMCP() error {
+	if len(h.cfg.MCPServers) == 0 {
+		return nil
+	}
+	// Provisioning resolves exactly the credentials the configured servers
+	// name, and nothing else. The grant set is built from the descriptors
+	// themselves, so the broker's check is real rather than ceremonial and the
+	// audit log records precisely which secrets a connection consumed.
+	var caps []security.Capability
+	for _, s := range h.cfg.MCPServers {
+		if s.AuthSecret != "" {
+			caps = append(caps, security.SecretCap(s.AuthSecret))
+		}
+		for _, ref := range s.EnvSecrets {
+			caps = append(caps, security.SecretCap(ref))
+		}
+	}
+	grants := security.NewGrantSet(caps...)
+
+	cat, err := mcp.NewCatalog(mcp.Options{
+		Resolve: func(ref security.SecretRef) (string, error) {
+			return h.broker.Resolve("provisioning", ref, grants)
+		},
+		Audit: h.audit, Bus: h.bus, Slots: h.cfg.Workers,
+	}, h.cfg.MCPServers...)
+	if err != nil {
+		return err
+	}
+	if err := cat.Connect(context.Background()); err != nil {
+		_ = cat.Close()
+		return err
+	}
+	h.mcp, h.manifest = cat, cat.Manifest()
+
+	// The discovered tools join the same tool set local tools live in, under
+	// qualified names ("mcp/<server>/<tool>"), so a grant on an MCP tool is an
+	// ordinary capability and the executor needed no new dispatch path.
+	for _, t := range cat.Tools() {
+		h.tools.Add(t)
+	}
+	return nil
+}
+
+// readMCPResources turns each configured resource into a broadcast: read once
+// here, stored by content hash, and from then on an ordinary shared value.
+func (h *host) readMCPResources() error {
+	for _, r := range h.cfg.MCPResources {
+		if h.mcp == nil {
+			return fmt.Errorf("mcp resource %q: no MCP servers registered (loom.WithMCPServer)", r.Name)
+		}
+		if _, taken := h.cfg.Broadcasts[r.Name]; taken {
+			return fmt.Errorf("mcp resource %q: a broadcast of that name is already registered", r.Name)
+		}
+		val, err := h.mcp.ReadResource(context.Background(), r.Server, r.URI)
+		if err != nil {
+			return fmt.Errorf("mcp resource %q: %w", r.Name, err)
+		}
+		if _, err := h.shared.Register(r.Name, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *host) closeMCP() error {
+	if h.mcp == nil {
+		return nil
+	}
+	return h.mcp.Close()
+}
+
+// mcpStats reports the host's connection accounting, or nil when no servers
+// were configured.
+func (h *host) mcpStats() []mcp.Stats {
+	if h.mcp == nil {
+		return nil
+	}
+	return h.mcp.Stats()
+}
+
 func (h *host) close() error {
-	err := h.cache.Close()
+	err := errors.Join(h.closeMCP(), h.cache.Close())
 	h.bus.Close()
 	return err
 }
@@ -752,7 +888,8 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	// agent pins the board: from here its envelopes name hashes, and later
 	// posts cannot move underneath it.
 	snapshot := h.shared.Hashes()
-	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(snapshot))
+	pl, err := plan.Compile(p, cfg.Registry,
+		plan.WithBroadcasts(snapshot), plan.WithMCP(h.manifest))
 	if err != nil {
 		return nil, err
 	}
@@ -831,6 +968,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		Lineage:      lineageOf(h.lineage.Entries(), runID),
 		Audit:        auditOf(h.audit.Entries(), tr),
 		Broadcasts:   snapshot,
+		MCP:          h.mcpStats(),
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {

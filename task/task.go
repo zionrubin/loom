@@ -61,6 +61,19 @@ type Envelope struct {
 	// of once per task. Reads additionally require the matching
 	// security.DataCap grant.
 	Broadcasts map[string]string `json:"broadcasts,omitempty"`
+	// MCP maps each Model Context Protocol server this task may reach to the
+	// content digest of the tool descriptors the stage was planned against.
+	//
+	// Connections are named, never carried — the same indirection that makes a
+	// broadcast a hash rather than a copy, and for the same reason: a task
+	// holding a live socket cannot be shipped anywhere, while a task naming a
+	// server can be run by any executor that can reach it. The digest makes the
+	// name a contract as well as an address: an executor whose server
+	// advertises a different tool set than the plan was compiled against
+	// refuses the call rather than invoking a tool nobody planned. Invocation
+	// additionally requires the matching security.ToolCap and, for a networked
+	// server, its host on the egress allowlist.
+	MCP map[string]string `json:"mcp,omitempty"`
 	// CachePrefix authorizes the executor to ask the provider to cache this
 	// stage's shared prompt prefix. The planner sets it only when the stage
 	// issues more than one model call, so a cache entry is never written

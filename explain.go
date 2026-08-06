@@ -11,6 +11,7 @@ import (
 
 	"github.com/zionrubin/loom/algo"
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
@@ -250,7 +251,17 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 			return nil, err
 		}
 	}
-	pl, err := plan.Compile(p, cfg.Registry, plan.WithBroadcasts(broadcasts.Hashes()))
+	// MCP servers are compiled against their *declaration* rather than a
+	// connection: Explain opens no sockets, and dialing a server to discover
+	// its tools would be exactly that. A stage naming an unregistered server
+	// or a tool outside the deployment's allowlist still fails here; what is
+	// missing is the tool-descriptor digest, so a stage that declares MCP
+	// fingerprints differently under Explain than under Run. Nothing in a
+	// projection reads a fingerprint, so this costs a warning rather than a
+	// wrong number.
+	pl, err := plan.Compile(p, cfg.Registry,
+		plan.WithBroadcasts(broadcasts.Hashes()),
+		plan.WithMCP(mcp.Declared(cfg.MCPServers...)))
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +280,14 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	}
 	if e.ratio <= 0 {
 		e.ratio = defaultExpectedOutput
+	}
+	for _, sp := range pl.Order {
+		if len(sp.Stage.Opts.MCP) > 0 {
+			e.warnf("stage %q calls MCP tools, which cost no tokens and are not "+
+				"priced here; its wall-clock is bounded by the server rather than "+
+				"by the rate limits below", sp.Stage.ID)
+			break
+		}
 	}
 
 	proj := &Projection{

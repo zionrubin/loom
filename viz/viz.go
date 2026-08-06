@@ -7,6 +7,15 @@
 // Clicking any node opens its full detail: stage, executor, model, input,
 // runtime, token usage, cost, retries, event log, and errors.
 //
+// Two kinds of node are not tasks, and they sit in bands on either side of the
+// stage clusters because that is the direction each one points. Above are the
+// run's shared values, feeding down into the stages that read them. Below are
+// the MCP servers, which the run reaches out to — drawn as rings whose filled
+// arc is the peak calls in flight against the server's ceiling, because a task
+// leases a call slot rather than a connection. Servers belong to the host
+// rather than to any run, so the same one appears in every sky, carrying that
+// run's own traffic.
+//
 // Wire it into a run with two lines:
 //
 //	v := viz.New()
@@ -116,6 +125,10 @@ type Node struct {
 	CacheHit  bool     `json:"cacheHit,omitempty"`
 	// Broadcasts names the run-level shared values this task actually read.
 	Broadcasts []string `json:"broadcasts,omitempty"`
+	// MCPCalls names the MCP tools this task invoked, as "server/tool". They
+	// are the one kind of work a task does that costs no tokens, so without
+	// this the node's own numbers would not explain its runtime.
+	MCPCalls []string `json:"mcpCalls,omitempty"`
 	// Round is the superstep this task belongs to, 1-based, on an iterative
 	// stage (0 everywhere else). It is what lets the view draw a stage that
 	// ran more than once as something other than one undifferentiated cluster.
@@ -268,6 +281,78 @@ type BroadcastInfo struct {
 	Tasks   []string `json:"tasks,omitempty"`   // reader task IDs (capped)
 }
 
+// MCPInfo is the visualized state of one MCP server: what it is, what the
+// host's connection to it is doing, and where in this run its tools were
+// called.
+//
+// A server is not a task and not an executor. It is outside the engine — a
+// process or an endpoint the run reaches out to — and it belongs to the *host*
+// rather than to any run: one connection serves every agent on a fleet, made
+// before the first run started and still open after the last one finishes. So
+// its identity fields (transport, tools, digest, sessions, dials) are the same
+// in every sky that shows it, while its call counters are that run's own.
+// The inspector says so, because "why does this server appear in both runs"
+// is exactly the question the architecture answers.
+type MCPInfo struct {
+	ID string `json:"id"` // the server name stages declare
+	// Kind is the transport ("stdio" or "http") and Endpoint what it reaches:
+	// a command line, or a URL.
+	Kind     string `json:"kind,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	Detail   string `json:"detail,omitempty"` // full description, for the inspector
+	Digest   string `json:"digest,omitempty"` // tool-descriptor contract
+	Tools    int    `json:"tools"`
+	Sessions int    `json:"sessions"` // transports the host holds open
+	Dials    int    `json:"dials"`    // connections made, reconnects included
+	DialMS   int64  `json:"dialMs,omitempty"`
+
+	// This run's activity. Times are microseconds, not the milliseconds the
+	// rest of this file uses: a local stdio server answers in a few hundred
+	// microseconds, and a panel reporting "0ms average" for six real calls
+	// reads as broken rather than as fast.
+	Calls   int   `json:"calls"`
+	Errors  int   `json:"errors"`
+	BusyUS  int64 `json:"busyUs"`
+	QueueUS int64 `json:"queueUs"` // total time this run's calls waited for a slot
+	// Slots is the ceiling on concurrent calls and Peak the most ever seen in
+	// flight at once. The pair is the whole of what this design rations: a task
+	// leases a call slot, not a connection, so occupancy against the ceiling is
+	// the number that says whether the bound is the bottleneck.
+	Slots int `json:"slots,omitempty"`
+	Peak  int `json:"peak"`
+	// LastAt is when the most recent call landed, which is what lets the view
+	// show a server as live rather than merely present.
+	LastAt   int64      `json:"lastAt,omitempty"`
+	Stages   []string   `json:"stages,omitempty"` // stages observed calling it
+	Tasks    []string   `json:"tasks,omitempty"`  // caller task IDs (capped)
+	ByTool   []ToolStat `json:"byTool,omitempty"`
+	Recent   []MCPCall  `json:"recent,omitempty"` // most recent calls, newest last
+	LastErr  string     `json:"lastErr,omitempty"`
+	Connects int        `json:"connects,omitempty"` // announcements seen
+}
+
+// ToolStat is one tool's share of a server's traffic.
+type ToolStat struct {
+	Name    string `json:"name"`
+	Calls   int    `json:"calls"`
+	Errors  int    `json:"errors"`
+	TotalUS int64  `json:"totalUs"`
+	MaxUS   int64  `json:"maxUs"`
+}
+
+// MCPCall is one tool invocation, kept as a short tail so the inspector can
+// show what a server has actually been asked to do rather than only how often.
+type MCPCall struct {
+	At      int64  `json:"at"`
+	Tool    string `json:"tool"`
+	Stage   string `json:"stage,omitempty"`
+	TaskID  string `json:"taskId,omitempty"`
+	US      int64  `json:"us"`
+	QueueUS int64  `json:"queueUs,omitempty"`
+	Bytes   int    `json:"bytes,omitempty"`
+	Err     string `json:"err,omitempty"`
+}
+
 // WorkerInfo is the visualized state of one scheduler worker (executor slot).
 type WorkerInfo struct {
 	ID string `json:"id"`
@@ -342,6 +427,7 @@ type Snapshot struct {
 	Tasks      []*Node          `json:"tasks"`
 	Workers    []*WorkerInfo    `json:"workers"`
 	Broadcasts []*BroadcastInfo `json:"broadcasts"`
+	MCP        []*MCPInfo       `json:"mcp"`
 	Projection *ProjectionInfo  `json:"projection,omitempty"`
 }
 
@@ -356,14 +442,18 @@ type delta struct {
 	RunID string `json:"runId,omitempty"`
 	// Runs is the full roster, sent when it changes shape (a run started, an
 	// old one was evicted) rather than on every event.
-	Runs       []*RunSummary   `json:"runs,omitempty"`
-	Live       string          `json:"live,omitempty"`
-	Run        runHeader       `json:"run"`
-	Summary    *RunSummary     `json:"summary,omitempty"`
-	Stage      *StageInfo      `json:"stage,omitempty"`
-	Task       *Node           `json:"task,omitempty"`
-	Worker     *WorkerInfo     `json:"worker,omitempty"`
-	Broadcast  *BroadcastInfo  `json:"broadcast,omitempty"`
+	Runs      []*RunSummary  `json:"runs,omitempty"`
+	Live      string         `json:"live,omitempty"`
+	Run       runHeader      `json:"run"`
+	Summary   *RunSummary    `json:"summary,omitempty"`
+	Stage     *StageInfo     `json:"stage,omitempty"`
+	Task      *Node          `json:"task,omitempty"`
+	Worker    *WorkerInfo    `json:"worker,omitempty"`
+	Broadcast *BroadcastInfo `json:"broadcast,omitempty"`
+	// MCP carries one server's state. It is the only entity in a delta that
+	// can arrive with no run ID: a connection is the host's, made before any
+	// run exists, so a client applies it to whatever sky it is showing.
+	MCP        *MCPInfo        `json:"mcp,omitempty"`
 	Projection *ProjectionInfo `json:"projection,omitempty"`
 }
 
@@ -373,6 +463,11 @@ const (
 	// Reader lists are for showing *where* a value landed, not for
 	// enumerating every task; Readers stays exact regardless.
 	maxBroadcastTasks = 24
+	// An MCP server's caller list and call tail are for showing what a server
+	// has been asked to do, not for enumerating every call; Calls and ByTool
+	// stay exact regardless.
+	maxMCPTasks = 24
+	maxMCPCalls = 32
 	// defaultRetainedRuns bounds the universe. Runs are held whole — every
 	// task, prompt, and response — so the history is finite by construction:
 	// the oldest run is dropped when a new one pushes past the limit.
@@ -398,6 +493,10 @@ type runState struct {
 	workIx   map[string]*WorkerInfo
 	shared   []*BroadcastInfo
 	sharedIx map[string]*BroadcastInfo
+	// servers is this run's view of the host's MCP connections: the same
+	// identity in every sky, this run's own call counters.
+	servers []*MCPInfo
+	serveIx map[string]*MCPInfo
 
 	// round is the superstep each iterative stage is currently in, so the
 	// tasks it schedules can be attributed to it.
@@ -432,6 +531,7 @@ func newRunState(hdr runHeader) *runState {
 		taskIx:   map[string]*Node{},
 		workIx:   map[string]*WorkerInfo{},
 		sharedIx: map[string]*BroadcastInfo{},
+		serveIx:  map[string]*MCPInfo{},
 		byStatus: map[string]int{},
 		round:    map[string]int{},
 	}
@@ -463,6 +563,13 @@ type Server struct {
 	// is the same prediction a second time.
 	forecasts map[string]*forecast
 
+	// servers is the host's MCP connections, held outside the universe
+	// because that is where they actually live: connected before the first
+	// run, shared by every agent, still open after the last one finishes. Each
+	// new run's sky is seeded from this, so a server looks the same in every
+	// sky and accumulates its own call counters in each.
+	servers    []*MCPInfo
+	serverIx   map[string]*MCPInfo
 	viewer     chan struct{}
 	viewerOnce sync.Once
 
@@ -490,6 +597,7 @@ func New(opts ...Option) *Server {
 	s := &Server{
 		runIx:     map[string]*runState{},
 		forecasts: map[string]*forecast{},
+		serverIx:  map[string]*MCPInfo{},
 		retain:    defaultRetainedRuns,
 		subs:      map[*subscriber]struct{}{},
 		viewer:    make(chan struct{}),
@@ -573,6 +681,11 @@ func (s *Server) Handle(e observe.Event) {
 	switch e.Type {
 	case observe.StageProjected, observe.RunProjected:
 		// Resolved below: a forecast belongs to a pipeline, not to a run.
+	case observe.MCPConnected:
+		// Nor does a connection. It is made before any run starts and outlives
+		// every one of them, so it must not conjure a sky to live in — the
+		// empty universe should show the servers it is about to use, not a
+		// phantom run that never happened.
 	case observe.RunStarted:
 		// A new sky. The roster rides along because this is the one event
 		// that changes its shape — a run appears, and the oldest may retire.
@@ -820,6 +933,81 @@ func (s *Server) Handle(e observe.Event) {
 		d.Task = n
 		d.Broadcast = bc
 
+	case observe.MCPConnected:
+		host := s.hostServerLocked(e.Server)
+		host.Kind, host.Endpoint, host.Detail = e.Kind, e.Note, e.Detail
+		host.Digest, host.Tools, host.Slots = e.Artifact, e.Records, e.Slots
+		host.DialMS = e.Latency.Milliseconds()
+		host.Connects++
+		host.Sessions, host.Dials = 1, host.Connects
+		// A run already open gains the server too: a reconnect mid-run is
+		// exactly the moment a viewer wants to see it.
+		if s.cur != nil {
+			d.MCP = s.cur.adoptServerLocked(host)
+			r = s.cur
+		} else {
+			cp := *host
+			d.MCP = &cp
+		}
+
+	case observe.MCPCalled:
+		m := r.serverLocked(e.Server)
+		if seed := s.serverIx[e.Server]; seed != nil && m.Tools == 0 {
+			m.Kind, m.Endpoint, m.Detail = seed.Kind, seed.Endpoint, seed.Detail
+			m.Digest, m.Tools, m.Sessions, m.Dials = seed.Digest, seed.Tools, seed.Sessions, seed.Dials
+		}
+		m.Calls++
+		m.LastAt = now
+		m.BusyUS += e.Latency.Microseconds()
+		m.QueueUS += e.Queued.Microseconds()
+		if e.Slots > 0 {
+			m.Slots = e.Slots
+		}
+		if e.InFlight > m.Peak {
+			m.Peak = e.InFlight
+		}
+		if e.Stage != "" && !contains(m.Stages, e.Stage) {
+			m.Stages = append(m.Stages, e.Stage)
+		}
+		if e.TaskID != "" && len(m.Tasks) < maxMCPTasks && !contains(m.Tasks, e.TaskID) {
+			m.Tasks = append(m.Tasks, e.TaskID)
+		}
+		m.tally(e.Tool, e.Latency.Microseconds(), e.Err != "")
+		m.Recent = append(m.Recent, MCPCall{
+			At: now, Tool: e.Tool, Stage: e.Stage, TaskID: e.TaskID,
+			US: e.Latency.Microseconds(), QueueUS: e.Queued.Microseconds(),
+			Bytes: e.Bytes, Err: e.Err,
+		})
+		if len(m.Recent) > maxMCPCalls {
+			m.Recent = m.Recent[len(m.Recent)-maxMCPCalls:]
+		}
+		if e.Err != "" {
+			m.Errors++
+			m.LastErr = e.Err
+		}
+
+		// The call also belongs to the task that made it: a star's log is
+		// where "why did this task take four seconds" gets answered, and a
+		// tool call is the one kind of work that costs no tokens and so leaves
+		// no trace in the cost column.
+		if e.TaskID != "" {
+			n := r.nodeLocked(e.TaskID, e.Stage)
+			qualified := e.Server + "/" + e.Tool
+			if !contains(n.MCPCalls, qualified) {
+				n.MCPCalls = append(n.MCPCalls, qualified)
+			}
+			if e.Err != "" {
+				logf(n, now, "mcp %s failed after %s: %s",
+					qualified, e.Latency.Round(time.Millisecond), e.Err)
+			} else {
+				logf(n, now, "mcp %s: %s%s, %d byte%s back (no tokens, no cost)",
+					qualified, e.Latency.Round(time.Millisecond),
+					queuedNote(e.Queued), e.Bytes, plural(e.Bytes))
+			}
+			d.Task = n
+		}
+		d.MCP = m
+
 	case observe.BudgetExceeded:
 		r.hdr.Note = "budget exceeded: " + e.Note
 		if e.TaskID != "" {
@@ -853,6 +1041,9 @@ func (s *Server) startRunLocked(e observe.Event, now int64) *runState {
 		r.fc = fc
 		r.proj = fc.run
 	}
+	// The host's connections predate this run and will outlive it, so the sky
+	// opens already knowing which servers it can reach.
+	r.seedServersLocked(s.servers)
 	// A run ID repeated (a reconnected producer, a hand-fed stream) replaces
 	// the run it names rather than shadowing it in the index.
 	if old, ok := s.runIx[e.RunID]; ok && e.RunID != "" {
@@ -990,6 +1181,87 @@ func (r *runState) sharedLocked(name string) *BroadcastInfo {
 	r.sharedIx[name] = bc
 	r.shared = append(r.shared, bc)
 	return bc
+}
+
+// hostServerLocked returns the host-level entry for an MCP server, creating it
+// on first announcement.
+func (s *Server) hostServerLocked(name string) *MCPInfo {
+	if m, ok := s.serverIx[name]; ok {
+		return m
+	}
+	m := &MCPInfo{ID: name}
+	s.serverIx[name] = m
+	s.servers = append(s.servers, m)
+	return m
+}
+
+// serverLocked returns this run's entry for a server, creating it if a call
+// arrives before (or without) the connection announcement.
+func (r *runState) serverLocked(name string) *MCPInfo {
+	if m, ok := r.serveIx[name]; ok {
+		return m
+	}
+	m := &MCPInfo{ID: name}
+	r.serveIx[name] = m
+	r.servers = append(r.servers, m)
+	return m
+}
+
+// adoptServerLocked copies the host's view of a server's identity into this
+// run, leaving the run's own call counters alone. Identity is the host's —
+// one connection, however many runs look at it — and traffic is the run's.
+func (r *runState) adoptServerLocked(host *MCPInfo) *MCPInfo {
+	m := r.serverLocked(host.ID)
+	m.Kind, m.Endpoint, m.Detail = host.Kind, host.Endpoint, host.Detail
+	m.Digest, m.Tools, m.DialMS = host.Digest, host.Tools, host.DialMS
+	m.Sessions, m.Dials, m.Connects = host.Sessions, host.Dials, host.Connects
+	if host.Slots > 0 {
+		m.Slots = host.Slots
+	}
+	return m
+}
+
+// seedServersLocked gives a new run the host's connections, so a sky opens
+// showing the servers it may reach rather than discovering them one call at a
+// time.
+func (r *runState) seedServersLocked(hosts []*MCPInfo) {
+	for _, h := range hosts {
+		r.adoptServerLocked(h)
+	}
+}
+
+// tally folds one call into a server's per-tool breakdown. Which tool is being
+// called is usually the answer to "why is this server slow", and a single
+// aggregate for the whole server hides it.
+func (m *MCPInfo) tally(tool string, us int64, failed bool) {
+	for i := range m.ByTool {
+		if m.ByTool[i].Name != tool {
+			continue
+		}
+		m.ByTool[i].Calls++
+		m.ByTool[i].TotalUS += us
+		if us > m.ByTool[i].MaxUS {
+			m.ByTool[i].MaxUS = us
+		}
+		if failed {
+			m.ByTool[i].Errors++
+		}
+		return
+	}
+	st := ToolStat{Name: tool, Calls: 1, TotalUS: us, MaxUS: us}
+	if failed {
+		st.Errors = 1
+	}
+	m.ByTool = append(m.ByTool, st)
+}
+
+// queuedNote renders slot-wait time only when there was any, so the common
+// case — a slot was free — says nothing rather than saying "0s".
+func queuedNote(d time.Duration) string {
+	if d < time.Millisecond {
+		return ""
+	}
+	return fmt.Sprintf(" after %s queued for a slot", d.Round(time.Millisecond))
 }
 
 func contains(list []string, want string) bool {
@@ -1169,12 +1441,16 @@ func (s *Server) snapshotLocked(r *runState) []byte {
 		snap.Tasks = r.tasks
 		snap.Workers = r.workers
 		snap.Broadcasts = r.shared
+		snap.MCP = r.servers
 		snap.Projection = r.proj
 	} else {
 		// Nothing has run yet. If a forecast has been published it is the only
 		// thing there is to show, and this is the one moment when knowing the
-		// price is still actionable.
+		// price is still actionable. The host's MCP connections are the other
+		// half of that: they exist before any run does, so an empty universe
+		// can still say what this process is wired to.
 		snap.Projection = s.pendingForecastLocked()
+		snap.MCP = s.servers
 	}
 	if snap.Stages == nil {
 		snap.Stages = []*StageInfo{}
@@ -1187,6 +1463,9 @@ func (s *Server) snapshotLocked(r *runState) []byte {
 	}
 	if snap.Broadcasts == nil {
 		snap.Broadcasts = []*BroadcastInfo{}
+	}
+	if snap.MCP == nil {
+		snap.MCP = []*MCPInfo{}
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {

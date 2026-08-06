@@ -154,6 +154,31 @@ Continuum — and says which rows are honestly still empty.
   does. `loom.Run` is a fleet of one, built through the same path. The fleet
   report gives each agent its completion time next to the slot-time it was
   given. See [docs/ASYNC.md](docs/ASYNC.md).
+- **MCP tools, under the envelope** — register Model Context Protocol servers
+  with `loom.WithMCPServer`; stages declare what they may call with
+  `pipeline.WithMCP`, and the planner turns that one declaration into a grant
+  per tool, the server's host on the egress allowlist, and the digest of the
+  tool descriptors the stage was compiled against. The connections are the
+  interesting part: they are made **once per host**, before any task exists —
+  next to the rate limiter and the budget governor, because a connection belongs
+  to a server process and an account rather than to a pipeline, so a fleet of
+  ten agents shares one session and one bound on how hard they may push it. MCP
+  is JSON-RPC, so one session serves any number of concurrent calls; what a task
+  leases is a **call slot**, not a connection, from a per-server semaphore that
+  is the tool-side analogue of token-bucket admission control. Envelopes name
+  servers and carry no socket, so a task stays shippable — and the digest makes
+  the name a contract: a server that comes back from a reconnect offering
+  different tools fails the tasks planned against the old ones instead of
+  silently substituting. That digest also joins the fingerprint, so **upgrading a
+  server recomputes exactly the stages that could have called the tools that
+  changed**. A model that *chooses* a tool is two stages (`Infer` → `mcp.Dispatch`)
+  rather than a loop hidden inside a task, so the choice is data in the record
+  and the call is an ordinary scheduled task. In the constellation view a server
+  is a **ring** in its own band below the stage clusters — the mirror of the
+  shared-value band above them — whose filled arc is the peak calls in flight
+  against the ceiling, with the sessions as dots at its centre; press `m` for
+  the inspector's per-tool breakdown, queue time, and callers. See
+  [docs/MCP.md](docs/MCP.md).
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
@@ -241,6 +266,16 @@ go run ./examples/newsroom        # then open http://localhost:8077, press `u`
 # land in one universe; the finished game shows its own build provenance
 go run ./examples/game-forge      # forge on :8077, the game it built on :8078
 
+# MCP: an inventory desk whose tools live behind a Model Context Protocol
+# server — a real child process over real pipes, still offline. One connection
+# serves every record; the model picks a follow-up tool and the next stage runs
+# it; a document on the server becomes a broadcast. Run it twice and the second
+# run makes zero tool calls, because a tool call is work and Loom does not pay
+# for work twice
+go run ./examples/mcp-desk
+go run ./examples/mcp-desk -state /tmp/loom-mcp
+go run ./examples/mcp-desk -state /tmp/loom-mcp   # 0 tool calls, 0 tokens
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -273,6 +308,8 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `executor` | Executor seam, capability-scoped runtime, model client, tools |
 | `ops` | Operation runners (infer, reduce, fused transforms) |
 | `model` | Provider abstraction, registry, tiers, escalation bindings, mock |
+| `mcp` | Model Context Protocol client: server descriptors, stdio and HTTP transports, the host-owned connection catalog, and the tool adapters stages call |
+| `mcp/mcptest` | A scriptable in-process MCP server for tests and offline examples — what `model.Mock` is to a provider |
 | `providers/anthropic` | Official-SDK Anthropic adapter, broker-resolved keys |
 | `providers/openai` | Official-SDK OpenAI adapter, broker-resolved keys |
 | `security` | Grants, secret broker, egress policy, audit log |
@@ -551,6 +588,90 @@ cache serves them. The prefix joins the stage fingerprint, so editing the
 rubric recomputes exactly the stages that could have seen it — and a stage
 without a prefix fingerprints exactly as it did before, leaving existing
 caches warm.
+
+## Calling tools: MCP servers
+
+Register the servers a run may use; declare, per stage, what it may call.
+
+```go
+inventory := mcp.Stdio("inventory", "npx", "-y", "@example/inventory-mcp").
+    WithTools("lookup_sku", "stock_level")            // least privilege, at the deployment
+
+src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+    out, err := s.Invoke(ctx, mcp.ToolName("inventory", "lookup_sku"),
+        map[string]any{"sku": r.String("sku")})
+    if err != nil {
+        return core.Record{}, err
+    }
+    r.Data["product"] = mcp.Text(out)
+    return r, nil
+}, pipeline.WithMCP("inventory", "lookup_sku"), pipeline.WithVersion("v1"))
+
+loom.Run(ctx, p,
+    loom.WithMCPServer(inventory),
+    loom.WithMCPResource("voice", "inventory", "mem://voice"),  // a doc → a broadcast
+)
+```
+
+That single `WithMCP` declaration produces the grant
+(`tool:mcp/inventory/lookup_sku` — an ordinary capability; MCP needed no second
+permission mechanism), the server's host on the stage's egress allowlist, and
+the digest of the tool descriptors the stage was compiled against. A server
+nobody registered fails compilation, not the first record.
+
+**Where the connections come from** is the part worth stating plainly, because
+the obvious answers are all wrong at pipeline scale. A connection per record
+spawns a process per record. A connection per task is Spark's `mapPartitions`
+answer, which is per record again when the batch is one. A connection per run
+gives a fleet of ten agents ten of them, and together they exceed a limit none
+of them individually violates.
+
+Loom connects **once per host** — during provisioning, before any task exists,
+in the same structure that holds the one rate limiter and the one budget
+governor, and for the same reason: a connection is a property of a server
+process and an account, not of a pipeline. Because MCP is JSON-RPC and every
+request carries an id, one session serves any number of concurrent calls, so
+what a task leases is a **call slot** rather than a connection — bounded per
+server by a semaphore that is the tool-side analogue of the scheduler's
+token-bucket admission control. Ten thousand records, one connection; a fleet of
+agents, still one.
+
+Everything else follows from treating the tool set as data:
+
+- **Envelopes name servers and carry no socket**, so tasks stay shippable to a
+  remote executor — the same indirection that makes a broadcast a hash rather
+  than a copy. The name is also a contract: a server that comes back from a
+  reconnect advertising different tools fails the tasks planned against the old
+  ones instead of silently invoking something else.
+- **The descriptors join the fingerprint**, so upgrading a server recomputes
+  exactly the stages that could have called the tools that changed, and leaves
+  the rest of the cache warm. Whether to cache at all stays the author's call:
+  a cacheable stage asserts that replaying the recorded result is as good as
+  calling again, which for a lookup is usually true and for a write never is.
+- **Credentials are named, never held.** `AuthSecret` / `EnvSecrets` are
+  resolved through the run's broker at provisioning and reach the transport
+  only, so no task needs a secret grant for a server it calls — it gets a lease
+  on an already-authenticated session.
+- **A model that chooses a tool is two stages**, not a loop inside a task:
+  `Infer` emits `{"tool": ..., "args": {...}}` and `mcp.Dispatch` runs it, so the
+  choice is visible in the record and the lineage and the call is scheduled,
+  retried, and budgeted like everything else. A hidden loop would have unbounded
+  cost under a per-task budget, a cache key that describes only its input, and
+  failures the scheduler cannot classify. When a loop is genuinely wanted it
+  already exists one altitude up, in `pipeline.Iterate`.
+
+[`examples/mcp-desk`](./examples/mcp-desk) is all of it running offline against
+a real child-process server, and [docs/MCP.md](docs/MCP.md) is the design.
+
+![The constellation view of a run that calls MCP tools: twelve completed tasks
+in four stage clusters, the shared `voice` value feeding down from above, and
+the `inventory` MCP server as a ring below, its dashed feeds running up to the
+two stages that call it.](./assets/mcp-constellation.png)
+
+The ring is the server. Its circumference is the concurrency ceiling and the
+bright arc is the most calls ever in flight at once; the dot at its centre is
+the session — one, shared by every call in the run. Press `m` for the
+inspector's per-tool timings, queue time, and callers.
 
 ## Design notes
 
