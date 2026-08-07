@@ -210,10 +210,23 @@ Continuum — and says which rows are honestly still empty.
   Heavy per-node payloads
   (rendered prompts, responses, record JSON) load only for the node you open,
   which is what keeps the view responsive on runs with thousands of tasks.
-- **Providers** — a deterministic mock (offline dev, scripted failures) plus
-  Anthropic and OpenAI adapters over the official SDKs with per-call
-  broker-resolved credentials. The `model.Provider` interface is small; add
-  your own.
+- **Providers, hosted or your own** — a deterministic mock (offline dev,
+  scripted failures), Anthropic and OpenAI adapters over the official SDKs
+  with per-call broker-resolved credentials, and **local inference** through
+  `providers/llamacpp`: point it at a `llama-server` and the model runs on
+  your hardware behind the same seam, so nothing in a pipeline changes. What
+  changes is the envelope, and every change is a simplification — cost is
+  zero, so the ceiling that binds becomes the *device's* decode width
+  (`Limits.MaxConcurrent`, discovered from the server's own slot count rather
+  than guessed); no credential exists, so the stage is planned with no secret
+  grant at all; egress is loopback and still *on* the allowlist rather than
+  exempt from it, so the envelope states — and the executor enforces — that
+  those records cannot reach a vendor. The shared prompt prefix stops being a
+  metaphor: locally the prompt cache **is** the KV cache, and because a local
+  cache write costs nothing to earn back, reuse is asked for on every call
+  instead of only on stages that would amortize it. Two servers on two ports
+  make an escalation ladder whose rungs are both local. The `model.Provider`
+  interface is small; add your own.
 
 ## Quickstart
 
@@ -276,6 +289,23 @@ go run ./examples/mcp-desk
 go run ./examples/mcp-desk -state /tmp/loom-mcp
 go run ./examples/mcp-desk -state /tmp/loom-mcp   # 0 tool calls, 0 tokens
 
+# local inference: an on-call desk whose models run on this machine — two
+# llama.cpp servers, no key, $0, and customer records that provably cannot
+# leave the box. Still offline: with no -fast/-deep address it starts its own
+# llama.cpp-compatible servers on real loopback sockets, so nothing is
+# installed and no weights are downloaded. Ends by printing what running
+# locally changed, including what the same pipeline would have cost billed by
+# the token
+go run ./examples/on-device
+
+# against real servers (llama-server -m small.gguf --port 8080 --parallel 2,
+# and a larger one on 8081 as the escalation rung)
+go run ./examples/on-device -fast http://127.0.0.1:8080 -deep http://127.0.0.1:8081
+
+# watch admission control do the thing local inference makes necessary: eight
+# workers against two decode slots, admitted two at a time
+go run ./examples/on-device -view localhost:8077 -slow 400ms
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -312,6 +342,8 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `mcp/mcptest` | A scriptable in-process MCP server for tests and offline examples — what `model.Mock` is to a provider |
 | `providers/anthropic` | Official-SDK Anthropic adapter, broker-resolved keys |
 | `providers/openai` | Official-SDK OpenAI adapter, broker-resolved keys |
+| `providers/llamacpp` | Local inference against a llama.cpp server: loopback egress, no credential, the KV cache as the prompt prefix cache, and the device's slot count as the admission ceiling |
+| `providers/llamacpp/llamacpptest` | A scriptable in-process llama.cpp server for tests and offline examples — what `mcp/mcptest` is to a server, on a real loopback socket |
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
@@ -672,6 +704,70 @@ The ring is the server. Its circumference is the concurrency ceiling and the
 bright arc is the most calls ever in flight at once; the dot at its centre is
 the session — one, shared by every call in the run. Press `m` for the
 inspector's per-tool timings, queue time, and callers.
+
+## Running the model yourself
+
+Point `providers/llamacpp` at a `llama-server` and the model runs on your
+hardware behind the same `model.Provider` seam as an API.
+
+```go
+reg := model.NewRegistry()
+props, _ := llamacpp.Register(ctx, reg,                    // asks the server what it is
+    llamacpp.New("http://127.0.0.1:8080"), "local-fast", model.TierFast)
+llamacpp.Register(ctx, reg,
+    llamacpp.New("http://127.0.0.1:8081"), "local-deep", model.TierDeep)
+
+src.Infer("triage", pipeline.InferSpec{
+    Binding: model.Binding{Tier: model.TierFast,            // both rungs local
+             Escalation: []string{"local-deep"}},
+    Prefix:  severityRubric,                                // served from the KV cache
+    Prompt:  "Incident: {{.text}}",
+    ParseJSON: true, Validate: ...,
+})
+```
+
+**Nothing in the pipeline changes** — a binding names a model, not a machine.
+What changes is the envelope around the call, and each change is a
+simplification rather than a special case:
+
+- **The ceiling stops being a rate and becomes a width.** A hosted model
+  meters how fast you may ask per minute; a model on your device decodes some
+  fixed number of sequences at once, and asking faster does not fail — the
+  excess queues *inside* the server, where the scheduler can neither see it
+  nor schedule around it. So `model.Limits` gained `MaxConcurrent`, admission
+  holds it across the call rather than merely before it, and `Register` reads
+  the number from the server's own `/props` instead of a config file that goes
+  stale the first time somebody changes `--parallel`.
+- **Cost is zero, so the dollar governor stops being the bound that matters.**
+  Pricing is left at zero because zero is the true marginal cost of a token
+  you generate yourself. Tokens are still counted — free is not the same as
+  unmeasured.
+- **No credential exists to leak.** `SecretRef` is empty, so the stage is
+  planned with model grants and *no secret grant at all*. It is not a stage
+  trusted with a key it happens not to use.
+- **Egress is loopback, and still on the allowlist rather than exempt from
+  it.** A local provider could report no endpoint — the in-process,
+  always-allowed answer — and naming `127.0.0.1` instead is what puts it in
+  the envelope, where the executor checks it before every call. So a stage
+  bound to a local model *provably* cannot send its records to a vendor, which
+  is what makes the mixed deployment expressible in the ordinary way: personal
+  data triaged locally, only the redacted aggregate escalating to a frontier
+  model, the boundary a binding and the envelope the proof.
+- **The prompt cache stops being a metaphor.** `InferSpec.Prefix` exists so a
+  provider's cache can serve the stage-stable head; locally that cache *is*
+  the KV cache. The planner's break-even rule — enable prefix caching only for
+  stages issuing more than one call — exists to earn back the premium a remote
+  cache *write* costs, and a local KV write costs nothing, so the adapter asks
+  for reuse on every call and `CacheWriteTokens` stays zero because there is
+  nothing to amortize.
+
+[`examples/on-device`](./examples/on-device) is an on-call incident desk
+running entirely on local models, offline and with nothing installed — it
+starts its own llama.cpp-compatible servers on real loopback sockets when no
+address is given. It ends by printing each property above as a number the run
+produced, including what the identical pipeline would have cost billed by the
+token (`loom.Explain` against hosted rates: no key, no socket, no call).
+[docs/INFERENCE.md](docs/INFERENCE.md) is the design.
 
 ## Design notes
 

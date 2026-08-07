@@ -49,20 +49,20 @@ func TestGovernor(t *testing.T) {
 
 func TestRateLimiterUnlimitedAndCancel(t *testing.T) {
 	l := NewRateLimiter()
-	if err := l.Acquire(context.Background(), "m", model.Limits{}, 100); err != nil {
+	if _, err := l.Acquire(context.Background(), "m", model.Limits{}, 100); err != nil {
 		t.Fatalf("unlimited acquire: %v", err)
 	}
 
 	// Consume the single request in the bucket, then expect the next acquire
 	// to block until the context deadline.
 	lim := model.Limits{RequestsPerMinute: 1}
-	if err := l.Acquire(context.Background(), "m2", lim, 1); err != nil {
+	if _, err := l.Acquire(context.Background(), "m2", lim, 1); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	err := l.Acquire(ctx, "m2", lim, 1)
+	_, err := l.Acquire(ctx, "m2", lim, 1)
 	if err == nil {
 		t.Fatal("acquire should fail when rate limited past deadline")
 	}
@@ -72,6 +72,62 @@ func TestRateLimiterUnlimitedAndCancel(t *testing.T) {
 	if time.Since(start) < 50*time.Millisecond {
 		t.Error("acquire returned before blocking on the limiter")
 	}
+}
+
+// TestRateLimiterMaxConcurrent pins the ceiling a local backend imposes: not
+// a rate, but a number of calls that may be in flight at once. Admissions
+// past the ceiling block until a holder releases, and releasing is what makes
+// the next one admissible — which is the whole difference from a bucket that
+// refills on a clock.
+func TestRateLimiterMaxConcurrent(t *testing.T) {
+	l := NewRateLimiter()
+	lim := model.Limits{MaxConcurrent: 2}
+
+	rel1, err := l.Acquire(context.Background(), "local", lim, 1)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	rel2, err := l.Acquire(context.Background(), "local", lim, 1)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+
+	// blocked reports how an admission fares against a short deadline.
+	blocked := func() (time.Duration, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := l.Acquire(ctx, "local", lim, 1)
+		return time.Since(start), err
+	}
+
+	// Both slots are held: a third admission cannot proceed.
+	waited, err := blocked()
+	if err == nil {
+		t.Fatal("acquire should block while every slot is occupied")
+	} else if core.ClassOf(err) != core.FailTransient {
+		t.Errorf("slot-wait cancellation should be transient, got %v", err)
+	}
+	if waited < 50*time.Millisecond {
+		t.Error("acquire returned before blocking on the semaphore")
+	}
+
+	// A different model has its own slots, so it is unaffected.
+	if _, err := l.Acquire(context.Background(), "other", lim, 1); err != nil {
+		t.Errorf("a second model's slots are its own: %v", err)
+	}
+
+	// Releasing readmits, and a repeated release must not hand out a slot that
+	// was never held — a released slot belongs to whoever takes it next.
+	rel1()
+	rel1()
+	if _, err := l.Acquire(context.Background(), "local", lim, 1); err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	if _, err := blocked(); err == nil {
+		t.Fatal("a repeated release must not free a second slot")
+	}
+	rel2()
 }
 
 // fakeExec is a scriptable executor.

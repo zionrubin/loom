@@ -24,6 +24,7 @@ the ones that aren't — says why not.
 | **Priority scheduling** — order work so short jobs are not stuck behind long ones | Fairness and completion time across tenants | **Program-fair admission** — `runtime.Pool` admits a contended slot to the agent with the least attained service | ✅ `runtime/pool.go` |
 | **Preemption** — evict work already running | Tail latency under contention | Not implemented — a task that has been admitted runs to completion | ❌ |
 | **KV cache eviction (LRU)** | Bounded cache memory | Not implemented — the result cache is unbounded | ❌ |
+| **Running the engine yourself** — the model on your own device | Paying by the token; sending records to a vendor | **Local providers** — `providers/llamacpp` over a llama.cpp server, with the device's decode width as the admission ceiling | ✅ `providers/llamacpp` |
 | **Disaggregated prefill/decode** | Different hardware profiles per phase | No analog — Loom does not own the decode loop | n/a |
 
 Two entries in that table were the gaps the prefix/streaming work closed, and
@@ -179,6 +180,132 @@ Everything else is identical: same planner, same envelopes, same cache keys,
 same recovery. Both drivers execute tasks through the same
 `Scheduler.RunTask`, so retry, escalation, admission control, and the budget
 governor cannot drift between them.
+
+---
+
+## When the inference engine is yours
+
+Everything above treats the serving engine as somebody else's: Loom issues a
+call, a vendor's fleet decodes it, and a bill arrives. `providers/llamacpp`
+removes the vendor. Point it at a `llama-server` and the model runs on your
+hardware, behind the same `model.Provider` seam as an API — which is the
+interesting part, because *nothing in a pipeline changes*. A binding names a
+model, not a machine.
+
+```go
+reg := model.NewRegistry()
+props, err := llamacpp.Register(ctx, reg,
+    llamacpp.New("http://127.0.0.1:8080"), "local-fast", model.TierFast)
+```
+
+What changes is the envelope around the call, and each change is a
+simplification rather than a special case.
+
+### The ceiling stops being a rate and becomes a width
+
+A hosted model meters how fast you may ask over a minute. A model on your own
+device has some fixed number of sequences it can decode at once — llama.cpp's
+slots, a serving engine's batch width — and asking faster than that does not
+fail, which is the problem. The excess queues *inside* the server, where the
+scheduler can neither see it nor schedule around it: latency inflates, the
+run report attributes the wait to the model call, and admission control is
+quietly bypassed.
+
+So `model.Limits` gained a third dimension next to the two token buckets:
+
+```go
+Limits{MaxConcurrent: props.Slots}   // discovered, not guessed
+```
+
+`RateLimiter.Acquire` now returns the release for what an admission holds, and
+the scheduler holds it across the call — so the bound is on calls actually in
+flight rather than calls dispatched, and a backoff sleep between attempts
+gives the slot back instead of sitting on it. The rate buckets are drawn on
+*before* the slot, because a request holding a scarce device slot while
+waiting on a per-minute quota idles the device.
+
+`llamacpp.Register` reads the number from `/props` rather than accepting one
+from a config file: the server knows its own decode width, and it is the kind
+of number that goes stale the first time somebody changes `--parallel`.
+
+### Cost is zero, which changes which bound matters
+
+The dollar governor is the ceiling that matters for hosted work, and against a
+local model it is inert — `Pricing` is left zero because zero is the true
+marginal cost of a token you generate yourself. That is not a gap to paper
+over with an invented rate; it is the point. What still binds is the device
+(above), the token budget, and wall-clock.
+
+Tokens are still counted. Free is not the same as unmeasured, and a run report
+that went silent because nothing was billable would be less useful than the
+bill it replaced.
+
+### The prompt cache stops being a metaphor
+
+`InferSpec.Prefix` exists so a provider's prompt cache can serve the
+stage-stable head instead of reprocessing it per record — RadixAttention's
+benefit, reached from outside. Against a llama.cpp server there is no reaching
+from outside: the cache **is** the KV cache, reused across requests whose
+prompts share a prefix.
+
+That collapses the break-even rule. The planner enables `CachePrefix` only for
+stages issuing more than one call, because a remote cache *write* costs a
+premium over a plain input token and needs a second call to earn it back. A
+local KV cache write costs nothing — it is a byproduct of the forward pass the
+model was making anyway — so the adapter asks for reuse unconditionally, and
+`CacheWriteTokens` is always zero because there is no write to amortize.
+Reused tokens still come back as `CacheReadTokens`, so the report reads the
+same as it does against a hosted model, priced at the zero it actually cost.
+
+One consequence for authors: the adapter joins `System` and `Prefix` into a
+single system message, where the hosted adapters send two. A GGUF ships
+whatever chat template its author wrote and plenty of them accept only one
+leading system turn. Both halves are stage-stable, so their concatenation is
+too — and identical leading bytes across a stage's calls is the entire
+requirement.
+
+### Two rungs, both local
+
+A llama.cpp server loads one model, so a deployment wanting a fast model and a
+strong one runs two servers on two ports. That makes an escalation ladder
+ordinary rather than special:
+
+```go
+Binding: model.Binding{Tier: model.TierFast, Escalation: []string{"local-deep"}}
+```
+
+This table's speculative-decoding row said escalation is the program-level
+form of "cheap model proposes, strong model verifies". With both rungs local,
+it is that shape with the vendor removed entirely — and the verification is
+`Validate`, a semantic gate the author wrote, rather than token agreement.
+
+### Least privilege gets easier, not harder
+
+Two properties fall out, and both are worth stating because the naive
+implementation loses them:
+
+**Endpoint is loopback, not empty.** A local provider could report `""` — the
+in-process, always-allowed answer — and the temptation is real, since nothing
+is leaving the machine. Reporting `127.0.0.1` instead is what puts it on the
+stage's egress allowlist, where the executor checks it before every call. The
+envelope then *states* that this stage's records cannot reach a vendor, and
+the statement is enforced rather than asserted.
+
+**No secret exists to leak.** `SecretRef` is empty for a plain local server,
+so the planner grants no secret capability at all. A stage bound to a local
+model is not a stage trusted with a key it happens not to use; it is a stage
+with no key in its envelope. (A server started with `--api-key` is covered by
+`llamacpp.WithAuth` and is then a broker-resolved secret like any other.)
+
+Together those make the mixed deployment expressible in the ordinary way:
+stages that touch personal data bind to a local model and are planned unable
+to egress, while a downstream stage over redacted or aggregated records binds
+to a frontier model and carries the key. The boundary is a binding, and the
+envelope is the proof.
+
+[`examples/on-device`](../examples/on-device) is all of it running offline
+against real loopback servers, and prints each of these as a number the run
+produced.
 
 ---
 
