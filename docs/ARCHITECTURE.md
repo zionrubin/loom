@@ -155,6 +155,12 @@ planning or scheduling.
 - **Bounded concurrency** (global or per-stage worker counts).
 - **Admission control** — per-model token buckets for requests/min *and*
   tokens/min; work waits at the scheduler instead of burning provider 429s.
+  A third dimension, `MaxConcurrent`, bounds calls in flight rather than
+  calls per minute — the ceiling a *local* backend imposes, where the scarce
+  resource is a device that decodes some fixed number of sequences at once and
+  oversubscription queues invisibly inside the server instead of failing. An
+  admission returns the release for what it holds, and the scheduler holds it
+  across the call, so a backoff between attempts gives the slot back.
 - **Budget governor** — run-level cost/token caps enforced across all
   concurrent tasks; on exhaustion the run stops admitting work and returns
   partial results plus the spend so far.
@@ -194,10 +200,24 @@ rate limits, tier, required secret. Stages bind by explicit ID or by
 model generations. A binding's **escalation ladder** is the ordered list of
 increasingly capable models used by semantic recovery.
 
-Three providers ship today: a deterministic `Mock` (tests, offline
-development, scripted failures), and `providers/anthropic` and
-`providers/openai` over the official SDKs (per-call broker-resolved keys,
-429/5xx → transient, 4xx → permanent, refusals → semantic).
+Four providers ship today: a deterministic `Mock` (tests, offline
+development, scripted failures); `providers/anthropic` and `providers/openai`
+over the official SDKs (per-call broker-resolved keys, 429/5xx → transient,
+4xx → permanent, refusals → semantic); and `providers/llamacpp`, which runs
+the model on your own hardware behind the same seam.
+
+Local inference is where the layer's separations earn themselves, because a
+pipeline is unaffected by it — a binding names a model, not a machine — while
+the envelope around the call simplifies in four ways. Pricing is zero, so the
+dollar governor stops being the bound that matters and `MaxConcurrent`
+(discovered from the server's own slot count) becomes it. `SecretRef` is
+empty, so the planner emits no secret grant at all. `Endpoint` is loopback
+rather than empty, so the egress allowlist *states* that the stage's records
+cannot reach a vendor and the executor enforces it. And the prompt-prefix
+cache the shared-prefix design was written against turns out to be the KV
+cache itself, whose writes are free — so the planner's break-even rule, which
+exists to earn back a remote write's premium, has nothing left to weigh. See
+[INFERENCE.md](./INFERENCE.md#when-the-inference-engine-is-yours).
 
 ### 4.7 State: CAS, cache, lineage
 
@@ -469,8 +489,10 @@ batched) execution alongside the barrier driver, pre-flight cost projection
 (`loom.Explain`), event bus + run reports, tree AI-reduce, iterative execution
 with a pluggable algorithm seam (`pipeline.Iterate` + `algo`, with BSP, refine
 and beam algorithms, quiescence detection, three-way halting, fan-out caps,
-open-world growth, per-round projection and round events), mock, Anthropic, and
-OpenAI providers, and cross-restart cache resume.
+open-world growth, per-round projection and round events), mock, Anthropic,
+OpenAI, and llama.cpp providers (the last with device-width admission control,
+loopback egress, no-credential envelopes, and KV-cache prefix reuse), and
+cross-restart cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
 stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
