@@ -141,6 +141,17 @@ func (p Pricing) Saved(u core.Usage) float64 {
 type Limits struct {
 	RequestsPerMinute int
 	TokensPerMinute   int
+	// MaxConcurrent caps requests in flight against this model at once.
+	//
+	// It is the ceiling a *local* backend imposes, and it is a different
+	// quantity from the two above: a hosted API meters how fast you may ask
+	// over a minute, while a model running on your own hardware has some
+	// fixed number of sequences it can decode at once (llama.cpp's slots, a
+	// serving engine's batch width). Exceeding it does not fail — the work
+	// queues invisibly inside the server, where Loom can neither see it nor
+	// schedule around it — so the honest place for the bound is here, in
+	// admission control, next to the rate limits it sits beside.
+	MaxConcurrent int
 }
 
 // Tier is a capability class, letting stages declare "what kind of model"

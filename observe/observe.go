@@ -356,9 +356,14 @@ func (r RunReport) String() string {
 	t := r.Totals()
 	fmt.Fprintf(&b, "%-22s %6s %6s %6s %6s %6s %8d %6.0f%% %10.4f\n",
 		"TOTAL", "", "", "", "", "", t.TotalTokens(), 100*t.CacheHitRate(), t.CostUSD)
-	if saved := r.PrefixSavedUSD(); saved != 0 {
+	// Reported on tokens rather than on dollars, because the two come apart:
+	// a model running on local hardware serves a shared prefix from its KV
+	// cache and saves real work for exactly $0, and a report that mentioned
+	// the cache only when it saved money would say nothing about the run
+	// where it did the most.
+	if t.CacheReadTokens > 0 || t.CacheWriteTokens > 0 {
 		fmt.Fprintf(&b, "prefix cache: %d tokens served from shared prefixes, $%.4f saved\n",
-			t.CacheReadTokens, saved)
+			t.CacheReadTokens, r.PrefixSavedUSD())
 	}
 	for _, s := range r.Stages {
 		if s.Rounds > 0 {

@@ -53,12 +53,16 @@ func (p RetryPolicy) Delay(attempt int) time.Duration {
 	return d
 }
 
-// RateLimiter provides per-model token buckets for requests/min and
-// tokens/min. Acquire blocks until admission is possible (or ctx ends), so
-// the scheduler never dispatches work the provider would immediately 429.
+// RateLimiter provides per-model admission control: token buckets for
+// requests/min and tokens/min, plus a semaphore for requests in flight.
+// Acquire blocks until admission is possible (or ctx ends), so the scheduler
+// never dispatches work the provider would immediately 429 — or, for a model
+// running on local hardware, work that would queue inside the server instead
+// of inside the scheduler.
 type RateLimiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
+	slots   map[string]chan struct{}
 }
 
 type bucket struct {
@@ -70,7 +74,7 @@ type bucket struct {
 
 // NewRateLimiter returns an empty limiter; buckets are created on first use.
 func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{buckets: map[string]*bucket{}}
+	return &RateLimiter{buckets: map[string]*bucket{}, slots: map[string]chan struct{}{}}
 }
 
 func (b *bucket) refill(now time.Time) {
@@ -84,8 +88,52 @@ func (b *bucket) refill(now time.Time) {
 }
 
 // Acquire admits one request of ~estTokens against modelID's limits,
-// blocking as needed. Zero limits admit immediately.
-func (l *RateLimiter) Acquire(ctx context.Context, modelID string, lim model.Limits, estTokens int) error {
+// blocking as needed, and returns the release for whatever the admission
+// holds for the duration of the call. Zero limits admit immediately; the
+// returned release is never nil and must be called exactly once when the
+// request finishes, successfully or not.
+//
+// The rate buckets are drawn on before the in-flight slot, not after. A
+// request that holds a scarce device slot while waiting on a per-minute
+// quota idles the device; a bucket drawn slightly ahead of issuance only
+// makes the limiter conservative, which is the safe direction for a ceiling.
+func (l *RateLimiter) Acquire(ctx context.Context, modelID string, lim model.Limits, estTokens int) (func(), error) {
+	if err := l.acquireRate(ctx, modelID, lim, estTokens); err != nil {
+		return noRelease, err
+	}
+	return l.acquireSlot(ctx, modelID, lim)
+}
+
+// noRelease is the release returned by an admission that holds nothing.
+func noRelease() {}
+
+// acquireSlot takes one of modelID's in-flight slots, blocking until one is
+// free. This is the ceiling a local backend imposes: a fixed number of
+// sequences decoded at once, which no amount of waiting per minute expresses.
+func (l *RateLimiter) acquireSlot(ctx context.Context, modelID string, lim model.Limits) (func(), error) {
+	if lim.MaxConcurrent <= 0 {
+		return noRelease, nil
+	}
+	l.mu.Lock()
+	sem, ok := l.slots[modelID]
+	if !ok {
+		sem = make(chan struct{}, lim.MaxConcurrent)
+		l.slots[modelID] = sem
+	}
+	l.mu.Unlock()
+
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }, nil
+	case <-ctx.Done():
+		return noRelease, core.Transient(ctx.Err())
+	}
+}
+
+// acquireRate blocks until modelID's requests/min and tokens/min buckets can
+// both cover one request of ~estTokens.
+func (l *RateLimiter) acquireRate(ctx context.Context, modelID string, lim model.Limits, estTokens int) error {
 	if lim.RequestsPerMinute <= 0 && lim.TokensPerMinute <= 0 {
 		return nil
 	}
@@ -326,7 +374,12 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		t.Attempt = attempt
 		t.Escalation = escalation
 
-		// Resolve the model for this attempt and pass admission control.
+		// Resolve the model for this attempt and pass admission control. The
+		// admission is held across the call and released however it ends, so a
+		// model's in-flight ceiling bounds the calls actually in flight rather
+		// than the calls dispatched — and a backoff sleep between attempts
+		// gives the slot back instead of sitting on it.
+		release := noRelease
 		if !t.Envelope.Binding.IsZero() && s.Registry != nil {
 			info, err := s.Registry.Resolve(t.Envelope.Binding, escalation)
 			if err != nil {
@@ -338,16 +391,20 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 				if est <= 0 {
 					est = 1
 				}
-				if err := s.Limiter.Acquire(ctx, info.ID, info.Limits, est); err != nil {
+				rel, err := s.Limiter.Acquire(ctx, info.ID, info.Limits, est)
+				if err != nil {
 					return task.Result{}, attempt, err
 				}
+				release = rel
 			}
 		}
 
 		if s.Governor != nil && s.Governor.Exhausted() {
+			release()
 			return task.Result{}, attempt, core.BudgetExceeded(ErrBudgetExhausted)
 		}
 		if ctx.Err() != nil {
+			release()
 			return task.Result{}, attempt, core.Transient(ctx.Err())
 		}
 
@@ -355,6 +412,7 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Model: t.ResolvedModel})
 
 		res, err := s.Exec.Execute(ctx, t)
+		release()
 		if err == nil {
 			if s.Governor != nil && res.Usage.Requests > 0 {
 				if cerr := s.Governor.Charge(res.Usage); cerr != nil {
