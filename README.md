@@ -210,6 +210,14 @@ Continuum — and says which rows are honestly still empty.
   Heavy per-node payloads
   (rendered prompts, responses, record JSON) load only for the node you open,
   which is what keeps the view responsive on runs with thousands of tasks.
+- **A canvas that prices itself** — `studio` serves **Loom Studio**: the same
+  pipeline as a document you edit in the browser, with `loom.Explain` running
+  behind every keystroke. It compiles to an ordinary `pipeline.Pipeline`, so
+  nothing built here is weaker than something written by hand; it reads your
+  sources locally to price against the real records rather than an assumed row
+  count; its ⌘K assistant answers from the projection and returns *edits* that
+  nothing applies until you accept them; and `Doc.Go` exports the canvas as a Go
+  program that compiles, because a builder you cannot leave is a trap.
 - **Providers, hosted or your own** — a deterministic mock (offline dev,
   scripted failures), Anthropic and OpenAI adapters over the official SDKs
   with per-call broker-resolved credentials, and **local inference** through
@@ -348,6 +356,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
 | `viz` | Constellation view: live web visualization of a run (tasks and executors as stars), and the universe of every run in the process |
+| `studio` | Loom Studio: the pipeline as an editable document — canvas, live projection, ⌘K proposals, and a Go export that compiles |
 | `task` | Task + envelope types (serializable — the distribution seam) |
 
 ## Knowing what a run will cost
@@ -437,6 +446,80 @@ projected column plus a projected-versus-actual reconciliation. The projection
 deliberately survives `run.started`: it describes the pipeline, and the run
 that follows is the thing it predicted. `go run ./examples/constellation`
 demonstrates the whole loop.
+
+## Building it on a canvas: Loom Studio
+
+`loom.Explain` prices a pipeline before it runs. **Loom Studio** (`studio`) is
+what happens when that projection stops being something a program prints at the
+end and becomes the thing you edit against: a browser canvas where each step is
+a card, the header carries what the run will cost, and the number moves as you
+change a model, a batch size, or a branch.
+
+```go
+doc, _ := studio.Load("vertical-digest.json")   // or build one in Go
+s := studio.New(doc,
+    studio.Models(reg),                          // what the steps bind to
+    studio.File("vertical-digest.json"),         // autosave every edit
+    studio.Constellation(vizURL),                // where the RUN tab goes
+    studio.Runner(run),                          // what the Run button does
+)
+url, _ := s.Start("localhost:8078")
+```
+
+It is not a second runtime. The studio edits a *document* — a flat, serializable
+list of steps — and `Doc.Build` compiles it into an ordinary
+`pipeline.Pipeline`, so a pipeline built here is planned, fused, fingerprinted,
+priced, admitted, retried, escalated, cached and audited by the same code as one
+written by hand. What the document holds instead of closures is declarations: a
+filter is a field, an operator and a value; a derived field is a template; a
+source is a spec; a loop is a condition and a round cap. That constraint is what
+makes it editable, diffable, and proposable-against.
+
+**The price is computed, not estimated.** The studio reads your sources itself —
+locally, off the disk, no model call, no network — and hands the records to
+`Explain`, which then executes every filter and derived field against them. So
+"148 of 412 days reach the payments rollup" is a count, and the branch
+multiplier, where projections usually go wrong, is exact. It also closes
+`Explain`'s one blind spot: a `ParseJSON` stage's fields normally come out of
+the model, but here the step *declares* its answer shape, so the projection is
+told exactly what the next step will read. And because `Explain` runs the pure
+Go stages for real, the studio compiles a dry form for pricing in which a write
+step computes the same path without writing the file — asking what a run would
+cost must not perform any of it.
+
+**One declaration, three consequences.** Saying a step returns
+`{summary, topics, signals}` with `summary` required generates the JSON
+instruction appended to the prompt, parses the response into the record, and
+builds the validation gate whose failure escalates that record to the next model
+on the ladder. Hand-written, those are three places that agree until someone
+edits one of them.
+
+**⌘K proposes; it never edits.** The built-in assistant answers from the
+projection rather than from a model: which step dominates the spend and why,
+what a cheaper shape would actually reprice to (computed by pricing it), whether
+a $8 cap still fits and what the run does when it does not, the shortest wall
+clock the rate limits allow. It returns *edits* — drawn on the canvas as a
+dashed ghost card and a diff — and the document changes only when you accept
+them. Anything it cannot compute it says so plainly, and `studio.Assist` takes a
+model-backed assistant in its place.
+
+**Fan-in is drawn as what it is.** Loom's DAGs fan out but never fan back in, so
+a fold over three branches is a *second run* seeded from the first one's output.
+The canvas puts it inside a dashed SECOND RUN · FAN-IN band, `Doc.BuildSecond`
+compiles it from `RunResult.StageOutputs`, and it is priced with its own stated
+assumption instead of being quietly folded into the first pass.
+
+**And there is a way out.** `Doc.Go` renders the canvas as a Go program that
+compiles — same operators, same prompts, same versions, same validators, with
+`build()`, `buildSecond()` and a `main` that runs both. A visual builder you
+cannot leave is a trap; the way out of this one is a file you can review, diff
+and run in CI.
+
+```sh
+go run ./examples/studio    # offline: invented archive, mock models, real arithmetic
+```
+
+Design notes and what is deliberately absent: [docs/STUDIO.md](docs/STUDIO.md).
 
 ## Running more than one pipeline: fleets
 
@@ -788,6 +871,12 @@ token (`loom.Explain` against hosted rates: no key, no socket, no call).
   that could publish mid-run would make its own cached result depend on
   execution order, and a task replayed from cache would not publish at all — so
   the board's contents would depend on how warm the cache happened to be.
+- The studio's document is declarative because it has to survive a round trip
+  through a browser, and that constraint pays for itself: a step's cache version
+  can be the hash of its own declaration, an assistant can propose a diff rather
+  than generate code, and the answer shape can be one declaration instead of
+  three that agree until someone edits one. What it cannot express is arbitrary
+  Go — which is what the Go export is for. [docs/STUDIO.md](docs/STUDIO.md).
 
 The scaling path (remote worker fleets, shared object-store CAS, WASM
 sandboxes with grant-derived imports) is laid out in
