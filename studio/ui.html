@@ -1,0 +1,1411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0a10'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%232ab5a6'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #08080c;
+    --panel: #0a0a10;
+    --card: #0e0e15;
+    --hairline: rgba(255,255,255,.08);
+    --line: rgba(255,255,255,.12);
+    --ink: #ffffff;
+    --ink-1: #e8e6df;
+    --ink-2: #c3c2b7;
+    --ink-3: #898781;
+    --ink-4: #5c5c66;
+    --source: #2ab5a6;
+    --infer: #3987e5;
+    --reduce: #9085e9;
+    --loop: #fab219;
+    --plain: #898781;
+    --bad: #d03b3b;
+    --good: #0ca30c;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --serif: "Instrument Serif", Georgia, "Times New Roman", serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink-1);
+    font-family: var(--mono); font-size: 12px; overflow: hidden;
+  }
+  a { color: var(--infer); text-decoration: none; }
+  a:hover { color: #6aa8ee; }
+  button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 9px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  @keyframes bp { 0%,100% { opacity: .5 } 50% { opacity: 1 } }
+
+  #app { height: 100vh; display: flex; flex-direction: column; }
+
+  /* --- header --- */
+  header {
+    flex: none; height: 52px; display: flex; align-items: center; gap: 18px;
+    padding: 0 16px; border-bottom: 1px solid var(--hairline); background: var(--panel);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; }
+  .brand .dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--source);
+    box-shadow: 0 0 10px 2px rgba(42,181,166,.4);
+  }
+  .brand .name { font-family: var(--serif); font-size: 19px; color: var(--ink); }
+  .sep { width: 1px; height: 22px; background: rgba(255,255,255,.1); }
+  .docname { display: flex; align-items: baseline; gap: 9px; }
+  .docname input {
+    background: transparent; border: 0; outline: none; font-size: 13px; color: var(--ink);
+    width: 15ch; padding: 2px 0; border-bottom: 1px solid transparent;
+  }
+  .docname input:focus { border-bottom-color: var(--line); }
+  .docname .saved { font-size: 10.5px; color: var(--ink-4); white-space: nowrap; }
+  .tabs { display: flex; padding: 2px; border: 1px solid rgba(255,255,255,.1); border-radius: 6px; background: rgba(255,255,255,.02); }
+  .tabs button {
+    border: 0; border-radius: 4px; padding: 5px 13px; font-size: 11.5px; letter-spacing: .06em;
+    cursor: pointer; color: var(--ink-3); background: transparent;
+  }
+  .tabs button.on { background: rgba(255,255,255,.1); color: var(--ink); }
+  .spacer { flex: 1; }
+  .priced {
+    display: flex; align-items: center; gap: 8px; padding: 6px 11px;
+    border: 1px solid rgba(255,255,255,.1); border-radius: 5px; background: rgba(255,255,255,.02);
+    white-space: nowrap;
+  }
+  .priced .k { font-size: 10px; letter-spacing: .14em; color: var(--ink-3); }
+  .priced .v { font-size: 12px; color: var(--ink-1); }
+  .priced .cap { font-size: 11px; color: var(--ink-4); }
+  .priced.over { border-color: rgba(250,178,25,.45); background: rgba(250,178,25,.08); }
+  .priced.over .v { color: #f0c46b; }
+  .priced.bad { border-color: rgba(208,59,59,.45); background: rgba(208,59,59,.08); }
+  .priced.bad .v { color: #e08585; }
+  .btn {
+    border: 1px solid var(--line); border-radius: 5px; background: transparent;
+    padding: 7px 12px; font-size: 12px; color: var(--ink-2); cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: rgba(255,255,255,.3); color: var(--ink); }
+  .btn.ai { border-color: rgba(57,135,229,.45); background: rgba(57,135,229,.1); color: #9dc4f4; display: flex; align-items: center; gap: 9px; }
+  .btn.ai:hover { background: rgba(57,135,229,.18); }
+  .btn.ai .k { font-size: 11px; color: #6aa8ee; }
+  .btn.run { border-color: rgba(42,181,166,.5); background: rgba(42,181,166,.14); color: #7fd8cd; padding: 7px 15px; }
+  .btn.run:hover { background: rgba(42,181,166,.24); }
+  .btn.run[disabled] { opacity: .45; cursor: default; }
+
+  /* --- layout --- */
+  .workbench { flex: 1; min-height: 0; display: flex; }
+  aside.rail {
+    flex: none; width: 212px; border-right: 1px solid var(--hairline); background: var(--panel);
+    display: flex; flex-direction: column; overflow: auto;
+  }
+  aside.inspector {
+    flex: none; width: 336px; border-left: 1px solid var(--hairline); background: var(--panel);
+    overflow: auto;
+  }
+  main {
+    flex: 1; min-width: 0; position: relative; overflow: auto; background: var(--bg);
+  }
+  #grid {
+    position: absolute; inset: 0; pointer-events: none;
+    background-image: radial-gradient(rgba(255,255,255,.055) 1px, transparent 1px);
+    background-size: 26px 26px;
+  }
+  #canvas { position: relative; width: 2200px; height: 1400px; }
+
+  /* --- palette rail --- */
+  .rail h2 { padding: 14px 14px 8px; font-size: 10px; letter-spacing: .18em; color: var(--ink-4); font-weight: 400; }
+  .rail h3 { padding: 14px 10px 6px; font-size: 10px; letter-spacing: .16em; color: var(--ink-3); font-weight: 400; }
+  .rail .group { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
+  .rail .item {
+    display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 4px;
+    cursor: grab; font-size: 12px; color: var(--ink-2); user-select: none;
+  }
+  .rail .item:hover { background: rgba(255,255,255,.05); color: var(--ink); }
+  .rail .item .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .rail .hint {
+    margin: 12px 10px; padding: 11px; border: 1px dashed rgba(57,135,229,.35); border-radius: 6px;
+    font-size: 11px; line-height: 1.65; color: var(--ink-3);
+  }
+  .rail .hint b { color: #9dc4f4; font-weight: 400; }
+  #drag-ghost {
+    position: fixed; z-index: 200; pointer-events: none; padding: 6px 10px; border-radius: 5px;
+    border: 1px solid var(--line); background: var(--card); font-size: 11.5px; color: var(--ink-1);
+    box-shadow: 0 12px 30px rgba(0,0,0,.5);
+  }
+
+  /* --- cards --- */
+  .card {
+    position: absolute; width: 210px; height: 142px; border: 1px solid var(--line);
+    border-radius: 7px; background: var(--card); cursor: pointer; overflow: hidden;
+    user-select: none;
+  }
+  .card:hover { border-color: rgba(255,255,255,.3); }
+  .card.sel { border-color: var(--infer); box-shadow: 0 0 0 1px rgba(57,135,229,.35); }
+  .card .head {
+    display: flex; align-items: center; gap: 8px; height: 31px; padding: 0 11px;
+    border-bottom: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.02);
+  }
+  .card .head .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .card .head .kind { font-size: 9.5px; letter-spacing: .16em; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .head .price { margin-left: auto; font-size: 10px; color: var(--ink-3); }
+  .card .pad { padding: 11px; }
+  .card .title { font-size: 13px; color: var(--ink); }
+  .card .note { margin-top: 5px; font-size: 11px; line-height: 1.55; color: var(--ink-3); }
+  .tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+  .tag {
+    font-size: 9.5px; color: #a9a8a0; background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.09); border-radius: 3px; padding: 2px 6px;
+  }
+  .card.ghost { border-style: dashed; border-color: rgba(250,178,25,.55); background: rgba(250,178,25,.05); }
+  .card.ghost .head { border-bottom-style: dashed; border-bottom-color: rgba(250,178,25,.3); background: transparent; }
+  .card.ghost .head .dot { background: var(--loop); animation: bp 1.6s ease-in-out infinite; }
+  .card.ghost .head .kind { color: #f0c46b; }
+  .card.ghost .note { color: #a08f68; }
+  .band {
+    position: absolute; border: 1px dashed rgba(144,133,233,.35); border-radius: 9px;
+    background: rgba(144,133,233,.04); pointer-events: none;
+  }
+  .band-label {
+    position: absolute; padding: 2px 8px; background: var(--bg); font-size: 9.5px;
+    letter-spacing: .16em; color: var(--reduce); pointer-events: none; white-space: nowrap;
+  }
+  #edges { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; }
+
+  /* --- proposal bar --- */
+  #proposal {
+    position: absolute; left: 40px; top: 14px; display: flex; align-items: center; gap: 16px;
+    padding: 12px 14px; border: 1px solid rgba(250,178,25,.4); border-radius: 7px;
+    background: rgba(24,18,6,.96); box-shadow: 0 18px 44px rgba(0,0,0,.5); max-width: 720px;
+    max-height: 42vh; overflow: auto; z-index: 6;
+  }
+  #proposal .kind { font-size: 9.5px; letter-spacing: .16em; color: #f0c46b; }
+  #proposal .title { font-size: 13px; color: var(--ink); }
+  #proposal .text { font-size: 11px; line-height: 1.6; color: var(--ink-2); }
+  #proposal .col { display: flex; flex-direction: column; gap: 4px; }
+  #proposal .acts { display: flex; gap: 8px; margin-left: auto; }
+  .btn.accept { border-color: rgba(250,178,25,.5); background: rgba(250,178,25,.16); color: #f0c46b; }
+  .btn.accept:hover { background: rgba(250,178,25,.26); color: #f0c46b; }
+
+  /* --- inspector --- */
+  .pane { padding: 18px 16px; display: flex; flex-direction: column; gap: 16px; }
+  .pane .eyebrow { font-size: 9.5px; letter-spacing: .18em; }
+  .pane h1 { font-size: 16px; color: var(--ink); font-weight: 400; }
+  .pane h1.big { font-family: var(--serif); font-size: 22px; }
+  .pane .lede { font-size: 11.5px; line-height: 1.7; color: var(--ink-3); }
+  .field { display: flex; flex-direction: column; gap: 7px; }
+  .field > label { font-size: 10.5px; letter-spacing: .1em; color: var(--ink-4); }
+  .field .help { font-size: 10.5px; line-height: 1.6; color: var(--ink-3); }
+  .in, .pane textarea, .pane select {
+    padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; background: transparent;
+    font-size: 11.5px; color: var(--ink-1); outline: none; width: 100%;
+  }
+  .in:focus, .pane textarea:focus, .pane select:focus { border-color: rgba(57,135,229,.5); }
+  .pane textarea { line-height: 1.7; resize: vertical; min-height: 76px; }
+  .pane select { appearance: none; cursor: pointer; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { min-width: 0; }
+  .grow { flex: 1; }
+  .kv {
+    display: flex; align-items: center; justify-content: space-between; padding: 9px 11px;
+    border: 1px solid rgba(255,255,255,.1); border-radius: 6px; font-size: 11.5px; color: var(--ink-2);
+  }
+  .kv b { color: var(--ink); font-weight: 400; }
+  .kv.on { border-color: rgba(42,181,166,.3); background: rgba(42,181,166,.05); }
+  .kv.on b { color: #7fd8cd; }
+  .kv.warn { border-color: rgba(208,59,59,.3); background: rgba(208,59,59,.05); }
+  .kv.warn b { color: #e08585; }
+  .kv.click { cursor: pointer; }
+  .table { border: 1px solid rgba(255,255,255,.1); border-radius: 7px; overflow: hidden; }
+  .table .th {
+    display: flex; justify-content: space-between; padding: 9px 11px;
+    border-bottom: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.02);
+    font-size: 9.5px; letter-spacing: .14em; color: var(--ink-4);
+  }
+  .table .tr {
+    display: flex; justify-content: space-between; gap: 10px; padding: 8px 11px;
+    font-size: 11.5px; color: var(--ink-2); cursor: pointer;
+  }
+  .table .tr:hover { background: rgba(255,255,255,.04); }
+  .table .tr.sel { background: rgba(57,135,229,.06); }
+  .table .tr .free { color: var(--ink-4); }
+  .table .total { border-top: 1px solid rgba(255,255,255,.07); color: var(--ink); padding: 10px 11px; }
+  .table pre {
+    margin: 0; padding: 11px; font-family: inherit; font-size: 10.5px; line-height: 1.8;
+    color: var(--ink-3); white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip {
+    padding: 2px 6px; border-radius: 3px; background: rgba(57,135,229,.16); color: #9dc4f4;
+    font-size: 10px; cursor: pointer; border: 0;
+  }
+  .chip:hover { background: rgba(57,135,229,.3); }
+  .seg { display: flex; gap: 6px; }
+  .seg button {
+    flex: 1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: transparent; font-size: 11.5px; color: var(--ink-3); text-align: center; cursor: pointer;
+  }
+  .seg button.on { border-color: rgba(57,135,229,.5); background: rgba(57,135,229,.1); color: #9dc4f4; }
+  .note-box {
+    padding: 11px; border: 1px dashed var(--line); border-radius: 6px; font-size: 11px;
+    line-height: 1.7; color: var(--ink-3);
+  }
+  .note-box.violet { border-style: solid; border-color: rgba(144,133,233,.3); background: rgba(144,133,233,.05); color: #b6afef; }
+  .note-box.bad { border-style: solid; border-color: rgba(208,59,59,.35); background: rgba(208,59,59,.06); color: #e08585; }
+  .note-box.warn { border-style: solid; border-color: rgba(250,178,25,.3); background: rgba(250,178,25,.05); color: #f0c46b; }
+  .list { display: flex; flex-direction: column; gap: 6px; }
+  .mini { border: 0; background: transparent; color: var(--ink-4); cursor: pointer; font-size: 13px; padding: 0 4px; }
+  .mini:hover { color: var(--ink); }
+  .add { align-self: flex-start; border: 1px dashed var(--line); border-radius: 5px; background: transparent; padding: 6px 10px; font-size: 11px; color: var(--ink-3); cursor: pointer; }
+  .add:hover { color: var(--ink); border-color: rgba(255,255,255,.3); }
+  .slider { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,.1); appearance: none; outline: none; }
+  .slider::-webkit-slider-thumb { appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #c9c3f6; cursor: pointer; }
+  .slider::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 50%; background: #c9c3f6; cursor: pointer; }
+  .danger { color: #e08585; border-color: rgba(208,59,59,.35); }
+  .danger:hover { color: #e08585; border-color: rgba(208,59,59,.6); }
+
+  /* --- footer --- */
+  footer {
+    flex: none; min-height: 30px; display: flex; align-items: center; gap: 16px; padding: 0 16px;
+    border-top: 1px solid var(--hairline); background: var(--panel); font-size: 10.5px; color: var(--ink-4);
+  }
+  footer .err { color: #e08585; }
+
+  /* --- modals --- */
+  .veil {
+    position: fixed; inset: 0; z-index: 80; background: rgba(4,4,8,.66); backdrop-filter: blur(3px);
+    display: flex; justify-content: center; padding-top: 13vh;
+  }
+  .veil.center { align-items: center; padding: 40px; }
+  .modal {
+    width: 660px; max-height: 66vh; display: flex; flex-direction: column;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: #0d0d14;
+    box-shadow: 0 34px 90px rgba(0,0,0,.62); overflow: hidden;
+  }
+  .modal.wide { width: 860px; max-height: 82vh; background: #0b0b12; }
+  .modal .top {
+    flex: none; display: flex; align-items: center; gap: 11px; padding: 14px 16px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .modal .top input { flex: 1; background: transparent; border: 0; outline: none; color: var(--ink-1); font-size: 13.5px; }
+  .modal .top .esc { font-size: 10px; letter-spacing: .14em; color: var(--ink-4); }
+  .modal .rows { flex: 1; overflow: auto; padding: 6px; }
+  .modal .rows .r {
+    display: flex; align-items: center; gap: 12px; padding: 11px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .modal .rows .r:hover, .modal .rows .r.cur { background: rgba(255,255,255,.055); }
+  .modal .rows .r .k { flex: none; width: 74px; font-size: 9px; letter-spacing: .14em; }
+  .modal .rows .r .l { flex: 1; font-size: 12.5px; color: var(--ink-1); }
+  .modal .rows .r .n { font-size: 10.5px; color: var(--ink-4); }
+  .modal .foot { flex: none; padding: 9px 14px; border-top: 1px solid var(--hairline); font-size: 10px; color: var(--ink-4); }
+  .modal pre {
+    margin: 0; padding: 18px; font-family: inherit; font-size: 11.5px; line-height: 1.85;
+    color: var(--ink-2); white-space: pre; overflow: auto;
+  }
+  .k-BUILD { color: var(--loop); }
+  .k-OPTIMIZE { color: var(--source); }
+  .k-EXPLAIN { color: var(--infer); }
+  .k-RUN { color: var(--reduce); }
+  .k-EXPORT { color: var(--plain); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span class="dot"></span><span class="name">Loom Studio</span></div>
+    <div class="sep"></div>
+    <div class="docname">
+      <input id="docname" spellcheck="false" aria-label="pipeline name">
+      <span class="saved" id="saved"></span>
+    </div>
+    <div class="tabs">
+      <button id="tab-build" class="on">BUILD</button>
+      <button id="tab-run">RUN</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="priced" id="priced"></div>
+    <button class="btn ai" id="ask">Ask AI <span class="k" id="askkey">⌘K</span></button>
+    <button class="btn" id="export">Export Go</button>
+    <button class="btn run" id="run">Run ▸</button>
+  </header>
+
+  <div class="workbench">
+    <aside class="rail" id="rail"></aside>
+    <main id="main">
+      <div id="grid"></div>
+      <div id="canvas">
+        <svg id="edges"></svg>
+      </div>
+    </main>
+    <aside class="inspector" id="inspector"></aside>
+  </div>
+
+  <footer><span id="status"></span><span class="spacer"></span><span id="status2"></span></footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else if (k === "style") n.setAttribute("style", v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid) n.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return n;
+};
+
+// --- model --------------------------------------------------------------
+// The document lives here while it is being edited and on the server the rest
+// of the time. Every change goes through save(), which is the only thing that
+// knows the price: the browser draws, the server compiles.
+
+const CARD_W = 210, CARD_H = 142;
+const KIND = {
+  source: { label: "DATA IN",         color: "var(--source)", head: "rgba(255,255,255,.02)" },
+  infer:  { label: "ONE PER RECORD",  color: "var(--infer)",  head: "rgba(57,135,229,.07)" },
+  reduce: { label: "COMBINE MANY",    color: "var(--reduce)", head: "rgba(144,133,233,.08)" },
+  loop:   { label: "REPEAT UNTIL DONE", color: "var(--loop)", head: "rgba(250,178,25,.07)" },
+  filter: { label: "KEEP ONLY…",      color: "var(--plain)",  head: "rgba(255,255,255,.02)" },
+  derive: { label: "ADD A FIELD",     color: "var(--plain)",  head: "rgba(255,255,255,.02)" },
+  write:  { label: "WRITE FILES",     color: "var(--plain)",  head: "rgba(255,255,255,.02)" },
+};
+const PALETTE = [
+  ["DATA IN", [["source", "Files by folder", { from: "folder" }], ["source", "A table", { from: "table" }], ["source", "Records in the document", { from: "records" }]]],
+  ["ASK A MODEL", [["infer", "One per record"], ["reduce", "Combine many into one"], ["loop", "Repeat until done"]]],
+  ["RESHAPE", [["filter", "Keep only…"], ["derive", "Add a field"], ["write", "Write files"]]],
+];
+
+let S = null;            // last state from the server
+let doc = null;          // the document being edited
+let sel = null;          // selected step id
+let proposal = null;     // pending AI proposal
+let saveTimer = null, saving = false, dirty = false;
+let lastError = "";
+const mac = navigator.platform.toLowerCase().includes("mac");
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = res.headers.get("content-type") || "";
+  if (!res.ok) {
+    let msg = res.statusText;
+    if (body.includes("json")) { try { msg = (await res.json()).error || msg; } catch (e) {} }
+    else { try { msg = await res.text(); } catch (e) {} }
+    throw new Error(msg);
+  }
+  return body.includes("json") ? res.json() : res.text();
+}
+
+function adopt(state) {
+  S = state;
+  doc = state.doc;
+  lastError = "";
+  if (sel && !doc.steps.some((s) => s.id === sel)) sel = null;
+  renderAll();
+}
+
+async function load() {
+  try { adopt(await api("/api/state")); }
+  catch (e) { lastError = e.message; renderFooter(); }
+}
+
+// save posts the whole document, debounced. The response carries the new
+// price, so the header, the table and the cards all update from one round
+// trip and never disagree with each other.
+function save({ now = false, keepFocus = true } = {}) {
+  dirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    if (saving) { save({ now: true }); return; }
+    saving = true;
+    const body = JSON.stringify(doc);
+    try {
+      const state = await api("/api/doc", { method: "POST", headers: { "content-type": "application/json" }, body });
+      dirty = false;
+      const focus = keepFocus ? document.activeElement : null;
+      const key = focus && focus.dataset ? focus.dataset.bind : null;
+      const start = focus && focus.selectionStart;
+      S = state; doc = state.doc;
+      lastError = "";
+      renderHeader(); renderCanvas(); renderFooter();
+      if (!key) renderInspector();
+      else {
+        renderPriceOnlyInspector();
+        const again = key && document.querySelector(`[data-bind="${CSS.escape(key)}"]`);
+        if (again && again !== document.activeElement) {
+          again.focus();
+          if (start != null && again.setSelectionRange) { try { again.setSelectionRange(start, start); } catch (e) {} }
+        }
+      }
+    } catch (e) {
+      lastError = e.message;
+      renderFooter();
+    } finally {
+      saving = false;
+    }
+  }, now ? 0 : 350);
+}
+
+// --- rendering ----------------------------------------------------------
+
+function renderAll() { renderHeader(); renderRail(); renderCanvas(); renderInspector(); renderFooter(); }
+
+function money(v) {
+  if (v === undefined || v === null) return "—";
+  if (v > 0 && v < 0.01) return "$" + v.toFixed(4);
+  return "$" + v.toFixed(2);
+}
+function num(n) { return (n ?? 0).toLocaleString("en-US"); }
+function ago(ms) {
+  if (!ms) return "not saved yet";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 5) return "saved just now";
+  if (s < 90) return `saved ${s}s ago`;
+  return `saved ${Math.round(s / 60)} min ago`;
+}
+
+function renderHeader() {
+  const est = S.estimate || {};
+  $("docname").value = doc.name;
+  $("saved").textContent = S.file ? ago(S.saved_at) : "not saved to a file";
+  $("askkey").textContent = mac ? "⌘K" : "Ctrl K";
+
+  const p = $("priced");
+  p.className = "priced";
+  p.replaceChildren();
+  if (est.error) {
+    p.classList.add("bad");
+    p.append(el("span", { class: "k", text: "CANNOT PRICE" }));
+  } else {
+    if (!est.fits_cap) p.classList.add("over");
+    p.append(
+      el("span", { class: "k", text: "PRICED" }),
+      el("span", { class: "v", text: "≤ " + money(est.ceiling_usd) }),
+      el("span", { class: "cap", text: doc.cap_usd ? `/ cap ${money(doc.cap_usd)}` : "/ no cap" }),
+    );
+  }
+  const run = S.run || {};
+  const btn = $("run");
+  btn.textContent = run.running ? "Running…" : "Run ▸";
+  btn.disabled = !!run.running;
+}
+
+function renderRail() {
+  const rail = $("rail");
+  rail.replaceChildren();
+  rail.append(el("h2", { text: "STEPS" }));
+  for (const [group, items] of PALETTE) {
+    rail.append(el("h3", { text: group }));
+    const box = el("div", { class: "group" });
+    for (const [kind, label, extra] of items) {
+      const item = el("div", { class: "item" },
+        el("span", { class: "dot", style: `background:${KIND[kind].color}` }), label);
+      item.addEventListener("mousedown", (e) => startPaletteDrag(e, kind, label, extra));
+      box.append(item);
+    }
+    rail.append(box);
+  }
+  rail.append(el("div", { class: "spacer", style: "flex:1" }));
+  rail.append(el("div", { class: "hint", html:
+    `Drop a step on the canvas and it attaches to the selected card. Press <b>${mac ? "⌘K" : "Ctrl&nbsp;K"}</b> to ask for one in a sentence.` }));
+}
+
+function stepPrice(id) { return (S.estimate?.steps || []).find((s) => s.id === id); }
+
+function cardTitle(s) { return s.title || s.id; }
+
+function cardNote(s) {
+  if (s.note) return s.note;
+  switch (s.kind) {
+    case "source": {
+      const sp = s.source || {};
+      if (sp.from === "folder") return sp.root || "a folder of files";
+      if (sp.from === "table") return sp.path || "a table";
+      return `${(sp.records || []).length} records in the document`;
+    }
+    case "infer": return trim(s.infer?.system || s.infer?.prompt || "", 64);
+    case "reduce": return s.merge?.length ? `folds ${s.merge.join(", ")}` : `${s.reduce?.fan_in || 8} at a time, in a tree`;
+    case "loop": return `until ${condText(s.loop?.until)}`;
+    case "filter": return `keeps ${condText(s.keep)}`;
+    case "derive": return `adds ${s.field?.name || "a field"}`;
+    case "write": return `${s.write?.dir || ""}/${s.write?.name || ""}`;
+  }
+  return "";
+}
+function condText(c) { if (!c) return "—"; return [c.field, c.op, c.value].filter(Boolean).join(" "); }
+function trim(s, n) { s = (s || "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+function cardTags(s) {
+  const p = stepPrice(s.id);
+  const tags = [];
+  switch (s.kind) {
+    case "source": {
+      if (p && p.records) tags.push(`${num(p.records)} records`);
+      for (const sc of s.source?.scrub || []) tags.push(sc === "emails" ? "redacted" : "anonymized");
+      break;
+    }
+    case "infer":
+      tags.push(s.infer?.model || s.infer?.tier || "balanced");
+      if (s.infer?.answer?.length) tags.push(`${s.infer.answer.length} fields`);
+      if (s.infer?.escalate?.length) tags.push("escalates");
+      break;
+    case "reduce":
+      tags.push(s.reduce?.model || s.reduce?.tier || "balanced");
+      if (s.reduce?.words) tags.push(`~${s.reduce.words} words`);
+      break;
+    case "loop":
+      tags.push(`${s.loop?.rounds || 0} rounds max`);
+      if (s.loop?.cap_usd) tags.push(`cap ${money(s.loop.cap_usd)}`);
+      break;
+    case "filter":
+      if (p && p.records) tags.push(`${num(p.records)} in`);
+      tags.push("free");
+      break;
+    case "derive": tags.push("no model", "free"); break;
+    case "write": tags.push("never cached"); break;
+  }
+  return tags;
+}
+
+function renderCanvas() {
+  const canvas = $("canvas");
+  for (const n of [...canvas.children]) if (n.id !== "edges") n.remove();
+
+  const steps = doc.steps;
+  let maxX = 900, maxY = 600;
+  for (const s of steps) { maxX = Math.max(maxX, s.x + CARD_W + 120); maxY = Math.max(maxY, s.y + CARD_H + 160); }
+  canvas.style.width = maxX + "px";
+  canvas.style.height = maxY + "px";
+
+  // The second pass sits inside a dashed band, because it is a different run:
+  // the fold that joins the branches, and everything that reads it.
+  const second = new Set();
+  for (const s of steps) if ((s.merge || []).length) second.add(s.id);
+  for (let i = 0; i < steps.length; i++) for (const s of steps) if (s.from && second.has(s.from)) second.add(s.id);
+  const merges = steps.filter((s) => second.has(s.id));
+  if (merges.length) {
+    const xs = merges.map((s) => s.x), ys = merges.map((s) => s.y);
+    const x = Math.min(...xs) - 14, y = Math.min(...ys) - 16;
+    const w = Math.max(...xs) + CARD_W + 14 - x, h = Math.max(...ys) + CARD_H + 14 - y;
+    canvas.append(el("div", { class: "band", style: `left:${x}px;top:${y}px;width:${w}px;height:${h}px` }));
+    canvas.append(el("div", { class: "band-label", style: `left:${x + 12}px;top:${y - 8}px`, text: "SECOND RUN · FAN-IN" }));
+  }
+
+  const svg = $("edges");
+  svg.setAttribute("width", maxX);
+  svg.setAttribute("height", maxY);
+  svg.replaceChildren();
+  const path = (d, cls) => {
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", d);
+    p.setAttribute("fill", "none");
+    p.setAttribute("stroke-width", "1.25");
+    if (cls === "merge") { p.setAttribute("stroke", "rgba(144,133,233,.45)"); p.setAttribute("stroke-dasharray", "4 5"); }
+    else if (cls === "ghost") { p.setAttribute("stroke", "rgba(250,178,25,.5)"); p.setAttribute("stroke-dasharray", "4 5"); }
+    else p.setAttribute("stroke", "rgba(255,255,255,.22)");
+    svg.append(p);
+  };
+  const dot = (x, y) => {
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", "2.5");
+    c.setAttribute("fill", "rgba(255,255,255,.3)");
+    svg.append(c);
+  };
+  const byId = Object.fromEntries(steps.map((s) => [s.id, s]));
+  const link = (from, to, cls) => {
+    if (!from || !to) return;
+    const x1 = from.x + CARD_W, y1 = from.y + CARD_H / 2;
+    const x2 = to.x, y2 = to.y + CARD_H / 2;
+    const mid = Math.max(24, (x2 - x1) / 2);
+    path(`M${x1},${y1} C${x1 + mid},${y1} ${x2 - mid},${y2} ${x2},${y2}`, cls);
+    dot(x2, y2);
+  };
+  for (const s of steps) {
+    if (s.from) link(byId[s.from], s, "");
+    for (const m of s.merge || []) link(byId[m], s, "merge");
+  }
+
+  for (const s of steps) {
+    const k = KIND[s.kind] || KIND.filter;
+    const p = stepPrice(s.id);
+    const card = el("div", {
+      class: "card" + (sel === s.id ? " sel" : ""),
+      style: `left:${s.x}px;top:${s.y}px`,
+      onmousedown: (e) => startCardDrag(e, s),
+    },
+      el("div", { class: "head", style: `background:${k.head}` },
+        el("span", { class: "dot", style: `background:${k.color}` }),
+        el("span", { class: "kind", style: s.kind === "infer" ? "color:#9dc4f4" : (s.kind === "reduce" ? "color:#b6afef" : ""), text: s.merge?.length ? "SECOND PASS · COMBINE" : k.label }),
+        p && p.expected_usd > 0 ? el("span", { class: "price", text: money(p.expected_usd) }) : null,
+      ),
+      el("div", { class: "pad" },
+        el("div", { class: "title", text: cardTitle(s) }),
+        el("div", { class: "note", text: cardNote(s) }),
+        el("div", { class: "tags" }, cardTags(s).map((t) => el("span", { class: "tag", text: t }))),
+      ),
+    );
+    canvas.append(card);
+  }
+
+  // The proposal's ghost card, drawn where the step would go.
+  if (proposal && proposal.ghost) {
+    const host = byId[proposal.after] || steps[steps.length - 1];
+    const gx = host ? host.x + 40 : 80, gy = host ? host.y + 200 : 400;
+    if (host) path(`M${host.x + CARD_W / 2},${host.y + CARD_H} L${gx + CARD_W / 2},${gy}`, "ghost");
+    canvas.append(el("div", { class: "card ghost", style: `left:${gx}px;top:${gy}px` },
+      el("div", { class: "head" },
+        el("span", { class: "dot" }),
+        el("span", { class: "kind", text: "PROPOSED BY AI" })),
+      el("div", { class: "pad" },
+        el("div", { class: "title", text: proposal.ghost }),
+        el("div", { class: "note", text: proposal.ghost_note || "" }))));
+  }
+  renderProposal();
+}
+
+function renderProposal() {
+  const old = $("proposal");
+  if (old) old.remove();
+  if (!proposal) return;
+  const est = proposal.estimate;
+  const bar = el("div", { id: "proposal" },
+    el("div", { class: "col", style: "max-width:560px" },
+      el("span", { class: "kind", text: proposal.kind === "EXPLAIN" ? "ANSWER" : "AI PROPOSAL" }),
+      el("span", { class: "title", text: proposal.title }),
+      el("span", { class: "text", text: proposal.body }),
+      est && proposal.edits?.length
+        ? el("span", { class: "text", style: "color:#f0c46b",
+            text: `Accepting reprices the run to ${money(est.ceiling_usd)} at the ceiling` +
+                  (est.fits_cap ? ", inside the cap." : " — over the cap: the run would stop partway.") })
+        : null,
+      proposal.edits?.length
+        ? el("span", { class: "text", style: "color:var(--ink-4)", text: proposal.edits.map((e) => e.note || e.op).join(" · ") })
+        : null,
+    ),
+    el("div", { class: "acts" },
+      el("button", { class: "btn", text: proposal.edits?.length ? "Discard" : "Close", onclick: () => { proposal = null; renderCanvas(); } }),
+      proposal.edits?.length ? el("button", { class: "btn accept", text: "Accept", onclick: accept }) : null,
+    ),
+  );
+  $("main").append(bar);
+}
+
+async function accept() {
+  const edits = proposal.edits;
+  proposal = null;
+  try {
+    adopt(await api("/api/accept", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ edits }),
+    }));
+  } catch (e) { lastError = e.message; renderAll(); }
+}
+
+function renderFooter() {
+  const est = S?.estimate || {};
+  const parts = [];
+  if (doc) parts.push(`${doc.steps.length} steps`);
+  if (est.records) parts.push(`${num(est.records)} records`);
+  if (est.calls) parts.push(`${num(est.calls)} calls`);
+  if (!est.error) parts.push(`priced at ${money(est.ceiling_usd)}, nothing spent yet`);
+  $("status").replaceChildren(
+    lastError ? el("span", { class: "err", text: lastError })
+      : document.createTextNode(saving || dirty ? "pricing…" : parts.join(" · ")));
+  const run = S?.run || {};
+  const right = [];
+  if (run.running) right.push("run in flight");
+  else if (run.err) right.push("last run: " + run.err);
+  right.push(`${mac ? "⌘K" : "Ctrl K"} ask AI`);
+  $("status2").textContent = right.join(" · ");
+}
+
+// --- inspector ----------------------------------------------------------
+
+function bind(node, get, set, key) {
+  node.dataset.bind = key;
+  node.value = get() ?? "";
+  node.addEventListener("input", () => { set(node.value); save(); });
+  return node;
+}
+function textIn(key, get, set, attrs = {}) { return bind(el("input", { class: "in", spellcheck: "false", ...attrs }), get, set, key); }
+function areaIn(key, get, set, attrs = {}) { return bind(el("textarea", { spellcheck: "false", ...attrs }), get, set, key); }
+function numIn(key, get, set, attrs = {}) {
+  const n = el("input", { class: "in", type: "number", ...attrs });
+  n.dataset.bind = key;
+  n.value = get() ?? "";
+  n.addEventListener("input", () => { set(n.value === "" ? 0 : Number(n.value)); save(); });
+  return n;
+}
+function selIn(key, options, get, set) {
+  const s = el("select", {});
+  s.dataset.bind = key;
+  for (const o of options) {
+    const [v, label] = Array.isArray(o) ? o : [o, o];
+    s.append(el("option", { value: v, text: label }));
+  }
+  s.value = get() ?? "";
+  s.addEventListener("change", () => { set(s.value); save({ now: true, keepFocus: false }); });
+  return s;
+}
+function field(label, ...kids) { return el("div", { class: "field" }, el("label", { text: label }), ...kids); }
+function toggle(label, on, click, cls = "") {
+  return el("div", { class: `kv click ${on ? "on" : ""} ${cls}`, onclick: click },
+    el("span", { text: label }), el("b", { text: on ? "on" : "off" }));
+}
+
+function renderPriceOnlyInspector() {
+  // Refresh just the numbers that pricing changed, so typing in a prompt does
+  // not rebuild the field being typed into.
+  for (const node of document.querySelectorAll("[data-price]")) {
+    const p = stepPrice(node.dataset.price);
+    const est = S.estimate || {};
+    node.textContent = p && !est.error
+      ? `${money(p.expected_usd)} of ${money(est.ceiling_usd)}` : "—";
+  }
+}
+
+function renderInspector() {
+  const box = $("inspector");
+  box.replaceChildren();
+  const s = sel ? doc.steps.find((x) => x.id === sel) : null;
+  box.append(s ? stepPane(s) : pipelinePane());
+}
+
+function pipelinePane() {
+  const est = S.estimate || {};
+  const pane = el("div", { class: "pane" });
+  pane.append(el("div", { class: "field" },
+    el("span", { class: "eyebrow", style: "color:var(--ink-4)", text: "PIPELINE" }),
+    el("h1", { class: "big", text: est.error ? "It does not price yet" : "Before you spend it" }),
+    el("span", { class: "lede", text: est.error
+      ? est.error
+      : "Every step is priced from your own records before a single call is made. Change a model or a branch and the number moves with it." }),
+  ));
+
+  if (!est.error) {
+    const table = el("div", { class: "table" },
+      el("div", { class: "th" }, el("span", { text: "STEP" }), el("span", { text: "EXPECTED" })));
+    for (const row of est.steps || []) {
+      const right = row.free
+        ? el("span", { class: "free", text: row.fused ? "fused" : "free" })
+        : el("span", { text: money(row.expected_usd) });
+      table.append(el("div", {
+        class: "tr" + (sel === row.id ? " sel" : ""),
+        onclick: () => { sel = row.id; renderCanvas(); renderInspector(); },
+      }, el("span", { text: row.title || row.id }), right));
+    }
+    table.append(el("div", { class: "tr total" },
+      el("span", { text: "Ceiling at the cap" }), el("span", { text: money(est.ceiling_usd) })));
+    pane.append(table);
+
+    const floor = est.floor_ms ? Math.round(est.floor_ms / 1000) : 0;
+    pane.append(el("div", { class: "field" },
+      el("label", { text: "GUARDRAILS" }),
+      el("div", { class: "kv" }, el("span", { text: "Stop the run at" }),
+        numIn("cap", () => doc.cap_usd, (v) => { doc.cap_usd = v; },
+          { style: "width:90px;text-align:right;padding:2px 6px", step: "0.5", min: "0" })),
+      el("div", { class: "kv" }, el("span", { text: "At once" }),
+        numIn("workers", () => doc.workers, (v) => { doc.workers = v; },
+          { style: "width:90px;text-align:right;padding:2px 6px", min: "1" })),
+      toggle("On a failed record", doc.keep_going, () => { doc.keep_going = !doc.keep_going; save({ now: true }); renderInspector(); }),
+      floor ? el("div", { class: "kv" }, el("span", { text: "At best, under rate limits" }),
+        el("b", { text: floor + "s" })) : null,
+    ));
+
+    if (!est.fits_cap) {
+      pane.append(el("div", { class: "note-box warn", text:
+        `The ceiling is ${money(est.ceiling_usd)}, over the ${money(doc.cap_usd)} cap. Loom halts on the budget rather than spending past it, and everything finished stays cached — a later run resumes.` }));
+    }
+    for (const w of est.warnings || []) pane.append(el("div", { class: "note-box", text: w }));
+  }
+  pane.append(el("div", { class: "note-box", text: "Select any step on the canvas to change what it does." }));
+  return pane;
+}
+
+function stepPane(s) {
+  const pane = el("div", { class: "pane" });
+  const k = KIND[s.kind] || KIND.filter;
+  const p = stepPrice(s.id);
+
+  pane.append(el("div", { class: "field" },
+    el("span", { class: "eyebrow", style: `color:${k.color}`, text: s.merge?.length ? "SECOND PASS · COMBINE MANY" : k.label }),
+    textIn("title", () => s.title, (v) => { s.title = v; }, { style: "font-size:15px;border:0;padding:0" }),
+    el("span", { class: "help", text: `id ${s.id}` }),
+  ));
+
+  if (s.kind !== "source" && !s.merge?.length) {
+    const others = doc.steps.filter((x) => x.id !== s.id).map((x) => [x.id, x.title || x.id]);
+    pane.append(field("READS FROM", selIn("from", others, () => s.from, (v) => { s.from = v; })));
+  }
+
+  switch (s.kind) {
+    case "source": sourcePane(pane, s); break;
+    case "infer": inferPane(pane, s, s.infer, "infer"); break;
+    case "reduce": reducePane(pane, s); break;
+    case "loop": loopPane(pane, s); break;
+    case "filter": filterPane(pane, s); break;
+    case "derive": derivePane(pane, s); break;
+    case "write": writePane(pane, s); break;
+  }
+
+  if (p && !p.free) {
+    pane.append(el("div", { class: "kv" },
+      el("span", { text: "Priced at" }),
+      el("b", { "data-price": s.id, text: `${money(p.expected_usd)} of ${money(S.estimate.ceiling_usd)}` })));
+    pane.append(el("div", { class: "help", text:
+      `${num(p.calls)} calls on ${p.model || "—"} · ${num(p.input_tokens)} in / ${num(p.output_tokens)} out` +
+      (p.cache_prefix ? " · shared prompt head served from the provider's cache" : "") }));
+  } else if (p && p.fused) {
+    pane.append(el("div", { class: "note-box", text:
+      "The planner fuses this into the step after it: no model call, no task boundary of its own, no cost." }));
+  }
+
+  pane.append(el("button", {
+    class: "btn danger", style: "align-self:flex-start",
+    text: "Remove step",
+    onclick: () => removeStep(s.id),
+  }));
+  return pane;
+}
+
+function sourcePane(pane, s) {
+  const sp = s.source;
+  pane.append(field("READS", selIn("source.from", [["folder", "A folder of files"], ["table", "A table"], ["records", "Records in the document"]],
+    () => sp.from, (v) => { sp.from = v; renderInspector(); })));
+
+  if (sp.from === "folder") {
+    pane.append(field("FOLDER",
+      textIn("source.root", () => sp.root, (v) => { sp.root = v; }),
+      el("span", { class: "help", text: "One directory per group, one file per record. A .jsonl file is read as a transcript." })));
+    pane.append(field("MATCH", textIn("source.match", () => sp.match, (v) => { sp.match = v; }, { placeholder: "*" })));
+    pane.append(field("NAME RANGE", el("div", { class: "row" },
+      textIn("source.since", () => sp.since, (v) => { sp.since = v; }, { placeholder: "from", class: "in grow" }),
+      textIn("source.until", () => sp.until, (v) => { sp.until = v; }, { placeholder: "to", class: "in grow" }))));
+    pane.append(field("ONE LINE OF A TRANSCRIPT",
+      textIn("source.line", () => sp.line, (v) => { sp.line = v; }, { placeholder: "{{.text}}" }),
+      el("span", { class: "help", text: "A template over each JSON line. {{clock .createTime}} renders a timestamp as HH:MM." })));
+    pane.append(field("CALL THE FIELDS",
+      el("div", { class: "row" },
+        textIn("source.f.group", () => (sp.fields || {}).group, (v) => setField(sp, "group", v), { placeholder: "group", class: "in grow" }),
+        textIn("source.f.name", () => (sp.fields || {}).name, (v) => setField(sp, "name", v), { placeholder: "name", class: "in grow" }),
+        textIn("source.f.text", () => (sp.fields || {}).text, (v) => setField(sp, "text", v), { placeholder: "text", class: "in grow" })),
+      el("span", { class: "help", text: "What every prompt below will call them." })));
+  } else if (sp.from === "table") {
+    pane.append(field("FILE", textIn("source.path", () => sp.path, (v) => { sp.path = v; }),
+      el("span", { class: "help", text: "A .csv, .tsv or .jsonl file: one record per row, columns become fields." })));
+  } else {
+    pane.append(el("div", { class: "note-box", text:
+      `${(sp.records || []).length} records travel inside the document, so it runs anywhere without the files beside it.` }));
+  }
+
+  pane.append(field("LIMIT", numIn("source.limit", () => sp.limit, (v) => { sp.limit = v; }, { min: "0" }),
+    el("span", { class: "help", text: "0 reads everything." })));
+
+  const has = (name) => (sp.scrub || []).includes(name);
+  const flip = (name) => {
+    const list = new Set(sp.scrub || []);
+    list.has(name) ? list.delete(name) : list.add(name);
+    sp.scrub = [...list];
+    save({ now: true }); renderInspector(); sampleInto(s.id);
+  };
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "BEFORE ANYTHING LEAVES THE MACHINE" }),
+    toggle("Replace names with S1, S2…", has("speakers"), () => flip("speakers")),
+    toggle("Redact email addresses", has("emails"), () => flip("emails")),
+  ));
+
+  const box = el("div", { class: "table" },
+    el("div", { class: "th" }, el("span", { text: "FIRST RECORD" })),
+    el("pre", { id: "sample", text: "reading…" }));
+  pane.append(box);
+  sampleInto(s.id);
+}
+
+function setField(sp, key, v) {
+  sp.fields = sp.fields || {};
+  if (v) sp.fields[key] = v; else delete sp.fields[key];
+}
+
+async function sampleInto(id) {
+  const pre = () => $("sample");
+  try {
+    const got = await api("/api/sample?step=" + encodeURIComponent(id));
+    if (!pre()) return;
+    const r = (got.records || [])[0];
+    if (!r) { pre().textContent = "no records found"; return; }
+    const lines = [r.id];
+    for (const [k, v] of Object.entries(r.data || {})) {
+      const s = typeof v === "string" ? v : JSON.stringify(v);
+      lines.push(`${k}: ${s.length > 400 ? s.slice(0, 400) + " …" : s}`);
+    }
+    pre().textContent = lines.join("\n");
+  } catch (e) { if (pre()) pre().textContent = e.message; }
+}
+
+const TIERS = [["cheapest", "Cheapest"], ["balanced", "Balanced"], ["best", "Best"]];
+
+function modelField(pane, spec, prefix, help) {
+  const seg = el("div", { class: "seg" });
+  for (const [v, label] of TIERS) {
+    seg.append(el("button", {
+      class: spec.tier === v && !spec.model ? "on" : "",
+      text: label,
+      onclick: () => { spec.tier = v; spec.model = ""; save({ now: true }); renderInspector(); },
+    }));
+  }
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "MODEL" }), seg,
+    textIn(prefix + ".model", () => spec.model, (v) => { spec.model = v; if (v) spec.tier = ""; },
+      { placeholder: "or name one exactly" }),
+    el("span", { class: "help", text: help }),
+  ));
+}
+
+function inferPane(pane, s, spec, prefix) {
+  modelField(pane, spec, prefix,
+    "A tier lets the registry choose. If the answer fails validation the record is retried on the next model up.");
+  pane.append(field("ESCALATES TO",
+    textIn(prefix + ".escalate", () => (spec.escalate || []).join(", "),
+      (v) => { spec.escalate = v.split(",").map((x) => x.trim()).filter(Boolean); },
+      { placeholder: "model, model" })));
+
+  pane.append(field("WHAT TO DO", areaIn(prefix + ".system", () => spec.system, (v) => { spec.system = v; },
+    { style: "min-height:60px" })));
+
+  const promptBox = areaIn(prefix + ".prompt", () => spec.prompt, (v) => { spec.prompt = v; }, { style: "min-height:120px" });
+  const chips = el("div", { class: "chips" });
+  for (const f of S.fields[s.from] || []) {
+    chips.append(el("button", { class: "chip", text: f, onclick: () => insert(promptBox, `{{.${f}}}`, (v) => { spec.prompt = v; }) }));
+  }
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "WHAT THE MODEL SEES" }), promptBox, chips,
+    el("span", { class: "help", text: "Blue chips are fields on the record reaching this step. Click one to drop it in." })));
+
+  pane.append(field("ANSWER LENGTH", numIn(prefix + ".max", () => spec.max_tokens, (v) => { spec.max_tokens = v; }, { min: "0", step: "50" }),
+    el("span", { class: "help", text: "The cap the ceiling price is computed from, so it is a budget control as much as a length one." })));
+
+  const rows = el("div", { class: "list" });
+  (spec.answer || []).forEach((a, i) => {
+    rows.append(el("div", { class: "row" },
+      textIn(`${prefix}.a${i}.name`, () => a.name, (v) => { a.name = v; }, { class: "in", style: "width:9ch" }),
+      selIn(`${prefix}.a${i}.kind`, [["text", "text"], ["list", "list"]], () => a.kind || "text", (v) => { a.kind = v; }),
+      textIn(`${prefix}.a${i}.note`, () => a.note, (v) => { a.note = v; }, { class: "in grow", placeholder: "what it should contain" }),
+      el("button", {
+        class: "mini", title: a.required ? "required" : "optional",
+        text: a.required ? "●" : "○",
+        style: a.required ? "color:#e08585" : "",
+        onclick: () => { a.required = !a.required; save({ now: true }); renderInspector(); },
+      }),
+      el("button", { class: "mini", text: "×", onclick: () => { spec.answer.splice(i, 1); save({ now: true }); renderInspector(); } }),
+    ));
+  });
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "ANSWER SHAPE" }), rows,
+    el("button", { class: "add", text: "+ field", onclick: () => {
+      spec.answer = spec.answer || [];
+      spec.answer.push({ name: "field" + (spec.answer.length + 1), kind: "text" });
+      save({ now: true }); renderInspector();
+    } }),
+    el("span", { class: "help", text: "One declaration: the JSON instruction in the prompt, the parse into the record, and — for a filled dot — the gate that escalates instead of passing an empty answer on." })));
+
+  pane.append(field("AT ONCE", numIn(prefix + ".workers", () => spec.workers, (v) => { spec.workers = v; }, { min: "0" })));
+}
+
+function reducePane(pane, s) {
+  const r = s.reduce;
+  if (s.merge?.length) {
+    pane.append(el("div", { class: "note-box violet", text:
+      "Branches fan out but never merge back, so this step runs as a second pass over the folds it reads. It starts by itself when they finish, with its own budget and its own sky in the constellation view." }));
+    const list = el("div", { class: "list" });
+    for (const other of doc.steps.filter((x) => x.kind === "reduce" && x.id !== s.id && !(x.merge || []).length)) {
+      const on = s.merge.includes(other.id);
+      list.append(toggle(other.title || other.id, on, () => {
+        s.merge = on ? s.merge.filter((m) => m !== other.id) : [...s.merge, other.id];
+        save({ now: true }); renderInspector();
+      }));
+    }
+    pane.append(field("FOLDS", list));
+  }
+  modelField(pane, r, "reduce", "One call per group, then a call over those results, until one record is left.");
+  pane.append(field("WHAT TO DO", areaIn("reduce.system", () => r.system, (v) => { r.system = v; }, { style: "min-height:56px" })));
+
+  const fanIn = r.fan_in || 8;
+  const slider = el("input", { class: "slider", type: "range", min: "2", max: "32", value: String(fanIn) });
+  const shown = el("b", { text: String(fanIn) });
+  slider.addEventListener("input", () => { r.fan_in = Number(slider.value); shown.textContent = slider.value; save(); });
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "HOW MANY AT A TIME" }),
+    el("div", { class: "row" }, slider, shown),
+    el("span", { class: "help", text: "Larger batches cost less and blur more." })));
+
+  pane.append(field("READS THE FIELD", textIn("reduce.item", () => r.item_field, (v) => { r.item_field = v; }, { placeholder: "output" }),
+    el("span", { class: "help", text: "Pointing this at a one-line summary rather than a whole document is usually what makes a fold affordable." })));
+
+  const cover = el("div", { class: "list" });
+  (r.cover || []).forEach((c, i) => {
+    cover.append(el("div", { class: "row" },
+      textIn(`reduce.c${i}`, () => c, (v) => { r.cover[i] = v; }, { class: "in grow" }),
+      el("button", { class: "mini", text: "×", onclick: () => { r.cover.splice(i, 1); save({ now: true }); renderInspector(); } })));
+  });
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "THE REPORT SHOULD COVER" }), cover,
+    el("button", { class: "add", text: "+ point", onclick: () => {
+      r.cover = r.cover || []; r.cover.push("Another point"); save({ now: true }); renderInspector();
+    } }),
+    el("span", { class: "help", text: "These become the prompt. Write one below instead and it replaces them wholesale." })));
+
+  pane.append(field("LENGTH", el("div", { class: "row" },
+    numIn("reduce.words", () => r.words, (v) => { r.words = v; }, { class: "in grow", min: "0", step: "50" }),
+    el("span", { class: "help", text: "words" }))));
+  pane.append(field("ANSWER LENGTH", numIn("reduce.max", () => r.max_tokens, (v) => { r.max_tokens = v; }, { min: "0", step: "100" })));
+  pane.append(field("OR WRITE THE PROMPT", areaIn("reduce.prompt", () => r.prompt, (v) => { r.prompt = v; },
+    { placeholder: "{{.Count}} items, {{range .Items}}…{{end}}", style: "min-height:70px" })));
+}
+
+function loopPane(pane, s) {
+  const l = s.loop;
+  pane.append(el("div", { class: "note-box warn", text:
+    "A loop cannot be priced exactly — only its cap can. The projection prices every round as if none of them converged, which is the number the cap has to cover." }));
+  inferPane(pane, s, l.step, "loop.step");
+  pane.append(field("UNTIL", condRow("loop.until", l.until, S.fields[s.id] || S.fields[s.from] || [])));
+  pane.append(field("WHAT THE NEXT ROUND READS", textIn("loop.note", () => l.note, (v) => { l.note = v; }, { placeholder: "critique" }),
+    el("span", { class: "help", text: "The field carrying what a rejected record tells its next round." })));
+  pane.append(field("ROUNDS AT MOST", numIn("loop.rounds", () => l.rounds, (v) => { l.rounds = v; }, { min: "1" })));
+  pane.append(field("THIS STEP MAY SPEND", numIn("loop.cap", () => l.cap_usd, (v) => { l.cap_usd = v; }, { min: "0", step: "0.5" }),
+    el("span", { class: "help", text: "Its own budget, not a share of the run's: a loop that does not converge should stop, not stop the pipeline." })));
+}
+
+function condRow(key, cond, fields) {
+  const f = el("input", { class: "in grow", value: cond.field || "", list: "fieldlist", spellcheck: "false" });
+  f.dataset.bind = key + ".field";
+  f.addEventListener("input", () => { cond.field = f.value; save(); });
+  const op = selIn(key + ".op", S.ops, () => cond.op, (v) => { cond.op = v; renderInspector(); });
+  const v = el("input", { class: "in grow", value: cond.value || "", spellcheck: "false" });
+  v.dataset.bind = key + ".value";
+  v.addEventListener("input", () => { cond.value = v.value; save(); });
+  const dl = el("datalist", { id: "fieldlist" });
+  for (const name of fields) dl.append(el("option", { value: name }));
+  const needsValue = !["exists", "missing", "non-empty", "empty"].includes(cond.op);
+  return el("div", { class: "row" }, f, op, needsValue ? v : null, dl);
+}
+
+function filterPane(pane, s) {
+  const p = stepPrice(s.id);
+  pane.append(field("KEEP ONLY RECORDS WHERE", condRow("keep", s.keep, S.fields[s.from] || [])));
+  if (p) {
+    pane.append(el("div", { class: "kv" }, el("span", { text: "Records reaching it" }), el("b", { text: num(p.records) })));
+  }
+  pane.append(el("div", { class: "note-box", text:
+    "One branch per value, all reading the same upstream step. Loom fuses a filter into its neighbours, so a branch costs nothing but the records it drops." }));
+}
+
+function derivePane(pane, s) {
+  pane.append(field("NEW FIELD", textIn("field.name", () => s.field.name, (v) => { s.field.name = v; })));
+  const box = areaIn("field.template", () => s.field.template, (v) => { s.field.template = v; }, { style: "min-height:90px" });
+  const chips = el("div", { class: "chips" });
+  for (const f of S.fields[s.from] || []) {
+    chips.append(el("button", { class: "chip", text: f, onclick: () => insert(box, `{{.${f}}}`, (v) => { s.field.template = v; }) }));
+  }
+  pane.append(el("div", { class: "field" }, el("label", { text: "COMPUTED AS" }), box, chips,
+    el("span", { class: "help", text: "A template over the record. {{join .topics}} renders a list as \"a, b, c\"." })));
+  pane.append(el("div", { class: "note-box", text:
+    "No model, no cost, and its cache version is the hash of this template: change what it says and exactly the records that carried the old value stop matching." }));
+}
+
+function writePane(pane, s) {
+  pane.append(field("DIRECTORY", textIn("write.dir", () => s.write.dir, (v) => { s.write.dir = v; })));
+  pane.append(field("FILENAME", textIn("write.name", () => s.write.name, (v) => { s.write.name = v; }, { placeholder: "{{.name}}.md" })));
+  pane.append(field("BODY", areaIn("write.body", () => s.write.body, (v) => { s.write.body = v; }, { placeholder: "{{.output}}" })));
+  pane.append(el("div", { class: "note-box", text:
+    "Never cached: writing is a side effect, and a replayed cache entry does not repeat it." }));
+}
+
+function insert(node, text, set) {
+  const at = node.selectionStart ?? node.value.length;
+  node.value = node.value.slice(0, at) + text + node.value.slice(node.selectionEnd ?? at);
+  set(node.value);
+  node.focus();
+  node.setSelectionRange(at + text.length, at + text.length);
+  save();
+}
+
+// --- editing ------------------------------------------------------------
+
+function uniqueId(want) {
+  let id = want.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "step";
+  if (!doc.steps.some((s) => s.id === id)) return id;
+  for (let n = 2; ; n++) if (!doc.steps.some((s) => s.id === `${id}-${n}`)) return `${id}-${n}`;
+}
+
+// nearestUpstream is what a card dropped at (x, y) reads from: the closest
+// card to its left, which is what the picture already implies. Falling back to
+// the selection, and then to the last leaf, keeps a drop onto empty space from
+// being a step with no upstream at all.
+function nearestUpstream(x, y) {
+  let best = null, bestD = Infinity;
+  for (const s of doc.steps) {
+    if (s.x > x - 20) continue;
+    const d = Math.hypot(x - (s.x + CARD_W), y - (s.y + CARD_H / 2));
+    if (d < bestD) { best = s; bestD = d; }
+  }
+  return best || doc.steps.find((s) => s.id === sel) || lastLeaf();
+}
+
+function blankStep(kind, label, extra, x, y) {
+  const id = uniqueId(kind === "source" ? "records-in" : label);
+  const upstream = nearestUpstream(x, y);
+  const s = { id, kind, title: label, x: Math.round(x), y: Math.round(y) };
+  if (kind !== "source") s.from = upstream ? upstream.id : (doc.steps[0] || {}).id;
+  switch (kind) {
+    // A dropped step has to leave the document valid, or the first thing a
+    // person sees after dropping one is a rejected save.
+    case "source": s.source = { from: (extra && extra.from) || "folder", root: ".", records: [] }; break;
+    case "infer": s.infer = { tier: "cheapest", prompt: "Read this and answer:\n\n{{.text}}", max_tokens: 400,
+      answer: [{ name: "answer", kind: "text", note: "what you found", required: true }] }; break;
+    case "reduce": s.reduce = { tier: "balanced", cover: ["What happened", "What deserves attention"],
+      words: 400, fan_in: 8, max_tokens: 900 }; break;
+    case "loop": s.loop = { step: { tier: "balanced", prompt: "Improve this:\n\n{{.draft}}\n{{if .Inbox}}{{range .Inbox}}- {{.}}\n{{end}}{{end}}",
+      max_tokens: 600, answer: [{ name: "draft", required: true }, { name: "verdict" }, { name: "critique" }] },
+      until: { field: "verdict", op: "is", value: "good" }, note: "critique", rounds: 4, cap_usd: 1 }; break;
+    case "filter": s.keep = { field: (S.fields[s.from] || [])[0] || "output", op: "non-empty", value: "" }; break;
+    case "derive": s.field = { name: "line", template: "{{.output}}" }; break;
+    case "write": s.write = { dir: "reports", name: "{{.id}}.md", body: "{{.output}}" }; break;
+  }
+  return s;
+}
+
+function addStep(kind, label, extra, x, y) {
+  if (kind !== "source" && doc.steps.length === 0) {
+    lastError = "start with a step that reads records in";
+    renderFooter();
+    return;
+  }
+  const s = blankStep(kind, label, extra, x, y);
+  doc.steps.push(s);
+  sel = s.id;
+  renderCanvas(); renderInspector();
+  save({ now: true, keepFocus: false });
+}
+
+function lastLeaf() {
+  const parents = new Set(doc.steps.map((s) => s.from).filter(Boolean));
+  const leaves = doc.steps.filter((s) => !parents.has(s.id));
+  return leaves[leaves.length - 1] || doc.steps[doc.steps.length - 1];
+}
+
+// removeStep deletes a card and re-parents its children onto its upstream, the
+// same way Doc.Apply does — locally, because the step being removed may be one
+// the server has not accepted yet (a half-configured card is exactly the kind
+// of thing you drop and then think better of).
+function removeStep(id) {
+  const s = doc.steps.find((x) => x.id === id);
+  if (!s) return;
+  const kids = doc.steps.filter((x) => x.from === id);
+  if (!s.from && kids.length) {
+    lastError = `cannot remove ${id}: ${kids.length} step(s) read from it`;
+    renderFooter();
+    return;
+  }
+  for (const k of kids) k.from = s.from;
+  for (const x of doc.steps) if (x.merge) x.merge = x.merge.filter((m) => m !== id);
+  doc.steps = doc.steps.filter((x) => x.id !== id);
+  if (sel === id) sel = null;
+  renderCanvas(); renderInspector();
+  save({ now: true, keepFocus: false });
+}
+
+// --- dragging -----------------------------------------------------------
+
+function startCardDrag(e, s) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  sel = s.id;
+  renderCanvas(); renderInspector();
+  const startX = e.clientX, startY = e.clientY, ox = s.x, oy = s.y;
+  let moved = false;
+  const move = (ev) => {
+    const dx = ev.clientX - startX, dy = ev.clientY - startY;
+    if (!moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+    moved = true;
+    s.x = Math.max(0, Math.round((ox + dx) / 2) * 2);
+    s.y = Math.max(0, Math.round((oy + dy) / 2) * 2);
+    renderCanvas();
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    if (moved) save({ keepFocus: false });
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+}
+
+function startPaletteDrag(e, kind, label, extra) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const ghost = el("div", { id: "drag-ghost", text: label });
+  ghost.style.left = e.clientX + 12 + "px";
+  ghost.style.top = e.clientY + 8 + "px";
+  document.body.append(ghost);
+  const move = (ev) => { ghost.style.left = ev.clientX + 12 + "px"; ghost.style.top = ev.clientY + 8 + "px"; };
+  const up = (ev) => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    ghost.remove();
+    const main = $("main"), r = main.getBoundingClientRect();
+    if (ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom) return;
+    addStep(kind, label, extra,
+      ev.clientX - r.left + main.scrollLeft - CARD_W / 2,
+      ev.clientY - r.top + main.scrollTop - CARD_H / 2);
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+}
+
+// --- ⌘K palette and export ----------------------------------------------
+
+let veil = null;
+function closeModal() { if (veil) { veil.remove(); veil = null; } }
+
+function openPalette() {
+  closeModal();
+  let rows = (S.intents || []).slice();
+  let cur = 0;
+  const list = el("div", { class: "rows" });
+  const input = el("input", { placeholder: "Describe what you want, or ask about this pipeline", autofocus: "true", spellcheck: "false" });
+  const draw = () => {
+    list.replaceChildren();
+    rows.forEach((it, i) => {
+      list.append(el("div", { class: "r" + (i === cur ? " cur" : ""), onclick: () => ask(it.id) },
+        el("span", { class: "k k-" + it.kind, text: it.kind }),
+        el("span", { class: "l", text: it.label }),
+        el("span", { class: "n", text: it.note })));
+    });
+    if (!rows.length) {
+      list.append(el("div", { class: "r" },
+        el("span", { class: "k k-EXPLAIN", text: "ASK" }),
+        el("span", { class: "l", text: input.value }),
+        el("span", { class: "n", text: "press enter" })));
+    }
+  };
+  input.addEventListener("input", () => {
+    const q = input.value.toLowerCase();
+    rows = (S.intents || []).filter((it) => (it.label + " " + it.kind + " " + it.note).toLowerCase().includes(q));
+    cur = 0;
+    draw();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { cur = Math.min(cur + 1, rows.length - 1); draw(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { cur = Math.max(cur - 1, 0); draw(); e.preventDefault(); }
+    else if (e.key === "Enter") { ask(rows.length ? rows[cur].id : input.value); e.preventDefault(); }
+  });
+  const modal = el("div", { class: "modal", onclick: (e) => e.stopPropagation() },
+    el("div", { class: "top" }, el("span", { style: "color:var(--infer);font-size:11.5px", text: mac ? "⌘K" : "^K" }),
+      input, el("span", { class: "esc", text: "ESC" })),
+    list,
+    el("div", { class: "foot", text: "Nothing changes until you accept it. Every proposal shows as a diff on the canvas first." }));
+  veil = el("div", { class: "veil", onclick: closeModal }, modal);
+  document.body.append(veil);
+  draw();
+  input.focus();
+}
+
+async function ask(q) {
+  closeModal();
+  try {
+    proposal = await api("/api/ask", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ q, selected: sel || "" }),
+    });
+    if (proposal.action === "export") { proposal = null; openExport(); return; }
+    renderCanvas();
+  } catch (e) { lastError = e.message; renderFooter(); }
+}
+
+async function openExport() {
+  closeModal();
+  let src;
+  try { src = await api("/api/export"); }
+  catch (e) { lastError = e.message; renderFooter(); return; }
+  const pre = el("pre", { text: src });
+  const copy = el("button", { class: "btn", text: "Copy", onclick: async () => {
+    try { await navigator.clipboard.writeText(src); copy.textContent = "Copied"; }
+    catch (e) { copy.textContent = "Select and copy"; }
+  } });
+  const modal = el("div", { class: "modal wide", onclick: (e) => e.stopPropagation() },
+    el("div", { class: "top" },
+      el("span", { class: "esc", text: "EXPORT" }),
+      el("span", { style: "font-size:13px;color:var(--ink)", text: doc.name + ".go" }),
+      el("span", { class: "spacer", style: "flex:1" }), copy,
+      el("button", { class: "btn", text: "Close", onclick: closeModal })),
+    pre,
+    el("div", { class: "foot", text: "Generated from the canvas, and it compiles. Editing the canvas regenerates it: this file is an export, not a second source of truth." }));
+  veil = el("div", { class: "veil center", onclick: closeModal }, modal);
+  document.body.append(veil);
+}
+
+async function startRun() {
+  try {
+    const state = await api("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    adopt(state);
+    if (state.run && state.run.url) window.open(state.run.url, "_blank", "noopener");
+    pollRun();
+  } catch (e) { lastError = e.message; renderFooter(); }
+}
+
+function pollRun() {
+  const tick = async () => {
+    try {
+      const state = await api("/api/state");
+      S = state;
+      renderHeader(); renderFooter();
+      if (state.run && state.run.running) setTimeout(tick, 1500);
+    } catch (e) { /* the run outlives a hiccup in the poll */ }
+  };
+  setTimeout(tick, 1200);
+}
+
+function openRunTab() {
+  if (S.constellation) { window.open(S.constellation, "_blank", "noopener"); return; }
+  proposal = {
+    kind: "EXPLAIN", title: "Watching a run is the constellation view's job",
+    body: "The studio is the build half: it draws the pipeline, prices it from your records, and " +
+      "exports it. A run in flight — every call as a star, the cost climbing, the retries — is " +
+      "what viz.Server already shows. Start one with studio.Constellation(url) and this tab opens it.",
+  };
+  renderCanvas();
+}
+
+// --- wiring -------------------------------------------------------------
+
+$("docname").addEventListener("input", (e) => { doc.name = e.target.value; save(); });
+$("ask").addEventListener("click", openPalette);
+$("export").addEventListener("click", openExport);
+$("run").addEventListener("click", startRun);
+$("tab-run").addEventListener("click", openRunTab);
+$("tab-build").addEventListener("click", () => {});
+$("main").addEventListener("mousedown", (e) => {
+  if (e.target.id === "main" || e.target.id === "canvas" || e.target.id === "grid") {
+    sel = null; renderCanvas(); renderInspector();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  const k = (e.key || "").toLowerCase();
+  if ((e.metaKey || e.ctrlKey) && k === "k") { e.preventDefault(); veil ? closeModal() : openPalette(); return; }
+  if (k === "escape") { closeModal(); if (proposal) { proposal = null; renderCanvas(); } return; }
+  const typing = /^(input|textarea|select)$/i.test((document.activeElement || {}).tagName || "");
+  if (!typing && (k === "backspace" || k === "delete") && sel) { e.preventDefault(); removeStep(sel); }
+});
+setInterval(() => { if (S && S.file) $("saved").textContent = ago(S.saved_at); }, 15000);
+
+load();
+</script>
+</body>
+</html>
