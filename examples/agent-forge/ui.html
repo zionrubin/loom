@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic system blueprint</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#131a22; --panel2:#0f151c; --line:#22303d;
+    --ink:#dbe6f0; --dim:#7f93a6; --faint:#4d6072;
+    --accent:#4fd1c5; --warm:#f6ad55; --cool:#63b3ed; --bad:#fc8181;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  a{color:var(--accent)}
+  code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{position:sticky;top:0;z-index:20;background:rgba(11,15,20,.92);backdrop-filter:blur(8px);
+         border-bottom:1px solid var(--line);padding:14px 22px;display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+  header h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.2px}
+  header .meta{color:var(--dim);font-size:12px}
+  header nav{margin-left:auto;display:flex;gap:14px}
+  header nav a{color:var(--dim);text-decoration:none;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+  header nav a:hover{color:var(--accent)}
+  main{max-width:1180px;margin:0 auto;padding:26px 22px 90px}
+  section{margin:0 0 46px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--dim);
+     margin:0 0 14px;font-weight:600}
+  h3{font-size:15px;margin:0 0 6px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
+  .muted{color:var(--dim)}
+  .tiny{font-size:12px}
+
+  /* verdict */
+  .verdict{display:grid;grid-template-columns:1fr 300px;gap:20px}
+  @media (max-width:860px){.verdict{grid-template-columns:1fr}}
+  .shape{font-size:30px;font-weight:650;letter-spacing:-.5px;margin:0 0 8px}
+  .shape span{color:var(--accent)}
+  .nums{display:flex;gap:26px;margin:16px 0 0;flex-wrap:wrap}
+  .num b{display:block;font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
+  .num s{display:block;text-decoration:none;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
+  .scores{margin-top:18px;display:grid;gap:6px}
+  .score{display:grid;grid-template-columns:110px 1fr 46px;gap:10px;align-items:center;font-size:12px}
+  .score .bar{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .score .bar i{display:block;height:100%;background:var(--faint)}
+  .score.win .bar i{background:var(--accent)}
+  .score.win{color:var(--ink)}
+  .score:not(.win){color:var(--dim)}
+  .quad{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px}
+
+  /* agents */
+  .agents{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .agent{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 17px;
+         cursor:pointer;transition:border-color .12s,transform .12s}
+  .agent:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .agent .part{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--warm)}
+  .agent .mission{color:var(--dim);font-size:13px;margin:6px 0 12px}
+  .mem{display:grid;gap:5px;margin-top:10px}
+  .mem .row{display:grid;grid-template-columns:78px 1fr 38px;gap:8px;align-items:center;font-size:12px}
+  .mem .row:first-child b{color:var(--accent)}
+  .mem .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden}
+  .mem .bar i{display:block;height:100%;background:var(--cool)}
+  .mem .row:first-child .bar i{background:var(--accent)}
+  .ledger{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--dim)}
+  .chip b{color:var(--ink);font-weight:600}
+
+  /* heatmap */
+  table.heat{border-collapse:collapse;width:100%;font-size:12px}
+  table.heat th{font-weight:500;color:var(--dim);text-align:left;padding:5px 8px;white-space:nowrap}
+  table.heat th.rot{text-align:center;font-size:11px}
+  table.heat td{padding:3px 4px;text-align:center}
+  table.heat td.name{text-align:left;white-space:nowrap;max-width:270px;overflow:hidden;text-overflow:ellipsis}
+  .cell{display:block;border-radius:3px;height:22px;line-height:22px;font-variant-numeric:tabular-nums;
+        color:#04121a;font-weight:600}
+  .cell.zero{background:var(--panel2);color:var(--faint);font-weight:400}
+  .fn{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint)}
+
+  /* spaces */
+  .spaces{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+  .space h3{display:flex;justify-content:space-between;align-items:baseline}
+  .space .cpl{font-size:11px;color:var(--warm);font-variant-numeric:tabular-nums}
+  .space p{color:var(--dim);font-size:13px;margin:8px 0 0}
+
+  /* drawer */
+  .scrim{position:fixed;inset:0;background:rgba(4,7,10,.66);opacity:0;pointer-events:none;transition:opacity .15s;z-index:30}
+  .scrim.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:min(720px,100%);background:var(--panel2);
+          border-left:1px solid var(--line);transform:translateX(100%);transition:transform .18s ease;
+          z-index:31;overflow-y:auto;padding:24px 26px 60px}
+  .drawer.on{transform:none}
+  .drawer .close{position:absolute;top:16px;right:20px;background:none;border:0;color:var(--dim);
+                 font-size:22px;cursor:pointer;line-height:1}
+  .drawer h2{margin-top:26px}
+  .drawer ul{margin:0;padding-left:18px}
+  .drawer li{margin:4px 0}
+  .drawer pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:14px;
+              white-space:pre-wrap;font-size:12px;color:var(--ink);overflow-x:auto}
+  .drawer table{border-collapse:collapse;width:100%;font-size:12px;margin:6px 0 14px}
+  .drawer th,.drawer td{border-bottom:1px solid var(--line);padding:5px 8px;text-align:left;vertical-align:top}
+  .drawer th{color:var(--dim);font-weight:500}
+  .quote{border-left:2px solid var(--line);padding-left:10px;color:var(--dim);font-size:12px;margin:5px 0}
+  footer{border-top:1px solid var(--line);color:var(--faint);font-size:12px;padding:18px 22px;text-align:center}
+</style>
+</head>
+<body>
+<script id="bp" type="application/json">__BLUEPRINT__</script>
+
+<header>
+  <h1>Agentic system blueprint</h1>
+  <div class="meta" id="meta"></div>
+  <nav>
+    <a href="#verdict">Shape</a><a href="#agents">Agents</a><a href="#heat">Capabilities</a>
+    <a href="#spaces">Spaces</a><a href="DESIGN.md">DESIGN.md</a>
+  </nav>
+</header>
+
+<main>
+  <section id="verdict"><h2>The shape, and why</h2><div id="verdictBody"></div></section>
+  <section id="agents"><h2>The agents</h2><div class="agents" id="agentGrid"></div>
+    <div id="sharedMem"></div></section>
+  <section id="heat"><h2>Capability × space</h2>
+    <div class="panel"><p class="tiny muted" style="margin:0 0 12px">
+      Colour is how much of a capability lives in each space. A row that is evenly lit recurs everywhere —
+      one shared agent can serve it. A row lit in one column belongs to that space alone.</p>
+      <div style="overflow-x:auto"><table class="heat" id="heatTable"></table></div></div></section>
+  <section id="spaces"><h2>What they talk about</h2><div class="spaces" id="spaceGrid"></div></section>
+  <section id="runs"><h2>The run</h2><div class="panel" id="runBody"></div></section>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer"><button class="close" id="closeBtn">×</button><div id="drawerBody"></div></aside>
+
+<footer id="foot"></footer>
+
+<script>
+const BP = JSON.parse(document.getElementById('bp').textContent);
+const C = BP.census || {}, R = BP.roster || {}, T = C.topology || {};
+const el = (t, cls, html) => { const n = document.createElement(t); if (cls) n.className = cls;
+  if (html != null) n.innerHTML = html; return n; };
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pct = x => (100 * (x || 0)).toFixed(0) + '%';
+const num = x => (x || 0).toFixed(2);
+
+/* ---- header ------------------------------------------------------------ */
+document.getElementById('meta').textContent =
+  `${(C.spaces||[]).length} spaces · ${C.days||0} days · ${C.observations||0} job observations · ${BP.provider} models · $${(BP.cost_usd||0).toFixed(4)}`;
+document.getElementById('foot').textContent =
+  `Generated ${BP.generated} from ${BP.source}. Senders, mentions and contact details were pseudonymised before any text reached a model.`;
+
+/* ---- verdict ----------------------------------------------------------- */
+const shapes = {
+  function: ['one agent per job family, shared across every space', 'S·(1−C)'],
+  vertical: ['one agent per space, owning every family inside it', 'C·(1−S)'],
+  hybrid:   ['shared function agents plus a per-space owner, over shared memory', 'min(S,C)'],
+  single:   ['one generalist agent', '(1−S)·(1−C)'],
+};
+{
+  const wrap = el('div', 'verdict');
+  const left = el('div', 'panel');
+  left.appendChild(el('div', 'shape', `<span>${esc(R.topology || T.recommended || '—')}</span>`));
+  left.appendChild(el('div', 'muted', esc(R.verdict || T.rationale || '')));
+  const nums = el('div', 'nums');
+  nums.innerHTML =
+    `<div class="num"><b>${num(T.spread)}</b><s>spread S</s></div>
+     <div class="num"><b>${num(T.coupling)}</b><s>coupling C</s></div>
+     <div class="num"><b>${(BP.agents||[]).length}</b><s>agents</s></div>
+     <div class="num"><b>${pct(C.match_rate)}</b><s>labels folded</s></div>
+     <div class="num"><b>${pct(C.other_share)}</b><s>outside vocabulary</s></div>`;
+  left.appendChild(nums);
+  const sc = el('div', 'scores');
+  const best = T.recommended;
+  Object.keys(shapes).forEach(k => {
+    const v = (T.scores || {})[k] || 0;
+    const row = el('div', 'score' + (k === best ? ' win' : ''));
+    row.innerHTML = `<span title="${shapes[k][0]}">${k} <span class="fn">${shapes[k][1]}</span></span>
+      <span class="bar"><i style="width:${Math.max(2, v * 100)}%"></i></span>
+      <span class="mono">${v.toFixed(3)}</span>`;
+    row.title = shapes[k][0];
+    sc.appendChild(row);
+  });
+  left.appendChild(sc);
+  if ((R.rejected || []).length) {
+    const rj = el('div', 'tiny muted');
+    rj.style.marginTop = '14px';
+    rj.innerHTML = '<b>Not taken:</b> ' + R.rejected.map(r => `${esc(r.shape)} — ${esc(r.why_not)}`).join(' · ');
+    left.appendChild(rj);
+  }
+  wrap.appendChild(left);
+  wrap.appendChild(quadrant(T.spread || 0, T.coupling || 0, best));
+  document.getElementById('verdictBody').appendChild(wrap);
+}
+
+function quadrant(S, Cc, best) {
+  const box = el('div', 'quad');
+  const W = 280, H = 280, P = 30, w = W - 2 * P;
+  const x = v => P + v * w, y = v => H - P - v * w;
+  const q = [
+    ['single',   0.25, 0.25], ['function', 0.75, 0.25],
+    ['vertical', 0.25, 0.75], ['hybrid',   0.75, 0.75],
+  ];
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="spread versus coupling quadrant">
+    <rect x="${P}" y="${P}" width="${w}" height="${w}" fill="none" stroke="#22303d"/>
+    <line x1="${x(.5)}" y1="${P}" x2="${x(.5)}" y2="${H - P}" stroke="#1b2733" stroke-dasharray="3 3"/>
+    <line x1="${P}" y1="${y(.5)}" x2="${W - P}" y2="${y(.5)}" stroke="#1b2733" stroke-dasharray="3 3"/>`;
+  q.forEach(([name, qx, qy]) => {
+    svg += `<text x="${x(qx)}" y="${y(qy)}" fill="${name === best ? '#4fd1c5' : '#4d6072'}"
+      font-size="11" text-anchor="middle" font-family="ui-monospace,monospace">${name}</text>`;
+  });
+  svg += `<circle cx="${x(S)}" cy="${y(Cc)}" r="7" fill="#f6ad55" fill-opacity=".25"/>
+    <circle cx="${x(S)}" cy="${y(Cc)}" r="3.5" fill="#f6ad55"/>
+    <text x="${W / 2}" y="${H - 8}" fill="#7f93a6" font-size="10" text-anchor="middle">spread across spaces →</text>
+    <text x="10" y="${H / 2}" fill="#7f93a6" font-size="10" text-anchor="middle"
+      transform="rotate(-90 10 ${H / 2})">coupling inside a space →</text></svg>`;
+  box.innerHTML = svg;
+  return box;
+}
+
+/* ---- agents ------------------------------------------------------------ */
+const partText = p => !p ? '—' : (p.axis === 'global' || (p.instances || 1) <= 1)
+  ? 'one shared instance' : `one instance per ${p.axis} (${p.instances})`;
+
+const grid = document.getElementById('agentGrid');
+(BP.agents || []).forEach((a, i) => {
+  const card = el('div', 'agent');
+  card.appendChild(el('div', 'part', esc(partText(a.partition))));
+  card.appendChild(el('h3', null, esc(a.name || a.id)));
+  card.appendChild(el('div', 'mission', esc((a.spec && a.spec.mission) || a.mission || '')));
+  const mem = el('div', 'mem');
+  (a.remembers || []).forEach(m => {
+    mem.appendChild(el('div', 'row',
+      `<b>${esc(m.axis)}</b><span class="bar"><i style="width:${Math.max(3, (m.weight || 0) * 100)}%"></i></span>
+       <span class="mono tiny">${pct(m.weight)}</span>`));
+  });
+  if (!(a.remembers || []).length) mem.appendChild(el('div', 'tiny muted', 'nothing across days'));
+  card.appendChild(el('div', 'fn', 'remembers, first to last'));
+  card.appendChild(mem);
+  card.onclick = () => openAgent(i);
+  grid.appendChild(card);
+});
+
+if ((R.shared_memory || []).length) {
+  const box = el('div', 'panel');
+  box.style.marginTop = '14px';
+  box.innerHTML = '<div class="fn" style="margin-bottom:8px">Shared memory — one ledger, not a copy per agent</div>' +
+    R.shared_memory.map(s =>
+      `<div style="margin:6px 0"><span class="chip"><b>${esc(s.axis)}</b> ledger</span>
+       <span class="tiny muted">read by ${esc((s.readers || []).join(', '))} — ${esc(s.why || '')}</span></div>`).join('');
+  document.getElementById('sharedMem').appendChild(box);
+}
+
+/* ---- heatmap ----------------------------------------------------------- */
+{
+  const spaces = C.spaces || [], caps = (C.capabilities || []).slice(0, 26);
+  const t = document.getElementById('heatTable');
+  let head = '<tr><th>capability</th><th class="rot">n</th><th class="rot">spread</th>';
+  spaces.forEach(s => head += `<th class="rot">${esc(s)}</th>`);
+  t.innerHTML = head + '</tr>' + caps.map(cs => {
+    const total = cs.count || 1;
+    let row = `<tr><td class="name" title="${esc(cs.capability.summary || '')}">${esc(cs.capability.name)}
+      <span class="fn">${esc(cs.capability.function)}</span></td>
+      <td class="mono tiny">${cs.count}</td><td class="mono tiny">${num(cs.spread)}</td>`;
+    spaces.forEach(s => {
+      const n = (cs.spaces || {})[s] || 0, f = n / total;
+      row += n === 0 ? '<td><span class="cell zero">·</span></td>'
+        : `<td><span class="cell" style="background:rgba(79,209,197,${(0.18 + 0.82 * f).toFixed(2)})">${n}</span></td>`;
+    });
+    return row + '</tr>';
+  }).join('');
+}
+
+/* ---- spaces ------------------------------------------------------------ */
+{
+  const g = document.getElementById('spaceGrid');
+  (C.space_stats || []).forEach(ss => {
+    const p = el('div', 'panel space');
+    p.innerHTML = `<h3>${esc(ss.space)}<span class="cpl">coupling ${num(ss.coupling)}</span></h3>
+      <div class="tiny muted">${ss.count} jobs over ${ss.days} days · family mix ${num(ss.diversity)} · handoffs ${num(ss.handoff_rate)}</div>
+      <div class="ledger">${Object.entries(ss.functions || {})
+        .sort((a, b) => b[1] - a[1]).slice(0, 5)
+        .map(([k, v]) => `<span class="chip"><b>${esc(k)}</b> ${v}</span>`).join('')}</div>
+      <p>${esc((BP.profiles || {})[ss.space] || 'No profile was produced for this space.')}</p>`;
+    g.appendChild(p);
+  });
+}
+
+/* ---- runs -------------------------------------------------------------- */
+{
+  const b = document.getElementById('runBody');
+  b.innerHTML = (BP.runs || []).map(r =>
+    `<div style="margin:0 0 12px"><b>${esc(r.run)}</b>
+      <span class="tiny muted"> $${(r.cost_usd || 0).toFixed(4)} · ${(r.seconds || 0).toFixed(1)}s</span>
+      <div class="ledger">${(r.stages || []).map(s =>
+        `<span class="chip"><b>${esc(s.stage)}</b> ${s.calls} calls${s.cache_hits ? ' · ' + s.cache_hits + ' cached' : ''}</span>`).join('')}</div></div>`
+  ).join('') || '<span class="muted">no run statistics recorded</span>';
+}
+
+/* ---- drawer ------------------------------------------------------------ */
+const drawer = document.getElementById('drawer'), scrim = document.getElementById('scrim');
+const close = () => { drawer.classList.remove('on'); scrim.classList.remove('on'); };
+document.getElementById('closeBtn').onclick = close;
+scrim.onclick = close;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+
+const list = (title, items) => !items || !items.length ? '' :
+  `<h2>${esc(title)}</h2><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
+const objList = (title, arr, head, body, tail) => {
+  if (!Array.isArray(arr) || !arr.length) return '';
+  return list(title, arr.map(o => typeof o === 'string' ? esc(o) :
+    `<b>${esc(o[head])}</b>${o[body] ? ' — ' + esc(o[body]) : ''}${tail && o[tail] ? ` <span class="tiny muted">(${esc(o[tail])})</span>` : ''}`));
+};
+
+function openAgent(i) {
+  const a = (BP.agents || [])[i]; if (!a) return;
+  const spec = a.spec || {}, ch = a.charter || {}, mem = spec.memory || {};
+  const caps = (C.capabilities || []).filter(cs => (a.capabilities || []).includes(cs.capability.id));
+  let h = `<div class="part fn">${esc(partText(a.partition))}</div><h1 style="margin:4px 0 6px;font-size:22px">${esc(a.name || a.id)}</h1>
+    <div class="muted">${esc(spec.mission || a.mission || '')}</div>`;
+  if (a.why) h += `<div class="tiny muted" style="margin-top:8px"><b>Why one agent:</b> ${esc(a.why)}</div>`;
+  if ((a.partition || {}).keys && a.partition.axis !== 'global')
+    h += `<div class="tiny muted" style="margin-top:6px">Instance keys: ${esc(a.partition.keys.join(', '))} — that axis is constant inside an instance, so it is not memory.</div>`;
+
+  h += '<h2>Memory</h2>';
+  if (mem.primary_key) {
+    h += `<p>Keyed on <b>${esc(mem.primary_key)}</b>${(mem.secondary_keys || []).length
+      ? ', cross-referenced by ' + esc(mem.secondary_keys.join(', ')) : ''}.
+      ${esc(mem.why_this_key || '')}</p>`;
+    h += '<ul>';
+    if (mem.working) h += `<li><b>Working</b> — ${esc(mem.working)}</li>`;
+    if (mem.episodic) h += `<li><b>Episodic</b> — ${esc(mem.episodic.record || '')} Keyed by ${esc(mem.episodic.keyed_by || '')}. Retained ${esc(mem.episodic.retention || '')}.</li>`;
+    if (mem.semantic) h += `<li><b>Semantic</b> — ${esc(mem.semantic.record || '')} Keyed by ${esc(mem.semantic.keyed_by || '')}. Rewritten when ${esc(mem.semantic.updated_when || '')}.</li>`;
+    h += '</ul>';
+  }
+  if ((a.remembers || []).length) {
+    h += '<div class="fn">measured recall ranking</div><div class="mem">' + a.remembers.map(m =>
+      `<div class="row"><b>${esc(m.axis)}</b><span class="bar"><i style="width:${Math.max(3, (m.weight || 0) * 100)}%"></i></span>
+       <span class="mono tiny">${pct(m.weight)}</span></div>
+       ${m.why ? `<div class="tiny muted" style="margin:-2px 0 4px 86px">${esc(m.why)}</div>` : ''}`).join('') + '</div>';
+  }
+
+  (ch.memory_schema || []).forEach(s => {
+    h += `<h2>${esc(s.name || '')} <span class="fn">${esc(s.store || '')} · key ${esc(s.key || '')}</span></h2>
+      <table><tr><th>field</th><th>type</th><th>holds</th></tr>` +
+      (s.fields || []).map(f => `<tr><td class="mono">${esc(f.name)}</td><td class="tiny">${esc(f.type)}</td><td class="tiny muted">${esc(f.note)}</td></tr>`).join('') +
+      '</table>';
+    if (s.example) h += `<div class="tiny muted mono">example: ${esc(JSON.stringify(s.example))}</div>`;
+  });
+
+  if (spec.scope) {
+    h += list('Owns', (spec.scope.owns || []).map(esc));
+    h += list('Explicitly not', (spec.scope.excluded || []).map(esc));
+  }
+  h += objList('Tools', spec.tools, 'name', 'use', 'access');
+  h += objList('Triggers', spec.triggers, 'when', 'does');
+  h += objList('Outputs', spec.outputs, 'what', 'to');
+  h += objList('Handoffs', spec.handoffs, 'to', 'when', 'payload');
+  h += list('Guardrails', (spec.guardrails || []).map(esc));
+  h += objList('Evals', spec.evals, 'name', 'checks');
+  h += objList('What it cannot learn from chat', spec.external_lookups, 'what', 'where');
+  h += objList('Risks', spec.risks, 'what', 'mitigation');
+  h += list('First week', (ch.first_week || []).map(esc));
+  if (ch.system_prompt) h += `<h2>System prompt</h2><pre>${esc(ch.system_prompt)}</pre>`;
+
+  if (caps.length) {
+    h += '<h2>Evidence</h2>';
+    caps.slice(0, 8).forEach(cs => {
+      h += `<div style="margin:10px 0"><b>${esc(cs.capability.name)}</b>
+        <span class="tiny muted">${cs.count} observations · spread ${num(cs.spread)}</span>` +
+        (cs.quotes || []).map(q => `<div class="quote">${esc(q)}</div>`).join('') + '</div>';
+    });
+  }
+  h += `<div class="tiny muted" style="margin-top:24px">Full text: <a href="agents/${esc(a.id)}.md">agents/${esc(a.id)}.md</a></div>`;
+
+  document.getElementById('drawerBody').innerHTML = h;
+  drawer.scrollTop = 0;
+  drawer.classList.add('on'); scrim.classList.add('on');
+}
+</script>
+</body>
+</html>
