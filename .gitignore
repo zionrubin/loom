@@ -11,3 +11,6 @@ blueprint
 .agent
 dist
 corpus
+partner-atlas/
+vertical-digest/
+agent-forge/
