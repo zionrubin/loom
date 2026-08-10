@@ -207,7 +207,7 @@ Rules that override the ladder:
 var incidents = []core.Record{
 	core.NewRecord("inc-1", map[string]any{
 		"reporter": "dana.okoye@example.com", "service": "payments",
-		"text": "Dana Okoye (acct 88121) has had every card declined since 09:40. Three retries, all 502 from the payments gateway. Her renewal fails tonight.",
+		"text": "Alex Rivera (acct 88121) has had every card declined since 09:40. Three retries, all 502 from the payments gateway. Her renewal fails tonight.",
 	}),
 	core.NewRecord("inc-2", map[string]any{
 		"reporter": "ops@example.com", "service": "checkout",

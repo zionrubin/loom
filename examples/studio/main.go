@@ -335,9 +335,9 @@ func inventArchive(days int) (string, error) {
 		return "", err
 	}
 	people := map[string][]string{
-		"payments":  {"Dana", "Roi", "Yael", "Amir"},
-		"logistics": {"Noa", "Tom", "Lior"},
-		"retail":    {"Maya", "Gil", "Shira", "Eitan", "Adi"},
+		"payments":  {"Alex", "Sam", "Jordan", "Riley"},
+		"logistics": {"Casey", "Morgan", "Quinn"},
+		"retail":    {"Avery", "Rowan", "Devin", "Noel", "Sage"},
 	}
 	lines := map[string][]string{
 		"payments": {

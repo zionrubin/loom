@@ -124,7 +124,7 @@ var voiceRubric = `BRAND VOICE
 - Maximum four sentences.`
 
 var tickets = []core.Record{
-	core.NewRecord("t01", map[string]any{"sku": "SOL-500", "customer": "Dana",
+	core.NewRecord("t01", map[string]any{"sku": "SOL-500", "customer": "Alex",
 		"subject": "charger got REALLY hot",
 		"body":    "My Solis charger from November got too hot to touch last night. I unplugged it. This seems dangerous?"}),
 	core.NewRecord("t02", map[string]any{"sku": "AUR-100", "customer": "Miguel",

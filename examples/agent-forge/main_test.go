@@ -34,17 +34,17 @@ func fixture(t *testing.T) string {
 	root := t.TempDir()
 	files := map[string][]string{
 		"renters/2026-03-02.jsonl": {
-			`{"sender":{"name":"Dana Levi","type":"HUMAN"},"createTime":"2026-03-02T09:15:00Z","text":"CPA doubled overnight, mailing dana.levi@example.com the sheet"}`,
-			`{"sender":{"name":"Omer Katz","type":"HUMAN"},"createTime":"2026-03-02T09:16:00Z","text":"@Dana Levi call me on +972-52-555-0134, id 987654321"}`,
+			`{"sender":{"name":"Alex Rivera","type":"HUMAN"},"createTime":"2026-03-02T09:15:00Z","text":"CPA doubled overnight, mailing alex.rivera@example.com the sheet"}`,
+			`{"sender":{"name":"Sam Okafor","type":"HUMAN"},"createTime":"2026-03-02T09:16:00Z","text":"@Alex Rivera call me on +972-52-555-0134, id 987654321"}`,
 		},
 		"renters/2026-03-03.jsonl": {
-			`{"sender":{"name":"Dana Levi","type":"HUMAN"},"createTime":"2026-03-03T10:00:00Z","text":"paused the losing keywords, see https://ads.example.com/x"}`,
+			`{"sender":{"name":"Alex Rivera","type":"HUMAN"},"createTime":"2026-03-03T10:00:00Z","text":"paused the losing keywords, see https://ads.example.com/x"}`,
 		},
 		"renters/2026-03-09.jsonl": {
-			`{"sender":{"name":"Omer Katz","type":"HUMAN"},"createTime":"2026-03-09T10:00:00Z","text":"partner still owes us the March report"}`,
+			`{"sender":{"name":"Sam Okafor","type":"HUMAN"},"createTime":"2026-03-09T10:00:00Z","text":"partner still owes us the March report"}`,
 		},
 		"travel/2026-03-02.jsonl": {
-			`{"sender":{"name":"Maya Bar","type":"HUMAN"},"createTime":"2026-03-02T11:00:00Z","text":"booking funnel step 3 fell off a cliff"}`,
+			`{"sender":{"name":"Jordan Blake","type":"HUMAN"},"createTime":"2026-03-02T11:00:00Z","text":"booking funnel step 3 fell off a cliff"}`,
 		},
 		"renters/notes.txt":   {"ignored"},
 		"renters/draft.jsonl": {`{"sender":{"name":"x","type":"HUMAN"},"createTime":"","text":"undated, must be skipped"}`},
@@ -163,7 +163,7 @@ func TestLoadDayScrubsIdentifiers(t *testing.T) {
 	corpus := strings.ToLower(all.String())
 	for _, forbidden := range []string{
 		"dana", "levi", "omer", "katz", "maya", // real names, in any casing
-		"dana.levi@example.com", "@example.com", // addresses
+		"alex.rivera@example.com", "@example.com", // addresses
 		"+972", "555-0134", // phone
 		"987654321",               // long id
 		"https://ads.example.com", // url
@@ -199,7 +199,7 @@ func TestLoadDayScrubsIdentifiers(t *testing.T) {
 
 	// A different salt must produce a different pseudonym for the same name,
 	// so two corpora cannot be joined on the hash.
-	if newScrubber("other-salt").pseudonym("Dana Levi") == newScrubber("test-salt").pseudonym("Dana Levi") {
+	if newScrubber("other-salt").pseudonym("Alex Rivera") == newScrubber("test-salt").pseudonym("Alex Rivera") {
 		t.Fatal("pseudonyms are not salted — the same name hashes identically across corpora")
 	}
 }
@@ -210,10 +210,10 @@ func TestLoadDayScrubsIdentifiers(t *testing.T) {
 func TestScrubberDoesNotSplitEmailAddresses(t *testing.T) {
 	s := newScrubber("salt")
 	cases := map[string]string{
-		"mail dana.levi@example.com the sheet":  "mail <email> the sheet",
+		"mail alex.rivera@example.com the sheet":  "mail <email> the sheet",
 		"cc: first.last+tag@sub.example.co.il":  "cc: <email>",
-		"ask @Dana Levi about it":               "", // pseudonym, asserted below
-		"ping @Omer and dana@example.com again": "", // both rules on one line
+		"ask @Alex Rivera about it":               "", // pseudonym, asserted below
+		"ping @Sam and alex@example.com again": "", // both rules on one line
 	}
 	for in, want := range cases {
 		got := s.text(in)
@@ -226,13 +226,13 @@ func TestScrubberDoesNotSplitEmailAddresses(t *testing.T) {
 			}
 		}
 	}
-	if got := s.text("ask @Dana Levi about it"); !strings.Contains(got, "TM-") {
+	if got := s.text("ask @Alex Rivera about it"); !strings.Contains(got, "TM-") {
 		t.Errorf("a mention should become a pseudonym, got %q", got)
 	}
 
 	// A different salt must produce a different pseudonym for the same name,
 	// so two corpora cannot be joined on the hash.
-	if newScrubber("other-salt").pseudonym("Dana Levi") == newScrubber("test-salt").pseudonym("Dana Levi") {
+	if newScrubber("other-salt").pseudonym("Alex Rivera") == newScrubber("test-salt").pseudonym("Alex Rivera") {
 		t.Fatal("pseudonyms are not salted — the same name hashes identically across corpora")
 	}
 }
@@ -888,7 +888,7 @@ func TestRunWritesTheFullBlueprint(t *testing.T) {
 	// Nothing that identifies a person may reach any artifact. The bundled
 	// corpus seeds real-looking names, an address and a phone number so this
 	// assertion has something to catch.
-	for _, forbidden := range []string{"Dana", "Omer", "Maya", "Tomer", "Shaked", "Katz",
+	for _, forbidden := range []string{"Alex", "Rivera", "Sam", "Okafor", "Jordan", "Blake",
 		"@example.com", "+972", "555-0134"} {
 		if hits := grepDir(t, out, forbidden); len(hits) > 0 {
 			t.Errorf("%q leaked into %v", forbidden, hits)

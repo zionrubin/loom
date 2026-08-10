@@ -202,7 +202,7 @@ func TestInventedArchiveIsRedactedOnTheWayIn(t *testing.T) {
 	var seen int
 	for _, r := range recs {
 		text := r.String("messages")
-		for _, name := range []string{"Dana", "Roi", "Yael", "Noa", "Maya", "Gil"} {
+		for _, name := range []string{"Alex", "Sam", "Jordan", "Casey", "Avery", "Rowan"} {
 			if strings.Contains(text, name) {
 				t.Fatalf("%s still names %s:\n%s", r.ID, name, text)
 			}

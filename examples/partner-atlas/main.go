@@ -519,8 +519,8 @@ func dedupeAliases(p partner) partner {
 	for _, a := range p.Aliases {
 		n := normName(a)
 		// Aliases shorter than 3 characters match everything; a 2-letter code
-		// like "JD" hits 292 files across five verticals, almost all of them
-		// somebody's initials.
+		// like "JD" hits hundreds of files across every vertical, almost all of
+		// them somebody's initials.
 		if n == "" || len([]rune(n)) < 3 || seen[n] {
 			continue
 		}
