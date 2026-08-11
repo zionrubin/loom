@@ -33,7 +33,29 @@ type Config struct {
 	// what the fleet already knows before deciding to research at all. Stages
 	// reach it like any tool, by being granted it.
 	Recall bool
+
+	// Shared connects this host's commons to the other executors through a
+	// distributed backend, so what one process learns every process can be
+	// served.
+	//
+	// Leaving it nil is the original, single-process layer, unchanged and with
+	// no network on any path. Setting it adds a rung to the ladder rather than
+	// replacing one: the in-process ledger is still consulted first and still
+	// answers without I/O, and the backend is reached only when it had nothing.
+	//
+	//	backend, err := pgstore.Open(ctx, dsn, pgstore.Options{Dimensions: 1536})
+	//	cfg := findings.Config{
+	//	    Gate:   []string{"mcp/web/search"},
+	//	    Shared: findings.NewShared(findings.SharedConfig{Backend: backend}),
+	//	}
+	//
+	// The host closes it with everything else it opened.
+	Shared *Shared
 }
 
 // Enabled reports whether the config asks for anything.
 func (c Config) Enabled() bool { return len(c.Gate) > 0 || c.Recall }
+
+// Distributed reports whether this host shares its commons with other
+// executors.
+func (c Config) Distributed() bool { return c.Shared.ok() }
