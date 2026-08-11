@@ -204,6 +204,15 @@ func (s *ToolSet) Add(tools ...Tool) {
 	}
 }
 
+// Get returns a registered tool by name. It is what lets a decorator be
+// applied at provisioning to a tool the set already holds — the shared
+// research gate wraps exactly the tools that reach a public source this way,
+// without the tools, the planner, or the stages that call them knowing.
+func (s *ToolSet) Get(name string) (Tool, bool) {
+	t, ok := s.tools[name]
+	return t, ok
+}
+
 // Names lists the registered tools in sorted order.
 func (s *ToolSet) Names() []string {
 	out := make([]string, 0, len(s.tools))

@@ -43,6 +43,23 @@ const (
 	// the agent that posted it has usually finished, and the agents that will
 	// read it have not started.
 	BlackboardPosted EventType = "blackboard.posted"
+	// FindingServed reports the shared research layer answering a question from
+	// what another agent already learned, instead of reaching a public source.
+	// Note carries how it matched (exact, class, near, coalesced), Saved and
+	// Usage what the avoided research originally cost, Artifact the finding's
+	// content hash, and Latency the served finding's age — which is the number
+	// that says whether a hit was fresh knowledge or an old one still inside
+	// its topic's horizon.
+	FindingServed EventType = "finding.served"
+	// FindingLearned reports a new finding contributed to the commons, with
+	// Usage the research it cost. Every later FindingServed naming this
+	// Artifact is that cost avoided again.
+	FindingLearned EventType = "finding.learned"
+	// FindingCoalesced reports a duplicate question collapsing into a call
+	// another task already had in flight — the saving a result cache cannot
+	// make, because it serves the second asker only after the first has
+	// finished, and these two asked at the same moment.
+	FindingCoalesced EventType = "finding.coalesced"
 	// StageProjected and RunProjected carry a pre-flight cost projection
 	// (loom.Explain): what a stage and a whole pipeline are expected to spend,
 	// published before anything is spent. They are the only events on this bus

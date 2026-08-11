@@ -19,6 +19,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/findings"
 	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
@@ -45,6 +46,7 @@ type Config struct {
 	MCPResources    []MCPResource
 	Broadcasts      map[string]any
 	Topics          map[string]bool
+	Findings        *findings.Config
 	EventHandler    func(observe.Event)
 	Streaming       bool
 	BatchWait       time.Duration
@@ -171,6 +173,43 @@ func WithBroadcast(name string, value any) Option {
 	}
 }
 
+// WithFindings puts a shared research layer in front of the tools that reach
+// public sources, so agents reuse each other's research instead of repeating
+// it.
+//
+//	loom.NewFleet(
+//	    loom.WithMCPServer(web),
+//	    loom.WithFindings(findings.Config{
+//	        Gate: []string{"mcp/web/search"},
+//	        Policy: findings.Policy{
+//	            Topics: map[string]findings.TopicPolicy{
+//	                "mcp/web/search": {Volatility: findings.Daily},
+//	            },
+//	        },
+//	    }),
+//	)
+//
+// It is a fleet-wide facility for the same reason the result cache is, and it
+// exists because the result cache cannot do this job. The cache's key is the
+// bytes going in, so it serves the second asker only if the first asked
+// *identically* and only after the first has *finished*. Neither holds for
+// concurrent agents doing research: they phrase one question three ways, and
+// they ask at the same instant. The gate keys on the question instead of the
+// bytes, and collapses simultaneous askers onto one call.
+//
+// A gated tool takes on one contract — it returns `{"text", "structured"}`,
+// because a served answer is rebuilt from a stored finding — and gains four
+// properties: questions already answered are served without a call, duplicate
+// questions in flight together become one call, findings carry the capabilities
+// their research consumed so the commons can never serve a reader research it
+// was not allowed to do itself, and every serve is recorded against the finding
+// so a retraction can say what rested on it.
+//
+// See the findings package and docs/FINDINGS.md for the design.
+func WithFindings(cfg findings.Config) Option {
+	return func(c *Config) { c.Findings = &cfg }
+}
+
 // WithFleetBudget caps what a whole fleet may spend, across every agent on it.
 //
 // It is WithRunBudget under the name that says what it means on a fleet: the
@@ -255,8 +294,14 @@ type RunResult struct {
 	// MCP reports each configured MCP server's connection accounting: how many
 	// sessions were opened, how many calls went through them, and how long the
 	// run spent waiting on tools that cost no tokens.
-	MCP   []mcp.Stats
-	Spent core.Usage
+	MCP []mcp.Stats
+	// Findings reports the shared research layer: questions asked at the gate,
+	// how many were answered from what had already been learned, and what that
+	// avoided. On a fleet these numbers are the fleet's — the commons has no
+	// per-agent owner — so a single Run's are its own only because a run is a
+	// fleet of one.
+	Findings findings.Stats
+	Spent    core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.
