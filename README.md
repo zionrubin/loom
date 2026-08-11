@@ -183,6 +183,20 @@ Continuum — and says which rows are honestly still empty.
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
   restarts with a state dir.
+- **A commons for external research** — `loom.WithFindings` gates the tools that
+  reach public sources, keying on the *question* rather than on the bytes,
+  because that is the duplication a result cache cannot see: one question in
+  three wordings, asked by agents that started at the same instant. An exact
+  key, then a topic-and-facets class, then optional embedding similarity that
+  yields candidates rather than hits; a single-flight lease so simultaneous
+  askers become one call; a coverage check that narrows the external request to
+  the fields it is actually missing; negative results stored so nobody
+  re-searches a dead end; and per-topic volatility horizons instead of
+  per-answer TTL guesses. Findings carry the capabilities their research
+  consumed, so the commons can save a reader a call it was allowed to make and
+  never make one it was not. Corrections append revisions and retractions report
+  every task that rested on the withdrawn claim. See
+  [docs/FINDINGS.md](docs/FINDINGS.md).
 - **Lineage & audit** — every artifact traces to the op, model, and inputs
   that produced it; every secret/tool/egress/broadcast decision is audited.
 - **Observability** — a typed event bus and per-stage run reports: tasks,
@@ -352,6 +366,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `providers/openai` | Official-SDK OpenAI adapter, broker-resolved keys |
 | `providers/llamacpp` | Local inference against a llama.cpp server: loopback egress, no credential, the KV cache as the prompt prefix cache, and the device's slot count as the admission ceiling |
 | `providers/llamacpp/llamacpptest` | A scriptable in-process llama.cpp server for tests and offline examples — what `mcp/mcptest` is to a server, on a real loopback socket |
+| `findings` | The commons: a gate agents pass before reaching a public source, so research one agent paid for is served to the next instead of repeated |
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
@@ -704,6 +719,82 @@ rubric recomputes exactly the stages that could have seen it — and a stage
 without a prefix fingerprints exactly as it did before, leaving existing
 caches warm.
 
+### Sharing the research, not just the results
+
+A broadcast shares bytes between tasks; a prefix shares them with the provider;
+the result cache shares *completed work* between agents. None of them stops two
+agents researching the same thing, because the result cache keys on the bytes
+going in — and research does not arrive as identical bytes:
+
+- **One question, three wordings.** Two desks wanting the same company's revenue
+  write two query strings. Same subject, two cache keys.
+- **Same instant, no prior.** Agents launched together all miss a cold key at
+  once, all call out, and all write the same entry. Concurrency is precisely
+  what defeats a write-then-read cache.
+- **Enough, not identical.** A finding gathered for one purpose often carries
+  four of the five fields another agent needs — worth zero to an all-or-nothing
+  cache.
+
+`loom.WithFindings` puts a **gate** in front of the tools that reach public
+sources. It keys on the question rather than on the bytes:
+
+```go
+fleet, _ := loom.NewFleet(
+    loom.WithMCPServer(web),
+    loom.WithFindings(findings.Config{
+        Gate: []string{"mcp/web/search"},                 // ← the public source
+        Policy: findings.Policy{
+            Topics: map[string]findings.TopicPolicy{
+                "mcp/web/search": {Volatility: findings.Slow},
+            },
+        },
+    }),
+)
+```
+
+Nothing in the pipeline changes — the stage declares the tool it always
+declared, and whether the call reaches the source or the ledger is decided
+beneath it. `examples/commons` runs four analyst desks over six companies, each
+desk asking in its own phrasing, and prints the same fleet both ways:
+
+```
+                           no commons   with commons
+calls to the source                24              6
+wall clock                      415ms          171ms
+spent at the source           $0.0960        $0.0240
+
+findings  24 asked · 18 reused (75%) · 6 researched
+  exact 0 · class 12 · near 0 · coalesced 6 · topped-up 0
+  avoided $0.0720 and 2.198s of research, spent $0.0240
+  gate overhead 1.122ms total, 47µs per question
+```
+
+No embedder was configured for that run: every reuse came from the free tiers —
+a topic-and-facets index, and a single-flight lease that collapses simultaneous
+askers onto one call. The gate costs about 1/2500 of the call it decides about,
+which is the argument for gating every task rather than the ones somebody
+guessed would collide.
+
+Four properties make writing to a shared ledger *from inside a task* safe in
+front of a content-addressed cache:
+
+- **A hit is substitutable for the call it replaces.** The example asserts it:
+  every brief is byte-identical in both runs. The ledger makes spend
+  order-dependent and answers order-independent.
+- **Entries are append-only and content-addressed.** A correction appends a
+  revision; a retraction writes a retracted head and *returns every task that
+  was served the claim*, so a withdrawn fact can find what rests on it.
+- **The knowledge hash excludes the clock**, so two agents that independently
+  learn the same thing corroborate one finding instead of filing two.
+- **The commons may save you a call you were allowed to make, never make one you
+  were not.** Every finding carries the capabilities and hosts its research
+  consumed, and a reader is served only if its own envelope holds them —
+  otherwise a shared cache is just a way around an egress allowlist.
+
+[docs/FINDINGS.md](docs/FINDINGS.md) is the design, and the literature it maps:
+semantic caching and its threshold problem, per-entry learned boundaries,
+memcache leases, negative caching, temporal invalidation, and truth maintenance.
+
 ## Calling tools: MCP servers
 
 Register the servers a run may use; declare, per stage, what it may call.
@@ -877,6 +968,22 @@ token (`loom.Explain` against hosted rates: no key, no socket, no call).
   than generate code, and the answer shape can be one declaration instead of
   three that agree until someone edits one. What it cannot express is arbitrary
   Go — which is what the Go export is for. [docs/STUDIO.md](docs/STUDIO.md).
+
+- Findings are written from *inside* a task, which the blackboard deliberately
+  forbids — and the exemption is earned rather than assumed. A blackboard post
+  changes what a later stage in the same run reads, so it cannot happen
+  mid-task. A findings hit is *substitutable* for the call it replaces, so it
+  can: the answer is the same either way and only the spend differs, which is
+  the trade worth making and the one `examples/commons` asserts rather than
+  claims. [docs/FINDINGS.md](docs/FINDINGS.md).
+- The cheapest tier of the findings gate is also the most certain, and that is
+  structural rather than lucky. Matching on topic-and-facets says two questions
+  are about one subject; matching on embedding similarity says only that they
+  look alike, so it yields candidates that must then be *checked*. The tier that
+  needs a model is therefore the last one tried, its verdicts are memoized per
+  question-and-finding pair, and it is skipped entirely when the ledger's own
+  record of what a topic costs to research says the judgement would cost more
+  than the lookup could save.
 
 The scaling path (remote worker fleets, shared object-store CAS, WASM
 sandboxes with grant-derived imports) is laid out in

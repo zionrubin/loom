@@ -248,6 +248,25 @@ exists to earn back a remote write's premium, has nothing left to weigh. See
   write can be earned back — and the prefix joins the stage fingerprint on
   the same terms a broadcast hash does. See
   [INFERENCE.md](./INFERENCE.md#shared-memory-prefix-caching).
+- **Findings** — the third layer of sharing, and the one that reaches *outside*
+  the process. A broadcast shares bytes between tasks and a prefix shares them
+  with the provider; a **finding** shares an answer about the world between
+  agents that were about to go and get it themselves. The result cache cannot
+  do this job, for three structural reasons: its key is the bytes going in, so
+  two wordings of one question are two keys; it serves the second asker only
+  after the first has finished, so agents launched together all miss and all
+  call out; and it is all-or-nothing, so a partial overlap is worth zero.
+  `findings.Gate` keys on the *question* instead — an exact key, then a
+  topic-and-facets class, then optional embedding similarity — collapses
+  concurrent askers onto one call with a single-flight lease, and narrows the
+  external request to the fields a partial hit left uncovered. Writing to it
+  from inside a task is safe in front of a content-addressed cache because a
+  hit is substitutable for the call it replaces, entries are append-only and
+  content-addressed, the knowledge hash excludes the clock (so independent
+  rediscovery corroborates rather than forks), and every finding carries the
+  capabilities its research consumed — the ledger may save a reader a call it
+  was allowed to make, never make one it was not. See
+  [FINDINGS.md](./FINDINGS.md).
 - **Lineage** — every artifact records the run, stage, op fingerprint,
   model, input hashes, and broadcast hashes that produced it: reproducibility
   and audit for outputs whose provenance would otherwise be "a model said
@@ -466,8 +485,14 @@ Still open in this phase: the inbox tree-reduce for high-degree vertices (today
 a cap, which is blunt but reported).
 
 **Also on the roadmap:**
-- **Semantic caching** — embedding-similarity lookup in front of the exact
-  cache for near-duplicate inputs.
+- **Semantic caching** — landed, but one level up rather than where this line
+  originally proposed it. Putting embedding similarity in front of the *result*
+  cache would have matched near-duplicate task inputs; what actually duplicates
+  between concurrent agents is external *research*, and the reuse worth having
+  is keyed on the question rather than on the record. `findings` is that
+  (§4.7), and its embedding tier is the optional refinement rather than the
+  mechanism — the free structural tiers answer most of it. Still open there:
+  vCache-style calibrated error rates, bi-temporal validity, and eviction.
 - **Ensemble/quorum operators** — N samples + vote or judge as a native op
   (today expressible as FlatMap → Infer → Combine).
 - **Data-access capabilities** — `data:read:<name>` exists today for
@@ -489,13 +514,21 @@ batched) execution alongside the barrier driver, pre-flight cost projection
 (`loom.Explain`), event bus + run reports, tree AI-reduce, iterative execution
 with a pluggable algorithm seam (`pipeline.Iterate` + `algo`, with BSP, refine
 and beam algorithms, quiescence detection, three-way halting, fan-out caps,
-open-world growth, per-round projection and round events), mock, Anthropic,
+open-world growth, per-round projection and round events), the shared research
+layer (`findings`: question-keyed lookup over three tiers, a sufficiency ladder
+with memoized adjudication under a break-even rule, single-flight leases over
+subjects, negative results, per-topic volatility horizons, append-only revision
+and retraction with dependent reporting, and capability containment), mock,
+Anthropic,
 OpenAI, and llama.cpp providers (the last with device-width admission control,
 loopback egress, no-credential envelopes, and KV-cache prefix reuse), and
 cross-restart cache resume.
 
 Designed but not yet implemented: remote executor backends, shared state
-stores, subprocess/container/WASM sandbox runtimes, semantic cache, ensemble
-operators, priority/preemptive scheduling, result-cache eviction, and the inbox
-tree-reduce for high-degree vertices. The interfaces above are the contract
+stores, subprocess/container/WASM sandbox runtimes, ensemble operators,
+priority/preemptive scheduling, result-cache eviction, a single-flight lease on
+the *result* cache (the findings gate has one; the result cache does not, so
+concurrent identical tasks still both run — see `examples/commons`), findings
+eviction and bi-temporal validity, and the inbox tree-reduce for high-degree
+vertices. The interfaces above are the contract
 those implementations plug into.
