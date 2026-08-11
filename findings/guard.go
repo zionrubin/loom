@@ -45,6 +45,16 @@ type GuardSpec struct {
 	// fields a caller of this tool always requires. It is what turns coverage
 	// from a formality into a real test, and what makes topping up possible.
 	Needs []string
+
+	// CostUSD is what one call to this source costs, when it costs money.
+	//
+	// A tool call spends no tokens, so without this the layer's dollar
+	// accounting reads zero for a metered search API that bills per query — and
+	// a saving reported as zero is a saving nobody will believe. Latency is
+	// measured either way; this is the part only the operator knows. It also
+	// feeds the gate's break-even rule, which needs to know what the research
+	// it is deciding about is worth.
+	CostUSD float64
 }
 
 // Guard wraps a tool so every call passes the shared research layer first.
@@ -216,8 +226,13 @@ func (w *guarded) harvest(q Question, out any) Result {
 
 // attribute stamps the calling tool and its host onto a result's provenance, so
 // containment is derived from what actually happened rather than from what a
-// harvester remembered to declare.
+// harvester remembered to declare, and prices the call when the spec says what
+// one costs.
 func (w *guarded) attribute(res *Result) {
+	if w.spec.CostUSD > 0 && res.Cost.CostUSD == 0 {
+		res.Cost.CostUSD = w.spec.CostUSD
+		res.Cost.Requests++
+	}
 	host := ""
 	if nt, ok := w.tool.(executor.NetworkTool); ok {
 		host = nt.Endpoint()

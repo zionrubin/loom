@@ -26,11 +26,11 @@ import (
 // independent agents have since reached the same conclusion, and where this
 // entry's own near-match boundary currently sits.
 type Entry struct {
-	Seq     int      `json:"seq"`
-	Hash    string   `json:"hash"`
-	Finding Finding  `json:"finding"`
-	Key     string   `json:"key"`   // the question key it was learned under
-	Class   string   `json:"class"` // topic + facets: the subject it is about
+	Seq     int     `json:"seq"`
+	Hash    string  `json:"hash"`
+	Finding Finding `json:"finding"`
+	Key     string  `json:"key"`   // the question key it was learned under
+	Class   string  `json:"class"` // topic + facets: the subject it is about
 	// Knowledge is the hash of the claim alone. Entries sharing one are the
 	// same conclusion reached independently; entries in one class with
 	// different ones are a contradiction the ledger can see.
