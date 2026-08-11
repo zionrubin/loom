@@ -14,6 +14,7 @@ import (
 
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
+	"github.com/zionrubin/loom/findings"
 	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
@@ -259,6 +260,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 		{probe.MCPResources != nil, "WithMCPResource"},
 		{probe.Broadcasts != nil, "WithBroadcast"},
 		{probe.Topics != nil, "WithTopic"},
+		{probe.Findings != nil, "WithFindings (a fleet shares one commons)"},
 		{probe.EventHandler != nil, "WithEventHandler"},
 	}
 	for _, s := range shared {
@@ -278,6 +280,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 	cfg.Secrets, cfg.StateDir = f.cfg.Secrets, f.cfg.StateDir
 	cfg.Tools, cfg.Broadcasts, cfg.Topics = f.cfg.Tools, f.cfg.Broadcasts, f.cfg.Topics
 	cfg.MCPServers, cfg.MCPResources = f.cfg.MCPServers, f.cfg.MCPResources
+	cfg.Findings = f.cfg.Findings
 	cfg.EventHandler = f.cfg.EventHandler
 	return cfg, nil
 }
@@ -433,6 +436,20 @@ func postDetail(p Post) string {
 	return string(blob)
 }
 
+// Findings returns the fleet's shared research gate, or nil when none was
+// configured. It is the handle for the operations that belong to the commons
+// rather than to any agent: retracting a claim that turned out to be wrong, and
+// asking what rested on it.
+func (f *Fleet) Findings() *findings.Gate { return f.commons }
+
+// commonsTopics summarizes the ledger, or nil when there is none.
+func (h *host) commonsTopics() []findings.TopicStat {
+	if h.ledger == nil {
+		return nil
+	}
+	return h.ledger.Topics()
+}
+
 // Explain projects what an agent would cost on this fleet without making a
 // call, with the board's current snapshots in scope — so a stage that reads a
 // topic is priced against the bytes it would actually read.
@@ -483,6 +500,13 @@ type FleetReport struct {
 	// MCP is the fleet's connection accounting — one row per server, shared by
 	// every agent, which is the point of holding them here.
 	MCP []mcp.Stats
+	// Findings is what the shared research layer did across the whole fleet:
+	// how many questions were answered from what another agent already learned,
+	// what that avoided, and what the gate itself cost to run.
+	Findings findings.Stats
+	// Commons summarizes the ledger by topic — what the fleet now knows, as
+	// distinct from what it saved by knowing it.
+	Commons []findings.TopicStat
 }
 
 // Duration is the fleet's wall-clock span.
@@ -526,6 +550,7 @@ func (f *Fleet) Report() FleetReport {
 		Slots: f.pool.Slots(), Started: started, Pool: stats,
 		Spent: f.gov.Spent(), Budget: f.cfg.RunBudget,
 		Topics: topics, Posts: posts, MCP: f.mcpStats(),
+		Findings: f.findingsStats(), Commons: f.commonsTopics(),
 	}
 	for _, a := range agents {
 		ar := AgentReport{Name: a.Name, RunID: a.RunID}
@@ -602,6 +627,22 @@ func (r FleetReport) String() string {
 	if r.Topics > 0 {
 		fmt.Fprintf(&b, "blackboard: %d topic(s), %d post(s), read by reference\n", r.Topics, r.Posts)
 	}
+	if r.Findings.Asked > 0 {
+		b.WriteString(r.Findings.String())
+		for _, t := range r.Commons {
+			fmt.Fprintf(&b, "  %-24s %d live", clip(t.Topic, 24), t.Live)
+			if t.Negative > 0 {
+				fmt.Fprintf(&b, " (%d negative)", t.Negative)
+			}
+			if t.Corroborations > 0 {
+				fmt.Fprintf(&b, " · %d corroboration(s)", t.Corroborations)
+			}
+			if t.Retracted > 0 {
+				fmt.Fprintf(&b, " · %d retracted", t.Retracted)
+			}
+			b.WriteByte('\n')
+		}
+	}
 	for _, m := range r.MCP {
 		fmt.Fprintf(&b, "mcp %s: %d session(s) shared by every agent, %d call(s)",
 			m.Server, m.Sessions, m.Calls)
@@ -659,6 +700,12 @@ type host struct {
 	// on this host shares one set of them and one bound on their use.
 	mcp      *mcp.Catalog
 	manifest mcp.Manifest
+	// commons is the shared research layer, held here for the same reason the
+	// cache is: what an agent has already learned about the world is a property
+	// of the work, not of the pipeline that learned it. Nil when no findings
+	// config was given, which leaves every tool exactly as it was.
+	commons *findings.Gate
+	ledger  *findings.Ledger
 
 	mu     sync.Mutex
 	traces map[string]*agentTrace
@@ -744,6 +791,16 @@ func newHost(cfg Config) (*host, error) {
 	// manifest a plan is compiled against, and any resource registered as a
 	// broadcast.
 	if err := h.connectMCP(); err != nil {
+		_ = cache.Close()
+		return nil, err
+	}
+
+	// The research gate is provisioned after the MCP tools exist, because the
+	// tools it stands in front of are usually theirs — and before anything
+	// runs, because a tool that were gated halfway through a run would produce
+	// a fleet whose savings depended on when the wrapping happened.
+	if err := h.provisionFindings(); err != nil {
+		_ = h.closeMCP()
 		_ = cache.Close()
 		return nil, err
 	}
@@ -838,11 +895,65 @@ func (h *host) readMCPResources() error {
 	return nil
 }
 
+// provisionFindings opens the host's ledger and wraps the tools the config
+// named, so a call to one of them passes the commons before it reaches a
+// public source.
+//
+// Wrapping the registered tool rather than adding a new one is what makes this
+// a gate: the stage still declares the tool it always declared, the planner
+// still grants exactly that name, and the executor still checks the capability
+// and the egress allowlist before the guard is reached. Nothing about the
+// pipeline says the commons exists, which is the property that lets it be
+// turned on for an existing fleet.
+func (h *host) provisionFindings() error {
+	cfg := h.cfg.Findings
+	if cfg == nil || !cfg.Enabled() {
+		return nil
+	}
+	// The ledger persists beside the result cache, under the same state dir and
+	// for the same reason: an append-only log whose durable form is its log.
+	ledger, err := findings.NewLedger(h.cas, h.cfg.StateDir)
+	if err != nil {
+		return fmt.Errorf("findings: %w", err)
+	}
+	gate := findings.NewGate(ledger, cfg.Policy)
+	gate.Bus = h.bus
+	h.ledger, h.commons = ledger, gate
+
+	for _, name := range cfg.Gate {
+		tool, ok := h.tools.Get(name)
+		if !ok {
+			_ = ledger.Close()
+			return fmt.Errorf("findings: tool %q is not registered "+
+				"(loom.WithTools, or an MCP server's \"mcp/<server>/<tool>\")", name)
+		}
+		h.tools.Add(findings.Guard(gate, tool, cfg.Specs[name]))
+	}
+	if cfg.Recall {
+		h.tools.Add(findings.Recall(gate))
+	}
+	return nil
+}
+
 func (h *host) closeMCP() error {
 	if h.mcp == nil {
 		return nil
 	}
 	return h.mcp.Close()
+}
+
+// findingsStats reports what the shared research layer did, or the zero value
+// when none was configured.
+//
+// It is host-wide rather than per-agent, deliberately. A finding one agent
+// learned and three others reused belongs to the fleet; attributing the saving
+// to any one of them would be picking an owner for something whose whole point
+// is that it has none.
+func (h *host) findingsStats() findings.Stats {
+	if h.commons == nil {
+		return findings.Stats{}
+	}
+	return h.commons.Stats()
 }
 
 // mcpStats reports the host's connection accounting, or nil when no servers
@@ -855,7 +966,11 @@ func (h *host) mcpStats() []mcp.Stats {
 }
 
 func (h *host) close() error {
-	err := errors.Join(h.closeMCP(), h.cache.Close())
+	var ledger error
+	if h.ledger != nil {
+		ledger = h.ledger.Close()
+	}
+	err := errors.Join(h.closeMCP(), h.cache.Close(), ledger)
 	h.bus.Close()
 	return err
 }
@@ -969,6 +1084,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		Audit:        auditOf(h.audit.Entries(), tr),
 		Broadcasts:   snapshot,
 		MCP:          h.mcpStats(),
+		Findings:     h.findingsStats(),
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {

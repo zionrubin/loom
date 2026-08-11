@@ -92,6 +92,7 @@ failures.
 | **One quota across concurrent programs** | Two runs in a process each believe they own the provider's whole limit | One `runtime.RateLimiter` per fleet, borrowed by every agent | ✅ `fleet.go` |
 | **One ceiling across concurrent programs** | A budget enforced per pipeline is a budget multiplied by pipelines | One `runtime.Governor` per fleet (`WithFleetBudget`) | ✅ `fleet.go` |
 | **Cross-program cache reuse** | Programs redo work a sibling already paid for | One CAS and result cache per fleet: an agent replays another agent's completed work at zero cost | ✅ `fleet.go` |
+| **Cross-program *research* reuse** | The result cache is blind to the duplication that costs most: one question in three wordings, asked at the same instant | `findings.Gate` keys on the question rather than the bytes, and a single-flight lease collapses concurrent askers onto one call | ✅ `findings`, [FINDINGS.md](./FINDINGS.md) |
 | **Append-only session log** (Anthropic) | State that survives a crashed harness | Loom's equivalent already existed for a different reason: the content-addressed result cache *is* the checkpoint, and lineage is the append-only record | ✅ `store` |
 | **Inter-agent state** (blackboard architectures) | Coordination breakdown — the largest single MAST failure class | Append-only, versioned, content-addressed topics: `Fleet.Post` / `Await`, read through the broadcast mechanism so grants, audit and cache fingerprints all apply unchanged | ✅ `fleet.go` |
 | **KV-cache TTL across tool pauses** (Continuum) | A paused program pays to rebuild its prefix | No analog — Loom does not own a KV cache. The remote-provider equivalent is the provider's own prefix-cache TTL, which Loom cannot pin | n/a |
@@ -277,6 +278,22 @@ but do not fan back in, so a fan-out and the synthesis that fuses its results
 are two runs.* They still are. But the second run can now read what the first
 ones concluded, with a content hash pinning what it read.
 
+### What the blackboard does not do
+
+It shares what an agent concluded *after it finished*. It does nothing for the
+case that costs more and happens more: two agents running right now, both about
+to research the same thing.
+
+That case needs a different instrument, because the sharing has to happen inside
+a task rather than at an agent boundary, and it has to be keyed on the *question*
+rather than on a topic name someone chose in advance. `findings.Gate` is that
+instrument — the commons — and [FINDINGS.md](./FINDINGS.md) is its design: three
+lookup tiers ordered so the free ones answer most of it, a single-flight lease so
+simultaneous askers become one call, and four properties that make writing from
+inside a task safe in front of a content-addressed cache. The two are
+complements: a topic is where an agent publishes a conclusion it reached, and a
+finding is where it deposits a fact it had to go and buy.
+
 ### Why agents post between tasks and not inside them
 
 A task cannot post. That is a restriction, and it is the same restriction
@@ -333,7 +350,14 @@ table that becomes urgent.
 **No cache eviction, still.** The fleet's result cache is unbounded, which was
 merely wrong for a long-lived worker fleet and is now wrong for a long-lived
 *fleet*, which is a thing that exists. An LRU over content-addressed blocks
-remains the obvious answer.
+remains the obvious answer, and it now applies to the findings ledger too.
+
+**No single-flight on the result cache.** The findings gate has a lease, so
+concurrent askers of one question become one call. The result cache does not, so
+concurrent *identical tasks* both run and both write. This was invisible while
+stage latency spread tasks out; `examples/commons` makes it visible by removing
+the latency that was hiding it, and reports the regression rather than only the
+column that improved.
 
 ---
 
