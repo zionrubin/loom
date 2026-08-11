@@ -452,7 +452,7 @@ func (g *Gate) admit(ctx context.Context, req Request, tp TopicPolicy,
 	if gap := f.Gap(req.Question.Needs); len(gap) > 0 {
 		return insufficient("does not cover "+strings.Join(gap, ", "), gap...)
 	}
-	if support := max(len(f.Sources), 1) + e.Corroborations; support < tp.MinSources {
+	if support := g.Ledger.Support(e); support < tp.MinSources {
 		return insufficient(fmt.Sprintf("support %d < %d", support, tp.MinSources))
 	}
 	if tp.MinConfidence > 0 && f.Confidence < tp.MinConfidence {
@@ -534,7 +534,7 @@ func (g *Gate) near(ctx context.Context, q Question, class []*Entry) []candidate
 	out := make([]candidate, 0, len(withVectors))
 	for _, e := range withVectors {
 		sim := cosine(vecs[0], e.Vector)
-		if sim >= e.Threshold {
+		if sim >= g.Ledger.Threshold(e) {
 			out = append(out, candidate{entry: e, similarity: sim})
 		}
 	}
@@ -603,7 +603,10 @@ func (g *Gate) acquire(ctx context.Context, req Request, ask Question,
 	// research the ledger was already holding. One extra map lookup on the miss
 	// path is a cheap price for a saving otherwise lost to a race rather than to
 	// a decision.
-	if ans, ok := g.consult(ctx, req, tp, false); ok {
+	recheck := time.Now()
+	ans, ok := g.consult(ctx, req, tp, false)
+	g.charge(recheck) // the double check is gate overhead and is reported as such
+	if ok {
 		g.retire(key, fl, nil)
 		return ans, true, nil
 	}
@@ -625,11 +628,19 @@ func (g *Gate) lead(ctx context.Context, req Request, ask Question,
 		}
 		return Answer{}, false, err
 	}
+	// A contribution that fails to land is not a research failure. The answer
+	// in hand is correct and paid for; all that is lost is the next agent's
+	// chance to reuse it, which is counted as Unrecorded rather than raised.
+	// The result cache makes the same call for the same reason — a cache that
+	// can fail the work it was meant to accelerate is worse than no cache.
 	ans, err := g.Contribute(ctx, req, ask, res)
+	if err != nil {
+		g.count(func(s *Stats) { s.Unrecorded++ })
+	}
 	if fl != nil {
 		g.retire(key, fl, nil)
 	}
-	return ans, false, err
+	return ans, false, nil
 }
 
 // retire removes a flight and releases everyone waiting on it. The flight is
@@ -880,10 +891,11 @@ type Stats struct {
 	Fresh    int // researched here
 	Bypassed int // Live topics, never consulted
 
-	Denied    int // capability containment refused a reader
-	Stale     int // a candidate was past its topic's horizon
-	Judged    int // adjudications actually paid for
-	Overtaken int // a follower gave up waiting and researched it itself
+	Denied     int // capability containment refused a reader
+	Stale      int // a candidate was past its topic's horizon
+	Judged     int // adjudications actually paid for
+	Overtaken  int // a follower gave up waiting and researched it itself
+	Unrecorded int // research succeeded but the ledger would not take it
 
 	// Avoided is research this layer did not have to buy; Spent is what it did.
 	// AvoidedTime is the wall clock the reused research originally took, which
@@ -963,6 +975,9 @@ func (s Stats) String() string {
 	}
 	if s.Overtaken > 0 {
 		fmt.Fprintf(&b, " · %d overtaken", s.Overtaken)
+	}
+	if s.Unrecorded > 0 {
+		fmt.Fprintf(&b, " · %d unrecorded", s.Unrecorded)
 	}
 	b.WriteByte('\n')
 	fmt.Fprintf(&b, "  avoided $%.4f and %s of research, spent $%.4f\n",

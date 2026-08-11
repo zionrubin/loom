@@ -901,6 +901,55 @@ func TestBreakEvenDeclinesToJudgeCheapResearch(t *testing.T) {
 	}
 }
 
+// A fleet has readers walking the class index while other agents' contributions
+// are incrementing corroboration counts and adjudications are moving near-match
+// boundaries on the very same entries. Run under -race, this is the test that
+// says those mutable fields are read through the lock that guards them.
+func TestConcurrentReadersAndWritersOnLiveEntries(t *testing.T) {
+	emb := bagOfWords{vocab: []string{"revenue", "headcount", "northwind", "annual", "quarterly", "staff"}}
+	g := newGate(t, Policy{
+		Embedder: emb,
+		Judge: func(context.Context, Question, Finding) (bool, error) {
+			return true, nil
+		},
+		JudgeCostUSD: 0.000001,
+		Topics: map[string]TopicPolicy{
+			"web": {Near: 0.4, Adjudicate: true, MinSources: 2},
+		},
+	})
+	ctx := context.Background()
+	fetch := counted(webResult("Annual revenue $4.2bn", map[string]any{"revenue": "4.2bn"}), new(int32))
+
+	texts := []string{
+		"northwind annual revenue", "annual revenue northwind",
+		"northwind quarterly revenue", "northwind staff headcount",
+		"headcount northwind annual",
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			q := Question{Topic: "web", Text: texts[i%len(texts)]}
+			req := openRequest(q)
+			req.RunID = fmt.Sprintf("run_%d", i)
+			req.TaskID = fmt.Sprintf("task_%d", i)
+			if _, err := g.Research(ctx, req, fetch); err != nil {
+				t.Errorf("asker %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if s := g.Stats(); s.Asked != 40 {
+		t.Fatalf("asked = %d, want 40", s.Asked)
+	}
+	if g.Ledger.Len() == 0 {
+		t.Fatalf("nothing was learned")
+	}
+}
+
 // --- persistence --------------------------------------------------------
 
 func TestLedgerSurvivesRestart(t *testing.T) {

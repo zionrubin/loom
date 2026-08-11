@@ -68,6 +68,31 @@ type Entry struct {
 // superseded by a later revision of the same claim.
 func (e *Entry) Live() bool { return !e.Finding.Retracted }
 
+// Support and Threshold are the two fields of an entry that change after it is
+// indexed — corroboration as agents rediscover a claim, and the near-match
+// boundary as adjudications move it — so both are read through the ledger's
+// lock rather than off the struct.
+//
+// Everything else about an entry is written once, before it is reachable from
+// any index, and can be read directly. These two cannot: a fleet has readers
+// walking the class index while another agent's contribution is incrementing a
+// corroboration count on an entry in it.
+
+// Support is how many independent sources stand behind an entry: its own,
+// plus every later agent that reached the same conclusion.
+func (l *Ledger) Support(e *Entry) int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return max(len(e.Finding.Sources), 1) + e.Corroborations
+}
+
+// Threshold is the entry's current near-match boundary.
+func (l *Ledger) Threshold(e *Entry) float64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return e.Threshold
+}
+
 // Age is how long ago the entry was learned, against the given clock.
 func (e *Entry) Age(now time.Time) time.Duration { return now.Sub(e.Learned) }
 
