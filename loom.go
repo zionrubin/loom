@@ -205,6 +205,28 @@ func WithBroadcast(name string, value any) Option {
 // was not allowed to do itself, and every serve is recorded against the finding
 // so a retraction can say what rested on it.
 //
+// # Sharing it between executors
+//
+// By default the commons is this process's: one fleet, one ledger, no network
+// on any path. Setting findings.Config.Shared connects it to a backend every
+// executor reads and writes, so what one machine learns another can be served —
+// and so executors that miss the same question at the same instant produce one
+// external call between them rather than one each.
+//
+//	backend, err := pgstore.Open(ctx, dsn, pgstore.Options{Dimensions: 1536})
+//	loom.WithFindings(findings.Config{
+//	    Gate:   []string{"mcp/web/search"},
+//	    Shared: findings.NewShared(findings.SharedConfig{Backend: backend}),
+//	})
+//
+// It adds a rung to the ladder rather than replacing one: the in-process ledger
+// is still consulted first and still answers without I/O, the backend is
+// reached only when it had nothing, and what comes back is checked by the same
+// sufficiency rules as a local finding — including the capability and egress
+// containment, which a shared store makes more important rather than less. An
+// unavailable backend degrades to ordinary research unless strict mode is
+// configured.
+//
 // See the findings package and docs/FINDINGS.md for the design.
 func WithFindings(cfg findings.Config) Option {
 	return func(c *Config) { c.Findings = &cfg }

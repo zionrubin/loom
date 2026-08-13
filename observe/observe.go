@@ -58,8 +58,15 @@ const (
 	// FindingCoalesced reports a duplicate question collapsing into a call
 	// another task already had in flight — the saving a result cache cannot
 	// make, because it serves the second asker only after the first has
-	// finished, and these two asked at the same moment.
+	// finished, and these two asked at the same moment. Note distinguishes the
+	// two scopes it can happen in: "coalesced" is two agents in this process,
+	// "remote-coalesced" is two executors on different machines.
 	FindingCoalesced EventType = "finding.coalesced"
+	// FindingPublished reports a finding written to the shared backend, where
+	// executors this process knows nothing about can be served it. It is the
+	// counterpart of FindingLearned one layer out: learned says this process
+	// paid for the research, published says the fleet now holds it.
+	FindingPublished EventType = "finding.published"
 	// StageProjected and RunProjected carry a pre-flight cost projection
 	// (loom.Explain): what a stage and a whole pipeline are expected to spend,
 	// published before anything is spent. They are the only events on this bus

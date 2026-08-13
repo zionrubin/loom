@@ -267,6 +267,13 @@ func render(ans Answer) map[string]any {
 	if ans.Reused() {
 		prov["age"] = ans.Age.Round(time.Second).String()
 	}
+	// Whose research this is, when it is not this executor's. An agent standing
+	// on another machine's work should be able to see that that is what it is —
+	// and a reader of the trace should be able to tell a fleet that shares from
+	// one that merely repeats itself quietly.
+	if ans.Executor != "" {
+		prov["executor"] = ans.Executor
+	}
 	if len(ans.Sources) > 0 {
 		uris := make([]string, 0, len(ans.Sources))
 		for _, s := range ans.Sources {

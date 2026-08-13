@@ -37,6 +37,23 @@ type Entry struct {
 	Knowledge string    `json:"knowledge"`
 	Learned   time.Time `json:"learned"`
 	Learner   string    `json:"learner,omitempty"` // the run that contributed it
+	// Executor names the process that learned it. On a single-process fleet it
+	// is noise; across executors it is what makes a report able to say that a
+	// finding this machine served was researched by another one, which is the
+	// whole claim the distributed layer makes.
+	Executor string `json:"executor,omitempty"`
+
+	// Remote marks an entry copied out of the shared backend rather than
+	// learned here, and Adopted when the copy was taken.
+	//
+	// The pair is what bounds cross-executor staleness. A copy cannot be
+	// reached by a retraction on the executor that owns the claim, so it is
+	// trusted for SharedConfig.Refresh and then re-consulted — the local hit
+	// misses, L2 answers with whatever the commons now holds, and the copy is
+	// refreshed or replaced. Locally learned entries carry neither field and
+	// are unaffected.
+	Remote  bool      `json:"remote,omitempty"`
+	Adopted time.Time `json:"adopted,omitempty"`
 
 	// Corroborations counts the independent rediscoveries of this claim. It
 	// costs nothing to maintain — an agent that re-learns something the ledger
@@ -129,6 +146,7 @@ type Ledger struct {
 	byClass     map[string][]*Entry
 	byID        map[string][]*Entry
 	byKnowledge map[string][]*Entry
+	byHash      map[string]*Entry
 	heads       map[string]*Entry
 	deps        map[string][]Dependent
 	verdicts    map[string]bool
@@ -152,6 +170,7 @@ func NewLedger(cas *store.CAS, dir string) (*Ledger, error) {
 		byClass:     map[string][]*Entry{},
 		byID:        map[string][]*Entry{},
 		byKnowledge: map[string][]*Entry{},
+		byHash:      map[string]*Entry{},
 		heads:       map[string]*Entry{},
 		deps:        map[string][]Dependent{},
 		verdicts:    map[string]bool{},
@@ -265,10 +284,103 @@ func (l *Ledger) Append(in Entry) (*Entry, error) {
 	return e, nil
 }
 
+// Adopt copies an entry out of the shared backend into this process's ledger,
+// reporting whether it was new here.
+//
+// It is Append's sibling for findings that arrive rather than happen, and the
+// differences are all in what it must *not* do. It does not corroborate: a copy
+// of a claim is not an independent rediscovery of it, and counting it as one
+// would let a finding bootstrap its own support by being read. It does not
+// re-derive identity: the shared entry's hash, ID and revision are the ones
+// every executor already agrees on. And it does not overwrite a claim's local
+// history — a hash the ledger already holds is refreshed in place, so a task
+// holding a pointer to it sees the newer corroboration count rather than a
+// second copy of its own entry.
+//
+// The hash is checked against the bytes. A shared store is another process's
+// memory reached over a socket, and content addressing is only worth anything
+// if somebody verifies the address; a mismatch means the entry did not survive
+// the round trip intact, and it is refused rather than indexed under a name it
+// does not have.
+func (l *Ledger) Adopt(e Entry, now time.Time) (*Entry, bool, error) {
+	if e.Hash == "" {
+		return nil, false, fmt.Errorf("findings: a shared entry must carry its hash")
+	}
+	if got := e.Finding.Hash(); got != e.Hash {
+		return nil, false, fmt.Errorf("findings: shared entry %s does not hash to its bytes (%s)", e.Hash, got)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if held, ok := l.byHash[e.Hash]; ok {
+		// Refresh the parts that are about the recording rather than the claim.
+		// Corroboration only ever rises: another executor's count includes
+		// rediscoveries this one has not seen, and this one's includes
+		// rediscoveries it has not yet published.
+		held.Corroborations = max(held.Corroborations, e.Corroborations)
+		if e.Threshold > 0 {
+			held.Threshold = e.Threshold
+		}
+		if len(held.Vector) == 0 {
+			held.Vector = e.Vector
+		}
+		if held.Remote {
+			held.Adopted = now
+		}
+		return held, false, nil
+	}
+
+	blob, err := json.Marshal(e.Finding.canonical())
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := l.cas.Put(blob); err != nil {
+		return nil, false, err
+	}
+
+	adopted := e
+	adopted.Remote, adopted.Adopted = true, now
+	l.index(&adopted)
+	l.creditLocked(adopted.Finding)
+	l.persistLocked(&adopted)
+	return &adopted, true, nil
+}
+
+// SeedVerdict installs an adjudication decided elsewhere, without moving the
+// entry's own threshold — the executor that made the call already moved it, and
+// the value came across with the entry.
+func (l *Ledger) SeedVerdict(qKey, hash string, ok bool) {
+	if qKey == "" || hash == "" {
+		return
+	}
+	l.mu.Lock()
+	l.verdicts[qKey+"|"+hash] = ok
+	l.mu.Unlock()
+}
+
+// Revisions returns every recorded revision of a claim, oldest first.
+func (l *Ledger) Revisions(id string) []*Entry {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return append([]*Entry(nil), l.byID[id]...)
+}
+
+// Entry returns the entry holding a content hash, if this ledger holds it.
+func (l *Ledger) Entry(hash string) (*Entry, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	e, ok := l.byHash[hash]
+	return e, ok
+}
+
 // index wires an entry into every lookup structure. Callers hold the lock.
 func (l *Ledger) index(e *Entry) {
 	e.Seq = len(l.entries)
 	l.entries = append(l.entries, e)
+	if e.Hash != "" {
+		l.byHash[e.Hash] = e
+	}
 	if e.Key != "" {
 		l.byKey[e.Key] = append(l.byKey[e.Key], e)
 	}

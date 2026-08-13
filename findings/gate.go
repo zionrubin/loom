@@ -93,7 +93,28 @@ const (
 	OriginCoalesced Origin = "coalesced" // another task was already fetching this
 	OriginFresh     Origin = "fresh"     // researched here
 	OriginBypass    Origin = "bypass"    // a Live topic: never consulted, never stored
+
+	// The same four reuse classes, reached through the shared backend rather
+	// than this process's ledger. They are separate origins rather than a flag
+	// because the distinction is the one a report exists to make: a local hit
+	// says this process had already asked, and a remote hit says *another
+	// executor* had — which is a call avoided that nothing in this process
+	// could have avoided.
+	OriginRemoteExact     Origin = "remote-exact"
+	OriginRemoteClass     Origin = "remote-class"
+	OriginRemoteNear      Origin = "remote-near"
+	OriginRemoteCoalesced Origin = "remote-coalesced" // waited behind another executor
 )
+
+// Remote reports whether an answer came from the shared backend rather than
+// from this executor's own ledger.
+func (o Origin) Remote() bool {
+	switch o {
+	case OriginRemoteExact, OriginRemoteClass, OriginRemoteNear, OriginRemoteCoalesced:
+		return true
+	}
+	return false
+}
 
 // Answer is what the gate returns.
 type Answer struct {
@@ -113,6 +134,10 @@ type Answer struct {
 	// score that admitted a near match (0 for exact and class hits).
 	Age        time.Duration
 	Similarity float64
+	// Executor names the process that learned the served finding, when it was
+	// not this one. It is what lets an agent — or a log line — say whose
+	// research it is standing on.
+	Executor string
 	// Gap is what the served finding did not cover, when the caller chose to
 	// accept a partial answer rather than top it up.
 	Gap []string
@@ -127,13 +152,14 @@ type Answer struct {
 }
 
 // Reused reports whether the answer came from the commons rather than from a
-// public source.
+// public source — this executor's ledger or another's, which are the same
+// saving from the caller's side.
 func (a Answer) Reused() bool {
 	switch a.Origin {
 	case OriginExact, OriginClass, OriginNear, OriginCoalesced:
 		return true
 	}
-	return false
+	return a.Origin.Remote()
 }
 
 // Gate is the single entrance to external research: every agent consults it
@@ -148,6 +174,18 @@ type Gate struct {
 	Policy Policy
 	Bus    *observe.Bus
 
+	// Shared connects this gate to the other executors through a distributed
+	// backend. Nil is the original layer, unchanged: one process, one ledger,
+	// no network on any path.
+	//
+	// When it is set the ladder grows a rung — L1 the ledger, L2 the backend,
+	// then the source — and the single-flight lease grows a second scope, so
+	// the deduplication that already worked between agents works between
+	// machines. Everything else is the same code: a shared candidate is
+	// adopted into the ledger and then admitted, or not, by the same
+	// sufficiency ladder as a local one.
+	Shared *Shared
+
 	mu      sync.Mutex
 	flights map[string]*flight
 	stats   Stats
@@ -157,6 +195,21 @@ type Gate struct {
 func NewGate(l *Ledger, p Policy) *Gate {
 	return &Gate{Ledger: l, Policy: p, flights: map[string]*flight{}}
 }
+
+// Share connects a gate to a distributed backend and returns it, so a gate can
+// be built and shared in one expression.
+func (g *Gate) Share(s *Shared) *Gate {
+	g.Shared = s
+	return g
+}
+
+// Close releases the gate's connection to the shared backend. The ledger is
+// the caller's to close: a gate does not own it, and on a fleet the host that
+// opened it closes it.
+func (g *Gate) Close() error { return g.Shared.Close() }
+
+// executor names this process in the commons, or "" when nothing is shared.
+func (g *Gate) executor() string { return g.Shared.Executor() }
 
 // flight is one in-progress piece of research that later askers wait on
 // instead of repeating.
@@ -213,14 +266,20 @@ func flightKey(q Question) string {
 // The path through it is a ladder that stops at the first rung that answers:
 //
 //  1. a Live topic bypasses the gate entirely — declared, counted, never stored;
-//  2. exact, class, and near lookup, each candidate checked for sufficiency;
-//  3. a partial hit narrows the question to the gap it left;
-//  4. a miss takes the single-flight lease, or waits behind whoever holds it;
-//  5. what comes back is contributed, so the next asker stops at rung 2.
+//  2. exact, class, and near lookup over this process's ledger — L1;
+//  3. the same three tiers over the shared backend, when one is configured —
+//     L2, reached only on an L1 miss, and its candidates checked by the same
+//     ladder before any of them is served;
+//  4. a partial hit narrows the question to the gap it left;
+//  5. a miss takes the single-flight lease — local, and distributed when a
+//     backend is configured — or waits behind whoever holds it;
+//  6. what comes back is contributed to both layers, so the next asker on any
+//     executor stops at rung 2 or 3.
 //
-// Everything before rung 4 is map lookups and, at most, one memoized model call
-// per (question, finding) pair — so the common path adds microseconds to a task
-// that was about to spend a network round trip and a model call.
+// Rung 2 is map lookups and, at most, one memoized model call per (question,
+// finding) pair: no I/O at all, which is what lets the gate stand in front of
+// every task rather than the ones a human guessed would collide. Rung 3 is one
+// round trip, paid only when the alternative was an external call.
 func (g *Gate) Research(ctx context.Context, req Request, fetch Fetch) (Answer, error) {
 	if fetch == nil {
 		return Answer{}, fmt.Errorf("findings: Research needs a fetch function")
@@ -249,14 +308,33 @@ func (g *Gate) Research(ctx context.Context, req Request, fetch Fetch) (Answer, 
 		return answerOf(q, OriginBypass, res), nil
 	}
 
-	if ans, ok := g.consult(ctx, req, tp, true); ok {
+	lk := &lookup{req: req, tp: tp}
+
+	// L1: this process's ledger. No I/O on this path, ever.
+	if ans, ok := g.consult(ctx, lk); ok {
 		g.charge(start)
 		g.countOrigin(ans.Origin)
 		g.serve(req, ans)
 		return ans, nil
 	}
 
-	// A partial hit narrows the request rather than repeating it.
+	// L2: what the other executors have learned. Consulted only now, and its
+	// candidates admitted only by the ladder that just declined every local one.
+	ans, ok, err := g.recall(ctx, lk)
+	if err != nil {
+		g.charge(start)
+		return Answer{}, err
+	}
+	if ok {
+		g.charge(start)
+		g.countOrigin(ans.Origin)
+		g.serve(req, ans)
+		return ans, nil
+	}
+
+	// A partial hit narrows the request rather than repeating it. It runs after
+	// the shared lookup on purpose: L2's candidates are in the ledger by now, so
+	// a finding another executor learned can top this one up too.
 	ask, gap := q, []string(nil)
 	var partial *Answer
 	if p, ok := g.partial(ctx, req, tp); ok {
@@ -265,7 +343,7 @@ func (g *Gate) Research(ctx context.Context, req Request, fetch Fetch) (Answer, 
 	}
 
 	g.charge(start)
-	ans, served, err := g.acquire(ctx, req, ask, tp, fetch)
+	ans, served, err := g.acquire(ctx, lk, ask, fetch)
 	if err != nil {
 		return Answer{}, err
 	}
@@ -298,7 +376,14 @@ func (g *Gate) Lookup(ctx context.Context, req Request) (Answer, bool) {
 		g.count(func(s *Stats) { s.Bypassed++ })
 		return Answer{}, false
 	}
-	ans, ok := g.consult(ctx, req, tp, true)
+	lk := &lookup{req: req, tp: tp}
+	ans, ok := g.consult(ctx, lk)
+	if !ok {
+		// A recall that stopped at the local ledger would answer "the fleet does
+		// not know" when the fleet does — it would only be reporting what this
+		// process happens to remember.
+		ans, ok, _ = g.recall(ctx, lk)
+	}
 	g.charge(start)
 	if ok {
 		g.countOrigin(ans.Origin)
@@ -322,19 +407,74 @@ func (g *Gate) countOrigin(o Origin) {
 			s.Near++
 		case OriginCoalesced:
 			s.Coalesced++
+		case OriginRemoteExact:
+			s.RemoteExact++
+		case OriginRemoteClass:
+			s.RemoteClass++
+		case OriginRemoteNear:
+			s.RemoteNear++
+		case OriginRemoteCoalesced:
+			s.RemoteCoalesced++
 		}
 	})
 }
 
-// consult walks the three lookup tiers and returns the first sufficient
-// candidate. Tiers are ordered by cost and by certainty at once, which is not a
-// coincidence: the cheaper test is the one that proves more.
-// tally is false on the re-consults the single-flight path performs — the
-// leader's double check and a released follower's lookup — because the caller
-// already counted its own pass over the ladder, and a rejection seen twice is
-// still one rejection.
-func (g *Gate) consult(ctx context.Context, req Request, tp TopicPolicy, tally bool) (Answer, bool) {
-	q := req.Question
+// lookup is one question's whole journey down the ladder: who is asking, under
+// what policy, the embedding once anybody has needed it, and which candidates
+// have already been counted against it.
+//
+// Both of those last two exist because one lookup walks the ladder more than
+// once — the local tiers, then the shared ones over what they returned, then
+// again behind a single-flight lease — and neither the arithmetic nor the
+// accounting should be repeated because of it. An embedder is usually a model
+// call, so embedding one question twice would mean paying, on the miss path,
+// for the very thing the layer uses to avoid paying. And a candidate rejected
+// as stale on the first pass is still one stale candidate on the second: a
+// counter that grew every time the ladder was re-walked would report the
+// gate's control flow rather than the commons' state.
+type lookup struct {
+	req Request
+	tp  TopicPolicy
+
+	vec      []float32
+	embedded bool
+
+	counted map[string]bool
+}
+
+// first reports whether this candidate's rejection has yet to be counted
+// against this lookup.
+func (lk *lookup) first(hash string) bool {
+	if lk.counted == nil {
+		lk.counted = map[string]bool{}
+	}
+	if lk.counted[hash] {
+		return false
+	}
+	lk.counted[hash] = true
+	return true
+}
+
+// embed returns the question's vector, computing it at most once per lookup.
+func (g *Gate) embed(ctx context.Context, lk *lookup) []float32 {
+	if lk.embedded || g.Policy.Embedder == nil {
+		return lk.vec
+	}
+	lk.embedded = true
+	vecs, err := g.Policy.Embedder.Embed(ctx, []string{lk.req.Question.Text})
+	if err == nil && len(vecs) > 0 {
+		lk.vec = vecs[0]
+	}
+	return lk.vec
+}
+
+// consult walks the three lookup tiers over this process's ledger and returns
+// the first sufficient candidate. Tiers are ordered by cost and by certainty at
+// once, which is not a coincidence: the cheaper test is the one that proves
+// more. It performs no I/O — the shared backend is recall's job, and it is
+// reached only after this has come back with nothing.
+func (g *Gate) consult(ctx context.Context, lk *lookup) (Answer, bool) {
+	q := lk.req.Question
 	seen := map[string]bool{}
 
 	// Tier 1 — exact. One hash and one map lookup: no I/O, no model, and no
@@ -342,7 +482,7 @@ func (g *Gate) consult(ctx context.Context, req Request, tp TopicPolicy, tally b
 	// when normalization proved them the same.
 	for _, e := range g.Ledger.Exact(q.Key()) {
 		seen[e.Hash] = true
-		if v := g.admit(ctx, req, tp, e, 0, false, tally); v.Sufficient {
+		if v := g.admit(ctx, lk, e, 0, false); v.Sufficient {
 			return g.answerFrom(e, q, OriginExact, 0), true
 		}
 	}
@@ -366,7 +506,7 @@ func (g *Gate) consult(ctx context.Context, req Request, tp TopicPolicy, tally b
 				continue
 			}
 			seen[e.Hash] = true
-			if v := g.admit(ctx, req, tp, e, 0, false, tally); v.Sufficient {
+			if v := g.admit(ctx, lk, e, 0, false); v.Sufficient {
 				return g.answerFrom(e, q, OriginClass, 0), true
 			}
 		}
@@ -376,12 +516,130 @@ func (g *Gate) consult(ctx context.Context, req Request, tp TopicPolicy, tally b
 	// entries, and only when an embedder exists. It produces candidates, never
 	// hits: every one is checked, and each entry is checked against its own
 	// boundary rather than a global constant.
-	for _, c := range g.near(ctx, q, class) {
-		if v := g.admit(ctx, req, tp, c.entry, c.similarity, true, tally); v.Sufficient {
+	for _, c := range g.near(ctx, lk, class) {
+		if v := g.admit(ctx, lk, c.entry, c.similarity, true); v.Sufficient {
 			return g.answerFrom(c.entry, q, OriginNear, c.similarity), true
 		}
 	}
 	return Answer{}, false
+}
+
+// --- L2: the shared backend ---------------------------------------------
+
+// recall consults the distributed commons after the local ledger came back with
+// nothing, and it is deliberately not a second lookup implementation.
+//
+// It pulls what the backend holds about this question into the ledger and then
+// re-runs the ordinary ladder over it. Everything a shared finding must survive
+// to be served — capability containment, scope, freshness, coverage,
+// corroboration, adjudication — is therefore checked by the same code that
+// checks a local one, and there is no way for a remote finding to be admitted
+// by rules a local finding is not held to. It also warms L1: the next agent in
+// this process asking this question never leaves the machine.
+//
+// The two pulls are the two halves of the L2 ladder. The first is one round
+// trip covering the exact key and the subject class, because both are indexed
+// lookups and a caller that wanted one is about to want the other. The second
+// is the vector search, reached only when the first found nothing servable —
+// the coldest, most expensive rung, paid exactly when the alternative is an
+// external call.
+//
+// A backend failure returns nothing and, unless strict mode is configured,
+// no error: the gate then researches the question as it would have if no
+// backend were configured at all.
+func (g *Gate) recall(ctx context.Context, lk *lookup) (Answer, bool, error) {
+	if !g.Shared.ok() {
+		return Answer{}, false, nil
+	}
+	q := lk.req.Question
+
+	entries, err := g.Shared.candidates(ctx, q)
+	if err != nil {
+		if e := g.Shared.failOpen(err); e != nil {
+			return Answer{}, false, fmt.Errorf("%w: %w", ErrStrict, e)
+		}
+	}
+	if adopted := g.take(ctx, lk, entries); len(adopted) > 0 {
+		if ans, ok := g.consult(ctx, lk); ok {
+			return shared(ans, adopted), true, nil
+		}
+	}
+
+	// Similarity search produces candidates, never hits — which is why it runs
+	// after the tiers that are certain about the subject, and why what comes
+	// back goes through the ladder rather than to the caller.
+	if g.Policy.Embedder == nil {
+		return Answer{}, false, nil
+	}
+	vec := g.embed(ctx, lk)
+	if len(vec) == 0 {
+		return Answer{}, false, nil
+	}
+	near, err := g.Shared.nearest(ctx, q, vec, lk.tp.Near)
+	if err != nil {
+		if e := g.Shared.failOpen(err); e != nil {
+			return Answer{}, false, fmt.Errorf("%w: %w", ErrStrict, e)
+		}
+	}
+	if adopted := g.take(ctx, lk, near); len(adopted) > 0 {
+		if ans, ok := g.consult(ctx, lk); ok {
+			return shared(ans, adopted), true, nil
+		}
+	}
+	return Answer{}, false, nil
+}
+
+// take copies shared entries into the ledger and returns the hashes it now
+// holds on the commons' behalf.
+//
+// Adoption is what makes the second pass over the ladder free, and it is also
+// where a shared entry's *decided* history arrives: an adjudication another
+// executor paid a model for is seeded into the local memo, so the same pairing
+// is never judged twice however many machines consider it.
+func (g *Gate) take(ctx context.Context, lk *lookup, entries []Entry) map[string]bool {
+	if len(entries) == 0 {
+		return nil
+	}
+	now := g.Policy.now()
+	out := make(map[string]bool, len(entries))
+	var fresh []string
+	for _, e := range entries {
+		adopted, isNew, err := g.Ledger.Adopt(e, now)
+		if err != nil {
+			// A shared entry that does not hash to its own bytes is not a
+			// finding, whatever it says it is.
+			g.count(func(s *Stats) { s.Rejected++ })
+			continue
+		}
+		out[adopted.Hash] = true
+		if isNew {
+			fresh = append(fresh, adopted.Hash)
+			g.count(func(s *Stats) { s.Adopted++ })
+		}
+	}
+	if len(fresh) > 0 && lk.tp.Adjudicate && g.Policy.Judge != nil {
+		for _, j := range g.Shared.verdicts(ctx, fresh) {
+			g.Ledger.SeedVerdict(j.QuestionKey, j.Hash, j.OK)
+		}
+	}
+	return out
+}
+
+// shared relabels an answer whose finding came from the backend, so the origin
+// says which executor's work it was.
+func shared(ans Answer, adopted map[string]bool) Answer {
+	if !adopted[ans.Hash] {
+		return ans
+	}
+	switch ans.Origin {
+	case OriginExact:
+		ans.Origin = OriginRemoteExact
+	case OriginClass:
+		ans.Origin = OriginRemoteClass
+	case OriginNear:
+		ans.Origin = OriginRemoteNear
+	}
+	return ans
 }
 
 // partial returns the best insufficient candidate — the one leaving the
@@ -427,15 +685,14 @@ func (g *Gate) partial(ctx context.Context, req Request, tp TopicPolicy) (Answer
 // the ledger already holds, so the expensive rung is reached only for the
 // candidates that survived every cheap one, and its verdicts are memoized so no
 // pairing is ever judged twice.
-func (g *Gate) admit(ctx context.Context, req Request, tp TopicPolicy,
-	e *Entry, similarity float64, allowJudge, tally bool) Verdict {
-
+func (g *Gate) admit(ctx context.Context, lk *lookup, e *Entry, similarity float64, allowJudge bool) Verdict {
+	req, tp := lk.req, lk.tp
 	f := e.Finding
 
 	// Capability containment comes first because its failure is not a cache
 	// miss but a denial: this reader may not be told what that research found.
 	if ok, why := Reachable(f, req.Grants, req.Egress); !ok {
-		if tally {
+		if lk.first(e.Hash) {
 			g.count(func(s *Stats) { s.Denied++ })
 		}
 		return insufficient(why)
@@ -444,7 +701,7 @@ func (g *Gate) admit(ctx context.Context, req Request, tp TopicPolicy,
 		return insufficient("private to the agent that learned it")
 	}
 	if !g.fresh(tp, e) {
-		if tally {
+		if lk.first(e.Hash) {
 			g.count(func(s *Stats) { s.Stale++ })
 		}
 		return insufficient("stale")
@@ -478,27 +735,46 @@ func (g *Gate) admit(ctx context.Context, req Request, tp TopicPolicy,
 		return sufficient()
 	}
 	ok, err := g.Policy.Judge(ctx, req.Question, f)
-	if tally {
-		g.count(func(s *Stats) { s.Judged++ })
-	}
+	g.count(func(s *Stats) { s.Judged++ })
 	if err != nil {
 		// A judge that fails is not evidence about the finding. Fall back to
 		// the structural verdict rather than inventing one.
 		return sufficient()
 	}
 	g.Ledger.RecordVerdict(qKey, e, similarity, ok)
+	// A judgement is the most expensive thing this layer does, so it is the
+	// thing most worth sharing: every other executor considering this pairing
+	// reads the answer instead of buying it.
+	g.Shared.recordVerdict(ctx, Judgement{
+		QuestionKey: qKey, Hash: e.Hash, OK: ok, Similarity: similarity,
+	}, g.Ledger.Threshold(e))
 	if ok {
 		return sufficient()
 	}
 	return insufficient("adjudicated: does not answer the question")
 }
 
+// fresh reports whether an entry is still inside its horizon — its topic's, and
+// for a copy taken from the shared backend, its refresh window as well.
+//
+// The second horizon is what bounds cross-executor invalidation. A copy cannot
+// be reached by a retraction on the executor that owns the claim, so it is
+// trusted for a while and then re-checked: the local hit misses, L2 answers
+// with whatever the commons holds now, and the copy is refreshed or replaced.
+// Locally learned entries have no such window, so a fleet that shares nothing
+// behaves exactly as it did.
 func (g *Gate) fresh(tp TopicPolicy, e *Entry) bool {
+	now := g.Policy.now()
+	if e.Remote && !e.Adopted.IsZero() && g.Shared.ok() {
+		if now.Sub(e.Adopted) > g.Shared.refresh() {
+			return false
+		}
+	}
 	ttl := tp.TTL
 	if ttl <= 0 {
 		return true // static: no expiry
 	}
-	return e.Age(g.Policy.now()) <= ttl
+	return e.Age(now) <= ttl
 }
 
 func (g *Gate) visible(tp TopicPolicy, req Request, e *Entry) bool {
@@ -514,7 +790,7 @@ type candidate struct {
 
 // near scores a class's entries against the question and returns those over
 // their own thresholds, best first.
-func (g *Gate) near(ctx context.Context, q Question, class []*Entry) []candidate {
+func (g *Gate) near(ctx context.Context, lk *lookup, class []*Entry) []candidate {
 	if g.Policy.Embedder == nil || len(class) == 0 {
 		return nil
 	}
@@ -527,13 +803,13 @@ func (g *Gate) near(ctx context.Context, q Question, class []*Entry) []candidate
 	if len(withVectors) == 0 {
 		return nil
 	}
-	vecs, err := g.Policy.Embedder.Embed(ctx, []string{q.Text})
-	if err != nil || len(vecs) == 0 {
+	vec := g.embed(ctx, lk)
+	if len(vec) == 0 {
 		return nil
 	}
 	out := make([]candidate, 0, len(withVectors))
 	for _, e := range withVectors {
-		sim := cosine(vecs[0], e.Vector)
+		sim := cosine(vec, e.Vector)
 		if sim >= g.Ledger.Threshold(e) {
 			out = append(out, candidate{entry: e, similarity: sim})
 		}
@@ -563,14 +839,19 @@ func cosine(a, b []float32) float64 {
 
 // --- Single flight ------------------------------------------------------
 
-// fetchOnce performs the research, or waits for whoever is already performing
-// it. It returns either a fresh Result or the answer the leader produced.
 // acquire performs the research or joins whoever is already performing it. It
 // reports whether the answer came from the commons (served) or from the source.
-func (g *Gate) acquire(ctx context.Context, req Request, ask Question,
-	tp TopicPolicy, fetch Fetch) (Answer, bool, error) {
-
+//
+// There are two scopes of "already performing it", and both are consulted here
+// in the order that makes each one cheap: the in-process flight first, because
+// it is a map lookup and a channel, and the distributed lease second, because
+// it is a round trip and there is no point taking one out on behalf of a
+// process that is already coalescing behind itself. One executor therefore
+// contributes at most one waiter to the shared lease however many of its agents
+// are asking.
+func (g *Gate) acquire(ctx context.Context, lk *lookup, ask Question, fetch Fetch) (ans Answer, served bool, err error) {
 	key := flightKey(ask)
+	req := lk.req
 
 	g.mu.Lock()
 	fl, busy := g.flights[key]
@@ -581,7 +862,7 @@ func (g *Gate) acquire(ctx context.Context, req Request, ask Question,
 	g.mu.Unlock()
 
 	if busy {
-		ans, err, research := g.wait(ctx, fl, req, tp)
+		ans, err, research := g.wait(ctx, fl, lk)
 		if err != nil {
 			return Answer{}, false, err
 		}
@@ -592,40 +873,106 @@ func (g *Gate) acquire(ctx context.Context, req Request, ask Question,
 		// slower than the wait bound allows. Research it without taking a lease:
 		// we already know this question is not being shared, and a second lease
 		// on the same key would put the next follower behind us for nothing.
-		return g.lead(ctx, req, ask, "", nil, fetch)
+		return g.lead(ctx, lk, ask, fetch)
 	}
 
-	// Consulting again now that the lease is held closes the check-then-act
+	// The flight is retired only *after* everything below has finished — a
+	// follower released before the ledger holds the answer would look, find
+	// nothing, and research it again, which is precisely the duplication the
+	// lease exists to prevent.
+	defer func() { g.retire(key, fl, err) }()
+
+	// Consulting again now that the flight is held closes the check-then-act
 	// window between this asker's own lookup and this moment. Without it a fleet
 	// launched together loses deduplication in a way that looks like noise: two
-	// askers miss, one takes the lease and finishes, and the other arrives at
-	// the flight after it was retired — so it leads a flight of its own and buys
+	// askers miss, one takes the flight and finishes, and the other arrives at
+	// it after it was retired — so it leads a flight of its own and buys
 	// research the ledger was already holding. One extra map lookup on the miss
 	// path is a cheap price for a saving otherwise lost to a race rather than to
 	// a decision.
 	recheck := time.Now()
-	ans, ok := g.consult(ctx, req, tp, false)
+	ans, ok := g.consult(ctx, lk)
 	g.charge(recheck) // the double check is gate overhead and is reported as such
 	if ok {
-		g.retire(key, fl, nil)
 		return ans, true, nil
 	}
-	return g.lead(ctx, req, ask, key, fl, fetch)
+
+	if g.Shared.ok() {
+		ans, served, handled, serr := g.share(ctx, lk, ask, key, fetch)
+		if serr != nil {
+			err = serr
+			return Answer{}, false, err
+		}
+		if handled {
+			return ans, served, nil
+		}
+	}
+	return g.lead(ctx, lk, ask, fetch)
 }
 
-// lead researches a question and contributes what comes back. When it holds a
-// flight, the flight is retired only *after* the contribution lands — a
-// follower released before the ledger holds the answer would look, find
-// nothing, and research it again, which is precisely the duplication the lease
-// exists to prevent.
-func (g *Gate) lead(ctx context.Context, req Request, ask Question,
-	key string, fl *flight, fetch Fetch) (Answer, bool, error) {
+// share coordinates one question with the other executors: whoever takes the
+// lease researches, and everyone else waits for the finding rather than
+// repeating the call. It reports whether it handled the question at all — a
+// backend that is down, or a leader that never produced an answer covering this
+// question, sends the caller on to research it directly.
+//
+// The loop exists for the case the lease is designed around. A follower whose
+// wait ends because the holder *expired* rather than released is a follower
+// whose leader crashed; it comes back around and tries to take the lease
+// itself, so a dead executor costs one TTL rather than blocking the question
+// forever. Every path through the loop is bounded by the policy's wait ceiling.
+func (g *Gate) share(ctx context.Context, lk *lookup, ask Question, key string, fetch Fetch) (Answer, bool, bool, error) {
+	s := g.Shared
+	deadline := time.Now().Add(g.Policy.maxWait())
 
+	for {
+		lease, held, err := s.acquire(ctx, key)
+		if err != nil {
+			return Answer{}, false, false, s.failOpen(fmt.Errorf("%w: %w", ErrStrict, err))
+		}
+
+		if held {
+			// Renewal runs for as long as the research does, so the TTL bounds
+			// how long a *crash* stalls this question rather than how long
+			// research is allowed to take.
+			stop := s.heartbeat(ctx, lease)
+			if ans, ok, rerr := g.recall(ctx, lk); rerr == nil && ok {
+				// Another executor contributed between our lookup and our lease.
+				s.release(ctx, stop())
+				return ans, true, true, nil
+			}
+			ans, served, ferr := g.lead(ctx, lk, ask, fetch)
+			// Released only now: the contribution has landed, so a follower
+			// released by this call finds the finding rather than a gap. The
+			// lease released is the renewed one, whose fencing token is current
+			// — an owner that was fenced while it researched holds a stale token
+			// and its release is refused, which is the whole point of the token.
+			s.release(ctx, stop())
+			return ans, served, true, ferr
+		}
+
+		// Someone else has it. Wait for them, bounded by the policy's ceiling
+		// and by the caller's context.
+		if !s.await(ctx, key, deadline) {
+			return Answer{}, false, false, nil
+		}
+		if ans, ok, rerr := g.recall(ctx, lk); rerr == nil && ok {
+			ans.Origin = OriginRemoteCoalesced
+			return ans, true, true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return Answer{}, false, false, nil
+		}
+		// The holder finished without an answer that covers this question, or
+		// its research failed, or it died. Go round: whoever is quickest to the
+		// lease researches, and the rest wait on that one instead.
+	}
+}
+
+// lead researches a question and contributes what comes back.
+func (g *Gate) lead(ctx context.Context, lk *lookup, ask Question, fetch Fetch) (Answer, bool, error) {
 	res, err := fetch(ctx, ask)
 	if err != nil {
-		if fl != nil {
-			g.retire(key, fl, err)
-		}
 		return Answer{}, false, err
 	}
 	// A contribution that fails to land is not a research failure. The answer
@@ -633,12 +980,9 @@ func (g *Gate) lead(ctx context.Context, req Request, ask Question,
 	// chance to reuse it, which is counted as Unrecorded rather than raised.
 	// The result cache makes the same call for the same reason — a cache that
 	// can fail the work it was meant to accelerate is worse than no cache.
-	ans, err := g.Contribute(ctx, req, ask, res)
+	ans, err := g.Contribute(ctx, lk.req, ask, res)
 	if err != nil {
 		g.count(func(s *Stats) { s.Unrecorded++ })
-	}
-	if fl != nil {
-		g.retire(key, fl, nil)
 	}
 	return ans, false, nil
 }
@@ -657,7 +1001,7 @@ func (g *Gate) retire(key string, fl *flight, err error) {
 // wait blocks a follower on the leader's flight, bounded three ways — the
 // leader finishing, the caller's context, and the policy's wait ceiling — and
 // reports whether the follower must go and research the question itself.
-func (g *Gate) wait(ctx context.Context, fl *flight, req Request, tp TopicPolicy) (*Answer, error, bool) {
+func (g *Gate) wait(ctx context.Context, fl *flight, lk *lookup) (*Answer, error, bool) {
 	timer := time.NewTimer(g.Policy.maxWait())
 	defer timer.Stop()
 
@@ -676,7 +1020,7 @@ func (g *Gate) wait(ctx context.Context, fl *flight, req Request, tp TopicPolicy
 		// cover the follower's question therefore sends the follower to the
 		// source rather than fobbing it off, which is what makes collapsing
 		// same-subject askers safe rather than merely cheap.
-		ans, ok := g.consult(ctx, req, tp, false)
+		ans, ok := g.consult(ctx, lk)
 		if !ok {
 			return nil, nil, true
 		}
@@ -756,7 +1100,7 @@ func (g *Gate) Contribute(ctx context.Context, req Request, asked Question, res 
 
 	e, err := g.Ledger.Append(Entry{
 		Finding: f, Key: asked.Key(), Class: asked.Class(),
-		Learned: g.Policy.now(), Learner: req.RunID,
+		Learned: g.Policy.now(), Learner: req.RunID, Executor: g.executor(),
 		Latency: res.Latency, Threshold: tp.Near, Vector: vec,
 	})
 	if err != nil {
@@ -764,7 +1108,83 @@ func (g *Gate) Contribute(ctx context.Context, req Request, asked Question, res 
 	}
 	ans.Finding, ans.Hash = e.Finding, e.Hash
 	g.publish(req, ans, observe.FindingLearned)
+
+	// The commons is only shared if the contribution reaches it. A private topic
+	// stops here by definition: its scope says the question itself is not
+	// answerable by anyone but the agent that asked it, and a row in a database
+	// every executor can read is the one place that guarantee cannot hold.
+	if g.Shared.ok() && tp.Scope != ScopePrivate {
+		if stored, ok := g.Shared.publish(ctx, *e); ok {
+			g.publish(req, ans, observe.FindingPublished)
+			if stored.Hash != "" && stored.Hash != e.Hash {
+				// Another executor had already published this claim, and the
+				// store folded ours into it as corroboration. Adopting what came
+				// back converges this ledger on the identity every other
+				// executor is already using — including for citations, which
+				// are recorded against a hash.
+				if adopted, _, aerr := g.Ledger.Adopt(stored, g.Policy.now()); aerr == nil {
+					ans.Finding, ans.Hash = adopted.Finding, adopted.Hash
+				}
+			}
+		}
+	}
 	return ans, nil
+}
+
+// --- Retraction ---------------------------------------------------------
+
+// Retract withdraws a claim from this executor's ledger and from the shared
+// commons, and returns everything that had already been served one of its
+// revisions — from every executor, not only this one.
+//
+// It is the gate-level counterpart of Ledger.Retract, and the reason to prefer
+// it once a backend is configured is that a retraction which reaches one
+// process is not a retraction. The claim's vectors are deactivated too, so a
+// withdrawn finding stops being a similarity candidate rather than merely
+// failing the ladder every time it is proposed.
+//
+// Copies already adopted by other executors keep being served until their
+// refresh window closes (SharedConfig.Refresh), which is the price of a local
+// tier that costs no round trip. Where a retraction must take effect
+// immediately, shorten Refresh or declare the topic's volatility honestly.
+// An executor need not hold the claim to withdraw it. Retraction is an
+// operation on the commons, and the process that learns a finding is wrong is
+// very often not the one that learned it — an operator on any machine, a
+// nightly job, the executor that just read a correction. A local ledger with no
+// copy of the claim is therefore not an error here; it is the ordinary case,
+// and only a failure on *both* sides means nothing was retracted.
+func (g *Gate) Retract(ctx context.Context, id, reason string) ([]Dependent, error) {
+	revisions := g.Ledger.Revisions(id)
+	local, lerr := g.Ledger.Retract(id, reason, g.Policy.now())
+	if !g.Shared.ok() {
+		return local, lerr
+	}
+	remote, rerr := g.Shared.retract(ctx, id, reason, g.Policy.now())
+	for _, e := range revisions {
+		g.Shared.forget(ctx, e.Hash)
+	}
+	switch {
+	case lerr != nil && rerr != nil:
+		return nil, fmt.Errorf("findings: retract %s: %w", id, rerr)
+	case rerr != nil:
+		// The local withdrawal stands whatever the backend did, and saying so is
+		// better than pretending the claim is gone everywhere.
+		return local, fmt.Errorf("findings: retracted locally, not shared: %w", rerr)
+	}
+	return dedupeDependents(append(local, remote...)), nil
+}
+
+func dedupeDependents(in []Dependent) []Dependent {
+	seen := make(map[Dependent]bool, len(in))
+	out := make([]Dependent, 0, len(in))
+	for _, d := range in {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 // provenanceOf derives the capabilities and hosts a set of sources implies, so
@@ -804,12 +1224,17 @@ func answerOf(q Question, origin Origin, res Result) Answer {
 // original research cost as spend this caller avoided.
 func (g *Gate) answerFrom(e *Entry, q Question, origin Origin, similarity float64) Answer {
 	f := e.Finding
+	executor := ""
+	if e.Executor != "" && e.Executor != g.executor() {
+		executor = e.Executor
+	}
 	return Answer{
 		Question: q, Origin: origin,
 		Text: f.Answer, Fields: f.Fields, Sources: f.Sources,
 		Finding: f, Hash: e.Hash,
 		Age:         e.Age(g.Policy.now()),
 		Similarity:  similarity,
+		Executor:    executor,
 		Avoided:     f.Cost,
 		AvoidedTime: e.Latency,
 	}
@@ -839,17 +1264,55 @@ func merge(partial, fresh Answer) Answer {
 
 // serve records a hit: the justification edge for retraction, the event, and
 // the avoided spend.
+//
+// The shared half of the citation is queued rather than written here. A serve
+// is supposed to cost microseconds, and a justification edge is worth exactly
+// one thing — telling a retraction what rested on the claim — which is a
+// guarantee worth keeping without putting a network write in front of every
+// hit.
 func (g *Gate) serve(req Request, ans Answer) {
 	g.Ledger.Cite(ans.Hash, req.dependent())
+	g.Shared.cite(ans.Hash, req.dependent())
 	g.count(func(s *Stats) {
 		s.Avoided.Add(ans.Avoided)
 		s.AvoidedTime += ans.AvoidedTime
 	})
 	kind := observe.FindingServed
-	if ans.Origin == OriginCoalesced {
+	switch ans.Origin {
+	case OriginCoalesced, OriginRemoteCoalesced:
 		kind = observe.FindingCoalesced
 	}
 	g.publish(req, ans, kind)
+}
+
+// Dependents returns everything that was served a finding, from every executor
+// that shares this backend.
+func (g *Gate) Dependents(ctx context.Context, hash string) []Dependent {
+	local := g.Ledger.Dependents(hash)
+	if !g.Shared.ok() {
+		return local
+	}
+	g.Shared.Flush(ctx)
+	remote, err := g.Shared.dependents(ctx, hash)
+	if err != nil {
+		return local
+	}
+	return dedupeDependents(append(local, remote...))
+}
+
+// Commons summarizes what the shared backend holds across every executor, or
+// this ledger's own topics when nothing is shared. It is what a fleet report
+// prints, and the distinction it makes is the one the layer exists for: the
+// local number is what this process learned, the shared one what the fleet
+// knows.
+func (g *Gate) Commons(ctx context.Context) []TopicStat {
+	if !g.Shared.ok() {
+		return g.Ledger.Topics()
+	}
+	if remote := g.Shared.topics(ctx); len(remote) > 0 {
+		return remote
+	}
+	return g.Ledger.Topics()
 }
 
 func (g *Gate) publish(req Request, ans Answer, kind observe.EventType) {
@@ -891,11 +1354,55 @@ type Stats struct {
 	Fresh    int // researched here
 	Bypassed int // Live topics, never consulted
 
+	// The same four reuse classes, served by another executor's research
+	// through the shared backend. They are counted apart from the local ones
+	// because they are the distributed layer's entire claim: an L2 hit is a
+	// call this process could not have avoided on its own.
+	RemoteExact     int
+	RemoteClass     int
+	RemoteNear      int
+	RemoteCoalesced int
+
 	Denied     int // capability containment refused a reader
 	Stale      int // a candidate was past its topic's horizon
 	Judged     int // adjudications actually paid for
 	Overtaken  int // a follower gave up waiting and researched it itself
 	Unrecorded int // research succeeded but the ledger would not take it
+
+	// --- the shared backend ---
+	//
+	// Adopted is findings copied out of L2 into this process's ledger, and
+	// Published contributions written the other way. Leader and Follower are
+	// how this executor fared at the distributed lease, and the three lines
+	// under them are what went wrong with it: a wait that ran out, a lease
+	// taken over from an executor that had expired without releasing it, and a
+	// lease this executor lost while it was still researching.
+	Adopted   int
+	Published int
+
+	Leader         int
+	Follower       int
+	LeaseTimeouts  int
+	LeaseTakeovers int
+	LeaseLost      int
+
+	// BackendFailures is every backend call that errored, and FailedOpen the
+	// research calls that proceeded uncoordinated because of one. Rejected is
+	// shared entries whose bytes did not hash to the address they arrived
+	// under, and CitesDropped justification edges lost to a full write-behind
+	// queue. All four are the layer being honest about its own failure modes
+	// rather than swallowing them into a hit rate.
+	BackendFailures int
+	FailedOpen      int
+	Rejected        int
+	CitesDropped    int
+
+	// RemoteLatency is the wall clock spent inside the shared backend, of which
+	// VectorLatency is similarity search. Both are also inside Overhead: they
+	// are what the layer costs, and a distributed gate that reported only its
+	// map lookups would be reporting the cheap half.
+	RemoteLatency time.Duration
+	VectorLatency time.Duration
 
 	// Avoided is research this layer did not have to buy; Spent is what it did.
 	// AvoidedTime is the wall clock the reused research originally took, which
@@ -910,8 +1417,19 @@ type Stats struct {
 	Overhead time.Duration
 }
 
-// Reused is the number of answers served from the commons.
-func (s Stats) Reused() int { return s.Exact + s.Class + s.Near + s.Coalesced }
+// Reused is the number of answers served from the commons, local or shared.
+func (s Stats) Reused() int { return s.LocalReuse() + s.SharedReuse() }
+
+// LocalReuse is the answers this process's own ledger served: research it had
+// already done, or was doing at that moment.
+func (s Stats) LocalReuse() int { return s.Exact + s.Class + s.Near + s.Coalesced }
+
+// SharedReuse is the answers another executor's research served — the external
+// calls avoided *across* processes, which is the number the distributed layer
+// exists to make non-zero and which no single-process layer can produce.
+func (s Stats) SharedReuse() int {
+	return s.RemoteExact + s.RemoteClass + s.RemoteNear + s.RemoteCoalesced
+}
 
 // HitRate is the share of questions answered without new external research.
 func (s Stats) HitRate() float64 {
@@ -929,11 +1447,31 @@ func (s Stats) Overshoot() time.Duration {
 	return s.Overhead / time.Duration(s.Asked)
 }
 
-// Stats returns a snapshot of what the gate has done.
+// Stats returns a snapshot of what the gate has done, including what its
+// connection to the shared backend did on its behalf.
 func (g *Gate) Stats() Stats {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.stats
+	s := g.stats
+	g.mu.Unlock()
+	s.mergeBackend(g.Shared.snapshot())
+	return s
+}
+
+// mergeBackend folds the shared layer's own accounting in. The two halves are
+// counted where they happen — tier decisions in the gate, round trips and
+// failures in the layer that makes them — and joined only here.
+func (s *Stats) mergeBackend(b Stats) {
+	s.Published += b.Published
+	s.Leader += b.Leader
+	s.Follower += b.Follower
+	s.LeaseTimeouts += b.LeaseTimeouts
+	s.LeaseTakeovers += b.LeaseTakeovers
+	s.LeaseLost += b.LeaseLost
+	s.BackendFailures += b.BackendFailures
+	s.FailedOpen += b.FailedOpen
+	s.CitesDropped += b.CitesDropped
+	s.RemoteLatency += b.RemoteLatency
+	s.VectorLatency += b.VectorLatency
 }
 
 func (g *Gate) count(fn func(*Stats)) {
@@ -962,7 +1500,7 @@ func (s Stats) String() string {
 		fmt.Fprintf(&b, " · %d live", s.Bypassed)
 	}
 	b.WriteByte('\n')
-	fmt.Fprintf(&b, "  exact %d · class %d · near %d · coalesced %d · topped-up %d",
+	fmt.Fprintf(&b, "  local  exact %d · class %d · near %d · coalesced %d · topped-up %d",
 		s.Exact, s.Class, s.Near, s.Coalesced, s.ToppedUp)
 	if s.Stale > 0 {
 		fmt.Fprintf(&b, " · %d stale", s.Stale)
@@ -980,9 +1518,49 @@ func (s Stats) String() string {
 		fmt.Fprintf(&b, " · %d unrecorded", s.Unrecorded)
 	}
 	b.WriteByte('\n')
+	b.WriteString(s.sharedLines())
 	fmt.Fprintf(&b, "  avoided $%.4f and %s of research, spent $%.4f\n",
 		s.Avoided.CostUSD, s.AvoidedTime.Round(time.Millisecond), s.Spent.CostUSD)
-	fmt.Fprintf(&b, "  gate overhead %s total, %s per question\n",
+	fmt.Fprintf(&b, "  gate overhead %s total, %s per question",
 		s.Overhead.Round(time.Microsecond), s.Overshoot().Round(time.Microsecond))
+	if s.RemoteLatency > 0 {
+		fmt.Fprintf(&b, " (%s in the shared backend)", s.RemoteLatency.Round(time.Millisecond))
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
+
+// sharedLines reports the distributed layer, and reports nothing at all when
+// there is no distributed layer — a local-only fleet's report should look
+// exactly as it did before this existed.
+func (s Stats) sharedLines() string {
+	touched := s.SharedReuse() > 0 || s.Adopted > 0 || s.Published > 0 ||
+		s.Leader > 0 || s.Follower > 0 || s.BackendFailures > 0
+	if !touched {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "  shared exact %d · class %d · near %d · coalesced %d",
+		s.RemoteExact, s.RemoteClass, s.RemoteNear, s.RemoteCoalesced)
+	fmt.Fprintf(&b, "  →  %d external call(s) another executor had already made\n", s.SharedReuse())
+	fmt.Fprintf(&b, "  backend  %d adopted · %d published · %d led · %d followed",
+		s.Adopted, s.Published, s.Leader, s.Follower)
+	if s.LeaseTakeovers > 0 {
+		fmt.Fprintf(&b, " · %d taken over", s.LeaseTakeovers)
+	}
+	if s.LeaseTimeouts > 0 {
+		fmt.Fprintf(&b, " · %d timed out", s.LeaseTimeouts)
+	}
+	if s.LeaseLost > 0 {
+		fmt.Fprintf(&b, " · %d fenced", s.LeaseLost)
+	}
+	b.WriteByte('\n')
+	if s.BackendFailures > 0 || s.Rejected > 0 || s.CitesDropped > 0 {
+		fmt.Fprintf(&b, "  degraded %d backend failure(s) · %d fail-open · %d rejected · %d citations dropped\n",
+			s.BackendFailures, s.FailedOpen, s.Rejected, s.CitesDropped)
+	}
+	if s.VectorLatency > 0 {
+		fmt.Fprintf(&b, "  vector search %s\n", s.VectorLatency.Round(time.Millisecond))
+	}
 	return b.String()
 }

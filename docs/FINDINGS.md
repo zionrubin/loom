@@ -376,7 +376,144 @@ finding passes it, and that is why it can happen inside a task.
 
 ---
 
-## 11. What this is deliberately not
+## 11. Across executors
+
+Everything above happens inside one process. A fleet worth running usually is
+not one process — it is a worker per machine, a batch job beside a long-lived
+service, ten pods of one deployment — and each of those holds a ledger the
+others cannot see. The duplication the gate removed between agents comes
+straight back at the process boundary: *n* executors research one subject *n*
+times, and *n* executors call one source at the same instant because none of
+them can see the others' flights.
+
+The distributed layer closes that gap by adding one rung to the ladder rather
+than replacing it:
+
+```
+L1   the in-process ledger      map lookups, no I/O, unchanged
+L2   the shared backend         one round trip, only after an L1 miss
+     the source                 what both exist to avoid
+```
+
+### The rung, and why it is a rung
+
+L2 is not a write-through cache in front of L1, and L1 is not a buffer in front
+of L2. A local hit answers without touching the network — which is the property
+that lets the gate stand in front of *every* task rather than the ones somebody
+guessed would collide — and L2 is consulted only when L1 had nothing.
+
+What L2 returns is *adopted*: copied into the local ledger, and then run through
+the ordinary sufficiency ladder. That is the whole of the design's safety
+argument. There is no second implementation of "is this finding good enough",
+so a remotely stored finding gets no privilege a local one lacks: the same
+reachability check, the same freshness horizon, the same coverage test, the same
+corroboration floor, the same adjudication. `Reachable` in particular is what
+stops a shared database from becoming a capability-laundering channel with a
+larger radius — the cheapest way around an egress allowlist would otherwise be
+to wait for a *machine* that has it.
+
+Adoption also warms L1, so the next agent in that process never leaves it, and
+it carries across the finding's *decided* history — the adjudications other
+executors already paid a model for, so no pairing is judged twice anywhere.
+
+### The lease
+
+Deduplication between processes needs mutual exclusion between processes. The
+key is the one the in-process flight already uses — subject class plus required
+coverage, falling back to the exact question key when there are no facts to be
+certain about the subject with — and the mechanism is a lease rather than a
+lock, because the holder is a process that can die:
+
+- an **owner ID** and an **expiry**, so a crashed executor costs one TTL rather
+  than blocking a question forever;
+- **renewal**, so the TTL bounds how long a *crash* stalls a question rather
+  than how long research is allowed to take;
+- a **fencing token**, incremented every time the lease changes hands, so an
+  owner that stalled past its expiry and woke to find itself replaced cannot
+  release the new owner's lease — which would wake its followers onto a finding
+  nobody has contributed yet;
+- **bounded waiting** with backoff, cancellable, after which a follower
+  researches the question itself: correctness preserved, deduplication lost,
+  which is the right way round for a bound that exists to stop a stuck leader
+  from stalling a fleet.
+
+Only the process-level leader takes a distributed lease, so an executor
+contributes one waiter however many of its own agents are asking. Waiting is
+polling with bounded exponential backoff against an indexed primary key — no
+pub/sub, no broker, no connection anybody has to hold open.
+
+### The seam
+
+Three interfaces, and the gate knows nothing else about the backend:
+
+| | |
+|---|---|
+| `Store` | put a revision, fetch the candidates for a question, cite, retract, memoize verdicts and thresholds, summarize topics |
+| `VectorStore` | upsert by finding hash, top-K cosine search filtered by topic and subject class, deactivate on retraction |
+| `Leases` | acquire, renew, release, peek — with owner, expiry and fencing token |
+
+`findings/pgstore` implements all three over PostgreSQL with `pgvector`, which
+is the intended production backend and the reason leases need no Redis and
+vectors need no second database: contributing a finding and indexing it is one
+transaction, and releasing a lease after the contribution lands is an ordering
+one connection can guarantee. Where the extension is unavailable it stores
+embeddings as JSON and scores them in Go, and says which mode it is in.
+
+`findings/filestore` implements the same three over a shared directory, for the
+many fleets that are several processes on one machine — and, just as usefully,
+as the second implementation that keeps the interfaces honest.
+`findings/backendtest` is the conformance suite both of them pass, which is what
+"replaceable" means operationally.
+
+### What a copy costs
+
+An adopted finding is a copy, and a retraction on another executor cannot reach
+into this process's memory. Re-validating on every local hit would put the
+network back on the path this layer exists to keep it off, so a copy instead
+carries a **refresh window** (`SharedConfig.Refresh`, 60s by default): past it,
+the local hit misses, L2 is consulted, and whatever the commons holds now — a
+revision, a retraction, nothing — is what gets served. Locally learned entries
+have no such window, so a fleet that shares nothing behaves exactly as it did.
+That window is the staleness bound for cross-executor invalidation, and it is
+stated rather than hidden because it is a real cost of a network-free L1.
+
+### When the commons is down
+
+A layer whose job is avoiding calls should cost money when it breaks, not
+correctness. A backend failure is counted, reported, and otherwise ignored: the
+gate researches the question as though no backend were configured. `Strict`
+inverts that for the deployment where an uncoordinated executor is worse than a
+stalled one — a metered source with a hard quota — and it is deliberately
+explicit, because turning it on converts an optimization into a dependency.
+
+One rule outranks both: **a shared-backend failure never fails research that
+succeeded.** The answer is in hand and paid for; all that is lost is another
+executor's chance to reuse it, which is counted as such.
+
+### What it measures
+
+`examples/commons-shared` runs four executor *processes* over six overlapping
+subjects, twice — once with the shared commons and once without — and counts the
+calls in the source's own log rather than in the layer's counters:
+
+```
+                                 no commons shared commons
+questions asked                          24             24
+calls to the source                      24              6
+spent at the source                 $0.0960        $0.0240
+
+findings  24 asked · 18 reused (75%) · 6 researched
+  local  exact 0 · class 0 · near 0 · coalesced 0 · topped-up 0
+  shared exact 0 · class 7 · near 0 · coalesced 11  →  18 external call(s) another executor had already made
+  backend  18 adopted · 6 published · 6 led · 11 followed
+```
+
+The split between the two shared lines is the argument: 11 of the 18 avoided
+calls were collapsed by the distributed lease — executors that missed at the
+same instant — and 7 by findings already in the commons. A layer with only the
+second half would have saved 7.
+
+## 12. What this is deliberately not
 
 **Not a knowledge base.** Findings are cached research with a horizon, not a
 curated corpus. Nothing here does entity resolution across claims, and
@@ -396,11 +533,16 @@ model for "what was true in March" and this is not it.
 **No eviction.** The ledger grows without bound, which is the same gap the result
 cache has and now has in a second place.
 
-**Not distributed.** The ledger persists to disk and reloads, so tomorrow's fleet
-starts with what today's learned. Two fleets on two machines are two commons. The
-CAS maps onto object storage and the indices onto any KV store — the same Phase 2
-described in [ARCHITECTURE.md](./ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distributed-system)
-— but none of that is built.
+**Not a replicated store.** The commons is distributed in the sense that every
+executor reads and writes one backend (§11); it is not replicated, partitioned,
+or multi-region, and a backend outage degrades every executor to local-only
+research at once. Nor is L1 coherent: an adopted copy is trusted for its refresh
+window, so a retraction reaches other executors within that window rather than
+immediately.
+
+**No contradiction resolution across executors.** `Conflicts` still reports
+disagreement rather than settling it, and a shared backend means it can now
+report disagreement between machines.
 
 **Not a substitute for good task decomposition.** Anthropic's fix for duplicated
 subagent work — tell each subagent precisely what it owns — is upstream of this
@@ -412,5 +554,6 @@ independently, most of it does.
 
 Read next: [ASYNC.md](./ASYNC.md) for the fleet this sits on and the blackboard
 it complements, [ARCHITECTURE.md](./ARCHITECTURE.md#47-state-cas-cache-lineage)
-for the state layer it extends, and `examples/commons` for the numbers above,
+for the state layer it extends, `examples/commons` for the single-process
+numbers and `examples/commons-shared` for the cross-executor ones — both
 runnable offline.

@@ -195,7 +195,10 @@ Continuum — and says which rows are honestly still empty.
   per-answer TTL guesses. Findings carry the capabilities their research
   consumed, so the commons can save a reader a call it was allowed to make and
   never make one it was not. Corrections append revisions and retractions report
-  every task that rested on the withdrawn claim. See
+  every task that rested on the withdrawn claim. With a shared backend the same
+  gate spans executors — PostgreSQL and `pgvector` for the findings and the
+  similarity search, a fenced lease for the single flight — so ten processes
+  research a subject once between them and a local hit still costs no I/O. See
   [docs/FINDINGS.md](docs/FINDINGS.md).
 - **Lineage & audit** — every artifact traces to the op, model, and inputs
   that produced it; every secret/tool/egress/broadcast decision is audited.
@@ -366,7 +369,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `providers/openai` | Official-SDK OpenAI adapter, broker-resolved keys |
 | `providers/llamacpp` | Local inference against a llama.cpp server: loopback egress, no credential, the KV cache as the prompt prefix cache, and the device's slot count as the admission ceiling |
 | `providers/llamacpp/llamacpptest` | A scriptable in-process llama.cpp server for tests and offline examples — what `mcp/mcptest` is to a server, on a real loopback socket |
-| `findings` | The commons: a gate agents pass before reaching a public source, so research one agent paid for is served to the next instead of repeated |
+| `findings` | The commons: a gate agents pass before reaching a public source, so research one agent paid for is served to the next instead of repeated. `findings/pgstore` and `findings/filestore` share it between executor processes |
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
@@ -790,6 +793,50 @@ front of a content-addressed cache:
   were not.** Every finding carries the capabilities and hosts its research
   consumed, and a reader is served only if its own envelope holds them —
   otherwise a shared cache is just a way around an egress allowlist.
+
+### Across executors
+
+That commons is one process's. A fleet worth running usually is not one process
+— a worker per machine, ten pods of one deployment — and each of those holds a
+ledger the others cannot see, so the duplication the gate removed between agents
+comes back at the process boundary. One field connects them:
+
+```go
+backend, _ := pgstore.Open(ctx, dsn, pgstore.Options{Dimensions: 1536})
+loom.WithFindings(findings.Config{
+    Gate:   []string{"mcp/web/search"},
+    Shared: findings.NewShared(findings.SharedConfig{Backend: backend}),   // ← every executor
+})
+```
+
+It adds a rung rather than replacing one — the in-process ledger is still
+consulted first and still answers with no I/O — and a shared candidate is
+adopted into that ledger and then checked by the same sufficiency ladder as a
+local one, containment included. The single-flight lease grows a second scope:
+a row with an expiry, a heartbeat and a fencing token, so executors that miss
+the same question at the same instant make one call between them and a crashed
+lease owner costs one TTL rather than blocking the question. PostgreSQL with
+`pgvector` is the production backend (`findings/pgstore`); a shared directory is
+the one for fleets that are several processes on one machine
+(`findings/filestore`); `Store`, `VectorStore` and `Leases` are the whole seam
+between them and the gate. An unavailable backend degrades to ordinary research
+unless strict mode is asked for.
+
+`examples/commons-shared` runs four executor *processes* over six overlapping
+subjects and counts the calls in the source's own log:
+
+```
+                                 no commons shared commons
+calls to the source                      24              6
+
+findings  24 asked · 18 reused (75%) · 6 researched
+  local  exact 0 · class 0 · near 0 · coalesced 0 · topped-up 0
+  shared exact 0 · class 7 · near 0 · coalesced 11  →  18 external call(s) another executor had already made
+```
+
+The local row is zero because no executor asked anything twice itself: all 18
+avoided calls crossed a process boundary, and 11 of them were collapsed by the
+distributed lease rather than served from the store.
 
 [docs/FINDINGS.md](docs/FINDINGS.md) is the design, and the literature it maps:
 semantic caching and its threshold problem, per-entry learned boundaries,

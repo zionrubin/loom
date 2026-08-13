@@ -442,13 +442,25 @@ func postDetail(p Post) string {
 // asking what rested on it.
 func (f *Fleet) Findings() *findings.Gate { return f.commons }
 
-// commonsTopics summarizes the ledger, or nil when there is none.
+// commonsTopics summarizes the commons, or nil when there is none. With a
+// shared backend configured it summarizes what every executor holds, not only
+// what this one has learned — a report about a commons that stopped at the
+// process boundary would be reporting the wrong thing.
 func (h *host) commonsTopics() []findings.TopicStat {
-	if h.ledger == nil {
-		return nil
+	if h.commons == nil {
+		if h.ledger == nil {
+			return nil
+		}
+		return h.ledger.Topics()
 	}
-	return h.ledger.Topics()
+	ctx, cancel := context.WithTimeout(context.Background(), commonsReportTimeout)
+	defer cancel()
+	return h.commons.Commons(ctx)
 }
+
+// commonsReportTimeout bounds the backend query a report makes. A report is
+// the one place it is always acceptable to say less rather than wait.
+const commonsReportTimeout = 5 * time.Second
 
 // Explain projects what an agent would cost on this fleet without making a
 // call, with the board's current snapshots in scope — so a stage that reads a
@@ -918,6 +930,10 @@ func (h *host) provisionFindings() error {
 	}
 	gate := findings.NewGate(ledger, cfg.Policy)
 	gate.Bus = h.bus
+	// The shared backend, when there is one. It is wired here rather than
+	// inside the gate because the host owns every connection this process
+	// makes and closes them together — the commons is not special.
+	gate.Shared = cfg.Shared
 	h.ledger, h.commons = ledger, gate
 
 	for _, name := range cfg.Gate {
@@ -966,11 +982,16 @@ func (h *host) mcpStats() []mcp.Stats {
 }
 
 func (h *host) close() error {
-	var ledger error
+	var ledger, shared error
 	if h.ledger != nil {
 		ledger = h.ledger.Close()
 	}
-	err := errors.Join(h.closeMCP(), h.cache.Close(), ledger)
+	if h.commons != nil {
+		// Draining first: the citation queue holds serves that have already
+		// happened, and a retraction that cannot find them under-reports.
+		shared = h.commons.Close()
+	}
+	err := errors.Join(h.closeMCP(), h.cache.Close(), ledger, shared)
 	h.bus.Close()
 	return err
 }
