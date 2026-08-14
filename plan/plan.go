@@ -12,6 +12,7 @@ import (
 	"text/template"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/pipeline"
@@ -26,6 +27,9 @@ type StagePlan struct {
 	Fingerprint string
 	Candidates  []model.Info      // resolved binding ladder for AI stages
 	Broadcasts  map[string]string // declared shared values → content hash
+	// Continuation is the revision of the evolving context this stage reads,
+	// zero when it declared none.
+	Continuation delta.Ref
 	// MCP maps each declared MCP server to the digest of the tool descriptors
 	// this stage was compiled against; MCPTools are the qualified tool names it
 	// may invoke, and MCPHosts the endpoints its egress policy must allow.
@@ -47,8 +51,9 @@ type StagePlan struct {
 type Option func(*compileOpts)
 
 type compileOpts struct {
-	broadcasts map[string]string
-	mcp        mcp.Manifest
+	broadcasts    map[string]string
+	continuations map[string]delta.Ref
+	mcp           mcp.Manifest
 }
 
 // WithBroadcasts supplies the run's registered shared values as name →
@@ -68,6 +73,18 @@ func WithBroadcasts(hashes map[string]string) Option {
 // The manifest is plain data rather than a live catalog, which is what lets
 // Explain compile the same pipeline from configuration alone
 // (mcp.Declared) without opening a socket.
+// WithContinuations supplies the run's evolving contexts as key → revision. A
+// stage may only declare a continuation present here, and the revision's hash
+// is folded into its fingerprint — so the round that appended a turn
+// recomputes, and every round before it stays cached.
+//
+// Compiling the same pipeline against a later revision is how a session moves
+// forward: nothing about the pipeline changes, one hash does, and the plan says
+// which stages that reaches.
+func WithContinuations(refs map[string]delta.Ref) Option {
+	return func(o *compileOpts) { o.continuations = refs }
+}
+
 func WithMCP(m mcp.Manifest) Option {
 	return func(o *compileOpts) { o.mcp = m }
 }
@@ -186,6 +203,12 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			return nil, err
 		}
 		sp.Broadcasts = bcast
+
+		cont, err := resolveContinuation(s, co.continuations)
+		if err != nil {
+			return nil, err
+		}
+		sp.Continuation = cont
 
 		if err := resolveMCP(sp, co.mcp); err != nil {
 			return nil, err
@@ -362,6 +385,9 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 			o.NoCache = true
 		}
 		o.Broadcasts = append(o.Broadcasts, s.Opts.Broadcasts...)
+		if s.Opts.Continuation != "" {
+			o.Continuation = s.Opts.Continuation
+		}
 		o.MCP = append(o.MCP, s.Opts.MCP...)
 		if s.Opts.Budget.MaxDuration > 0 {
 			o.Budget.MaxDuration = s.Opts.Budget.MaxDuration
@@ -412,6 +438,32 @@ func resolveBroadcasts(s *pipeline.Stage, registered map[string]string) (map[str
 		out[name] = hash
 	}
 	return out, nil
+}
+
+// resolveContinuation maps the continuation a stage declared to the revision
+// registered for this run, rejecting a name nobody registered — a typo should
+// fail compilation rather than silently produce a stage with no context, which
+// would run, cost money, and answer the wrong question.
+func resolveContinuation(s *pipeline.Stage, registered map[string]delta.Ref) (delta.Ref, error) {
+	key := s.Opts.Continuation
+	if key == "" {
+		return delta.Ref{}, nil
+	}
+	ref, ok := registered[key]
+	if !ok {
+		return delta.Ref{}, fmt.Errorf(
+			"stage %q: continuation %q is not registered for this run (loom.WithContinuation)",
+			s.ID, key)
+	}
+	// A registered key with no revision is a process that knows this
+	// continuation exists and is not the one choosing which revision to read —
+	// a worker, which is sent envelopes rather than planning them. It compiles;
+	// what it must not do is execute, and the executor refuses an unbound chain
+	// rather than quietly running a stage with no context.
+	if ref.Key == "" {
+		ref.Key = key
+	}
+	return ref, nil
 }
 
 // resolveMCP turns a stage's MCP declarations into the three things an
@@ -541,6 +593,12 @@ func fingerprint(sp *StagePlan, parts ...any) (string, error) {
 	if bk := broadcastKey(sp.Broadcasts); bk != nil {
 		parts = append(parts, bk)
 	}
+	// The revision, not the key. Two rounds of one session share a key and
+	// must not share a fingerprint, or the second round would replay the
+	// first's answers against a context it never saw.
+	if r := sp.Continuation; !r.Zero() {
+		parts = append(parts, map[string]string{"continuation": r.Key, "revision": r.Hash})
+	}
 	if mk := mcpKey(sp); mk != nil {
 		parts = append(parts, mk)
 	}
@@ -613,6 +671,11 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		}
 		hosts = append(hosts, sp.MCPHosts...)
 	}
+
+	// The continuation travels as a revision hash, like a broadcast and for a
+	// sharper version of the same reason: the value it names is not only large
+	// but growing, and an envelope that carried it would grow with it.
+	ctxBundle.Chain = sp.Continuation
 
 	sandbox := s.Opts.Sandbox
 	if sandbox == "" {

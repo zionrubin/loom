@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/security"
@@ -37,6 +38,16 @@ type Runtime struct {
 	TaskID  string
 	Models  *ModelClient
 	Session core.Session // grant-checked tools and broadcast reads
+	// Continuation is the evolving context this task's envelope referenced,
+	// already materialized. It is empty when the envelope carried none, which
+	// is every stage that does not declare one.
+	//
+	// The executor materializes it rather than the op, for the same reason the
+	// executor resolves broadcasts: an op that fetched its own context would
+	// be an op that had to know about storage, about which revisions this
+	// process already holds, and about what to do when it holds none. What an
+	// op gets is bytes.
+	Continuation delta.Materialization
 }
 
 // OpRunner executes one stage's operation for one task. Implementations live
@@ -377,6 +388,13 @@ type Local struct {
 	Cache      *store.Cache
 	Lineage    *store.Lineage
 	Bus        *observe.Bus
+	// State materializes the evolving contexts task envelopes reference. Nil
+	// unless the deployment enabled them, in which case a task carrying a chain
+	// fails rather than running with no context — the same treatment a
+	// broadcast with no store gets, and for the same reason: a task quietly
+	// executing without the context it was planned with is a wrong answer
+	// wearing a plausible one.
+	State *delta.Store
 }
 
 // Execute implements Executor.
@@ -423,6 +441,29 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 			Tools:       BindTools(l.Tools, t.Envelope, l.Audit, t.ID),
 			Broadcaster: BindBroadcasts(l.Broadcasts, t.Envelope, l.Audit, l.Bus, t.ID),
 		},
+	}
+
+	// The continuation is materialized after the cache short-circuit and before
+	// the runner, which is the only place it can go. Before the cache it would
+	// render a context for a result nobody is going to compute; inside the
+	// runner it would be materialized once per record instead of once per task.
+	if chain := t.Envelope.Context.Chain; chain.Unbound() {
+		return task.Result{}, core.Permanent(fmt.Errorf(
+			"stage %q names continuation %q but no revision of it: the run must bind one "+
+				"with loom.WithContinuation before this stage can execute", t.Stage, chain.Key))
+	} else if !chain.Zero() {
+		if l.State == nil {
+			return task.Result{}, core.Permanent(fmt.Errorf(
+				"stage %q references continuation %q, but this executor was built without "+
+					"a state store (executor.Local.State)", t.Stage, chain.Key))
+		}
+		m, err := l.State.Materialize(ctx, delta.Attribution{
+			RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
+		}, chain)
+		if err != nil {
+			return task.Result{}, err
+		}
+		rt.Continuation = m
 	}
 
 	out, usage, modelUsed, err := runner.Run(ctx, rt, t)

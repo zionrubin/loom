@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/findings"
 	"github.com/zionrubin/loom/mcp"
@@ -724,6 +725,16 @@ type host struct {
 	// keeps local execution the default: distribution is an adapter installed
 	// at provisioning, not a mode the scheduler knows about.
 	remote *worker.Client
+	// state materializes the evolving contexts task envelopes reference, and
+	// keeps what it has rendered so the next revision costs the change rather
+	// than the context.
+	//
+	// It is held on the host beside the cache and the commons because it is the
+	// same kind of thing: a property of the process rather than of a pipeline.
+	// Every agent on this host shares one, which is what lets two pipelines
+	// working the same session share the rendering rather than each keeping
+	// their own copy of it.
+	state *delta.Store
 
 	mu     sync.Mutex
 	traces map[string]*agentTrace
@@ -800,6 +811,13 @@ func newHost(cfg Config) (*host, error) {
 	}
 	h.cas, h.cache = cas, cache
 	h.shared = store.NewBroadcasts(cas)
+	h.state, err = delta.NewStore(cas, delta.Options{
+		Renderer: cfg.DeltaRenderer, Policy: cfg.DeltaPolicy,
+		MaxBytes: cfg.DeltaBytes, Bus: h.bus,
+	})
+	if err != nil {
+		return nil, err
+	}
 	h.client = &executor.ModelClient{
 		Registry: cfg.Registry, Broker: h.broker, Audit: audit, Bus: h.bus,
 	}
@@ -810,6 +828,7 @@ func newHost(cfg Config) (*host, error) {
 		// resolve its own inputs.
 		h.remote = worker.NewClient(worker.ClientConfig{
 			Queue: cfg.Queue, Blobs: h.cas, Bus: h.bus, Wait: cfg.QueueWait,
+			Affinity: cfg.Affinity,
 		})
 	}
 
@@ -1040,7 +1059,8 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	// posts cannot move underneath it.
 	snapshot := h.shared.Hashes()
 	pl, err := plan.Compile(p, cfg.Registry,
-		plan.WithBroadcasts(snapshot), plan.WithMCP(h.manifest))
+		plan.WithBroadcasts(snapshot), plan.WithContinuations(cfg.Continuations),
+		plan.WithMCP(h.manifest))
 	if err != nil {
 		return nil, err
 	}
@@ -1054,8 +1074,8 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	// so nothing downstream of this line can tell which it got.
 	var exec executor.Executor = &executor.Local{
 		Runners: runners, Client: h.client, Tools: h.tools,
-		Broadcasts: h.shared,
-		Audit:      h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
+		Broadcasts: h.shared, State: h.state,
+		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
 	}
 	if h.remote != nil {
 		exec = h.remote

@@ -234,9 +234,50 @@ type Submission struct {
 	// a task that kills every worker that touches it must eventually be
 	// declared the problem rather than the workers.
 	Deliveries int `json:"deliveries,omitempty"`
+	// Affinity is where this task would rather run. It is a preference and
+	// never a requirement — see the type.
+	Affinity Affinity `json:"affinity,omitzero"`
 	// Client identifies the submitter, for reporting.
 	Client string `json:"client,omitempty"`
 }
+
+// Affinity is the queue's one soft input: work that would go faster on a
+// particular worker, without becoming work that only that worker can do.
+//
+// The distinction from Requirements is the whole of it, and it is a distinction
+// the fleet cannot afford to blur:
+//
+//	Requirements   hard. A worker that cannot serve them must not claim the
+//	               task, because claiming it means failing it.
+//	Affinity       soft. A worker that does not hold the state runs the task
+//	               correctly and more slowly, because state is an optimization
+//	               and the executor's fallback is the reference path.
+//
+// Encoding "prefers worker A" as a requirement would make a task unclaimable
+// the moment A died — which is precisely the failure locality exists to survive
+// — so it is encoded here, where the queue may act on it and is never obliged
+// to. A worker that holds the key is offered the task first. Every other worker
+// may take it, immediately if Grace is zero and after Grace otherwise.
+type Affinity struct {
+	// Key is the state the task would like to find already materialized: a
+	// continuation key, in practice, since that is what task.Locality returns.
+	Key string `json:"key,omitempty"`
+	// Grace is how long the queue holds a keyed task back from workers that do
+	// not hold its state, giving one that does a chance to ask (default zero:
+	// no waiting at all, pure preference).
+	//
+	// It is the one place this mechanism can cost latency, so it is opt-in and
+	// wants to be small — a poll interval or two, not a lease. What it buys is
+	// affinity that survives contention: with no grace, a busy fleet hands the
+	// session to whichever worker asked first, and the state-holder gets it
+	// only by luck. What it costs, in the worst case where the state-holder has
+	// died, is exactly Grace once — after which the task goes to anybody, which
+	// is what keeps "never wait forever" true rather than aspirational.
+	Grace time.Duration `json:"grace,omitempty"`
+}
+
+// Zero reports whether no affinity is expressed.
+func (a Affinity) Zero() bool { return a.Key == "" }
 
 // Claim is a worker asking for work.
 type Claim struct {
@@ -245,6 +286,20 @@ type Claim struct {
 	// Max is how many assignments to take — in practice the worker's free
 	// slots, so the queue never leases work the worker cannot start.
 	Max int `json:"max"`
+	// Resident is the affinity keys this worker currently holds state for.
+	//
+	// It sits on the claim rather than on Capabilities on purpose. Capabilities
+	// are what a worker *can* do: they change when the binary changes, they are
+	// a hard filter, and a task nobody advertises for is a bug. Residency is
+	// what a worker *happens to hold*: it changes on every eviction, it is a
+	// preference, and a key nobody holds is the ordinary state of the world one
+	// second after a process starts. Advertising it as a capability would make
+	// the first request of every session unclaimable.
+	//
+	// It is bounded by whatever bounds the worker's state — delta.Options
+	// MaxBytes, in the usual wiring — because a claim is a request and a
+	// request should not grow without limit.
+	Resident []string `json:"resident,omitempty"`
 	// TTL is the requested lease duration. Implementations may clamp it; the
 	// granted expiry is on the returned lease and is the only one that counts.
 	TTL time.Duration `json:"ttl"`
@@ -259,6 +314,12 @@ type Assignment struct {
 	// included. Above one it means an earlier lease expired, which a worker
 	// can log and a report can total.
 	Delivery int `json:"delivery"`
+	// Local reports that this assignment matched the worker's residency: the
+	// queue handed it here because the state is here. It is the number that
+	// says whether locality is working, and the only place it can be observed
+	// — the worker knows it holds the state and the client knows the task
+	// wanted it, but only the queue saw the two meet.
+	Local bool `json:"local,omitempty"`
 }
 
 // Lease is a worker's exclusive, expiring, fenced claim on one task.
@@ -409,6 +470,13 @@ type Stats struct {
 	Duplicates int `json:"duplicates"`
 	Fenced     int `json:"fenced"`
 	Cancelled  int `json:"cancelled"`
+	// Local counts claims that matched a worker's residency, and Displaced
+	// those where a keyed task went to a worker that did not hold its state.
+	// Their ratio is how well affinity is working; Displaced climbing is
+	// either a fleet too busy to keep sessions together or a grace of zero on
+	// a workload that needed one.
+	Local     int `json:"local"`
+	Displaced int `json:"displaced"`
 }
 
 // --- Capabilities -------------------------------------------------------
@@ -554,6 +622,25 @@ func (c Capabilities) CanRun(r Requirements) error {
 		}
 	}
 	return nil
+}
+
+// Prefers reports whether this claim's worker holds the state a submission
+// wants, which is the queue's whole affinity decision.
+//
+// It lives here rather than in either queue implementation because it is a rule
+// about the protocol and not about storage: two queues that scored locality
+// differently would be two queues, and the conformance suite would have nothing
+// to assert.
+func (c Claim) Prefers(a Affinity) bool {
+	return !a.Zero() && has(c.Resident, a.Key)
+}
+
+// Held reports whether a keyed submission is still within its grace window,
+// counting from when it became claimable — so a task redelivered after its
+// worker died gets a fresh, brief chance to reach another worker holding the
+// same session before it goes to whoever asks.
+func (a Affinity) Held(since, now time.Time) bool {
+	return !a.Zero() && a.Grace > 0 && now.Sub(since) < a.Grace
 }
 
 func has(list []string, want string) bool {

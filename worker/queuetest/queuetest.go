@@ -70,6 +70,9 @@ func Run(t *testing.T, open Open) {
 		{"DeliveryBudgetStopsAPoisonTask", testDeliveryBudget},
 		{"CancelWithdrawsAndFences", testCancel},
 		{"AwaitReturnsTheTerminalState", testAwait},
+		{"AffinityPrefersTheStateHolder", testAffinityPrefers},
+		{"AffinityNeverBlocksTheFleet", testAffinityNeverBlocks},
+		{"AffinityGraceExpires", testAffinityGrace},
 		{"StatsCountDepthsAndEvents", testStats},
 	}
 	for _, tc := range tests {
@@ -136,6 +139,30 @@ func submit(t *testing.T, q worker.Queue, id string) worker.Submission {
 		t.Fatalf("submit %s: %v", id, err)
 	}
 	return s
+}
+
+// submitTo is submit with an affinity: the same task, offered to the fleet with
+// a note about where its state already is.
+func submitTo(t *testing.T, q worker.Queue, id string, a worker.Affinity) worker.Submission {
+	t.Helper()
+	tk := fixture(id)
+	s := worker.Submission{Task: tk, Needs: worker.Require(tk), Affinity: a}
+	if _, err := q.Submit(context.Background(), s); err != nil {
+		t.Fatalf("submit %s: %v", id, err)
+	}
+	return s
+}
+
+// claimAs claims up to n tasks as a worker holding state for the given keys.
+func claimAs(t *testing.T, q worker.Queue, name string, n int, resident ...string) []worker.Assignment {
+	t.Helper()
+	got, err := q.Claim(context.Background(), worker.Claim{
+		Worker: name, Caps: caps(name), Max: n, TTL: TTL, Resident: resident,
+	})
+	if err != nil {
+		t.Fatalf("claim as %s: %v", name, err)
+	}
+	return got
 }
 
 func claimOne(t *testing.T, q worker.Queue, name string) worker.Assignment {
@@ -588,6 +615,89 @@ func testAwait(t *testing.T, q worker.Queue) {
 
 // The accounting is what tells an operator the lease TTL is wrong, so it has
 // to count the things that say so.
+// Affinity is a preference and the queue is expected to act on it: a worker
+// holding a session's state should be offered that session's work ahead of
+// work it has no state for, even when the other work was submitted first.
+func testAffinityPrefers(t *testing.T, q worker.Queue) {
+	submitTo(t, q, "t_plain", worker.Affinity{})
+	submitTo(t, q, "t_other", worker.Affinity{Key: "session/b"})
+	submitTo(t, q, "t_mine", worker.Affinity{Key: "session/a"})
+
+	got := claimAs(t, q, "w1", 1, "session/a")
+	if len(got) != 1 {
+		t.Fatalf("claimed %d tasks, want 1", len(got))
+	}
+	if got[0].Task.ID != "t_mine" {
+		t.Fatalf("claimed %s, want the task whose state this worker holds", got[0].Task.ID)
+	}
+	if !got[0].Local {
+		t.Fatal("the assignment does not report that it matched residency")
+	}
+
+	// And the rest is ordinary work, taken in submission order.
+	rest := claimAs(t, q, "w1", 2, "session/a")
+	if len(rest) != 2 || rest[0].Task.ID != "t_plain" {
+		t.Fatalf("claimed %d tasks starting with %q, want the two unkeyed ones in order",
+			len(rest), rest[0].Task.ID)
+	}
+	for _, a := range rest {
+		if a.Local {
+			t.Fatalf("task %s reported as local", a.Task.ID)
+		}
+	}
+}
+
+// The property that makes affinity safe: a worker that holds nothing still gets
+// the work. Locality that could strand a task would be a hard requirement
+// wearing a soft name, and a fleet whose state-holder has died would stop.
+func testAffinityNeverBlocks(t *testing.T, q worker.Queue) {
+	submitTo(t, q, "t_keyed", worker.Affinity{Key: "session/gone"})
+
+	got := claimAs(t, q, "stranger", 1)
+	if len(got) != 1 || got[0].Task.ID != "t_keyed" {
+		t.Fatalf("a worker holding no state claimed %d tasks; keyed work must not be reserved", len(got))
+	}
+	if got[0].Local {
+		t.Fatal("a claim by a worker holding nothing was reported as local")
+	}
+	if s, err := q.Stats(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if s.Displaced != 1 {
+		t.Fatalf("%d displaced claims, want 1 — the queue should record that state was missed", s.Displaced)
+	}
+}
+
+// A grace window holds keyed work back from workers that do not have its state,
+// briefly. The two halves of "briefly" are both properties: it does hold, and
+// it does let go.
+func testAffinityGrace(t *testing.T, q worker.Queue) {
+	grace := 60 * time.Millisecond
+	submitTo(t, q, "t_keyed", worker.Affinity{Key: "session/a", Grace: grace})
+
+	if got := claimAs(t, q, "stranger", 1); len(got) != 0 {
+		t.Fatalf("a worker holding no state claimed keyed work inside its grace window")
+	}
+	// The state-holder is not held back for a moment.
+	if got := claimAs(t, q, "holder", 1, "session/a"); len(got) != 1 {
+		t.Fatal("the worker holding the state was made to wait for it")
+	}
+
+	// A second keyed task nobody holds state for must reach the fleet once its
+	// grace has passed — the guarantee that this can cost latency but not work.
+	submitTo(t, q, "t_orphan", worker.Affinity{Key: "session/dead", Grace: grace})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := claimAs(t, q, "stranger", 1)
+		if len(got) == 1 && got[0].Task.ID == "t_orphan" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("keyed work was never released to a worker without its state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func testStats(t *testing.T, q worker.Queue) {
 	ctx := context.Background()
 	submit(t, q, "t1")

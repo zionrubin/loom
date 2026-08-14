@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/security"
 )
 
@@ -40,6 +41,26 @@ type Request struct {
 	// below it is silently not cached and costs nothing extra, so setting this
 	// on a short prefix is harmless rather than wasteful.
 	CachePrefix bool `json:"cache_prefix,omitempty"`
+	// Continuation says where this request sits in a sequence of requests over
+	// an evolving context: which one, which revision it extends, and how many
+	// leading bytes of Prefix are certified identical to that revision's
+	// rendering.
+	//
+	// It is an optimization channel and nothing else, and the point is worth
+	// making twice because the failure if anyone forgets is silent. The prompt
+	// on this request is the whole prompt. A provider must never reconstruct
+	// one from a parent plus a change: Loom does not promise that any backend
+	// still holds the parent, and a request that only made sense next to state
+	// somebody else was keeping would stop being replayable, cacheable, or
+	// safe to send to a second provider when the first one failed.
+	//
+	// What it is for is a backend that keeps its own state and can say so — a
+	// local engine with a KV cache, a tokenizer service holding token IDs and
+	// source spans. Stable tells such a backend exactly how much of its
+	// previous work is still valid, and it is not an estimate: it is the
+	// retained region of a certified splice. Providers that have no use for it
+	// ignore it, which is all of them today.
+	Continuation delta.Hint `json:"continuation,omitzero"`
 }
 
 // FullPrompt returns the prompt as the model sees it: shared prefix first,

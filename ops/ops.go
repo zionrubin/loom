@@ -147,14 +147,20 @@ func parsePrefix(stageID, prefix string) (*template.Template, error) {
 }
 
 // sharedPrefix assembles the part of the prompt every call in this stage
-// sends identically: the envelope's context fragments followed by the
-// stage's rendered prefix template.
+// sends identically: the stage's materialized continuation, then the
+// envelope's context fragments, then the stage's rendered prefix template.
 //
 // It is rendered once per task, not once per record — both because the
 // result cannot vary by record (no record data is in scope) and because that
 // is what makes it a prefix the provider can cache across the whole stage.
+//
+// The continuation goes first because it is the largest and the most stable:
+// it is the part that grew by two kilobytes since the last round while the
+// fragments and the template did not change at all, so putting it at the front
+// keeps the longest possible run of unchanged leading bytes — which is what a
+// provider's prefix cache measures, and what delta.Hint.Stable reports.
 func sharedPrefix(ctx context.Context, tmpl *template.Template, rt *executor.Runtime) (string, error) {
-	prefix := contextPrefix(rt.Env)
+	prefix := rt.Continuation.Text + contextPrefix(rt.Env)
 	if tmpl == nil {
 		return prefix, nil
 	}
@@ -201,11 +207,12 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 			return nil, usage, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 		}
 		resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
-			System:      rt.Env.Context.System,
-			Prefix:      prefix,
-			Prompt:      sb.String(),
-			MaxTokens:   maxTokens,
-			CachePrefix: rt.Env.CachePrefix,
+			System:       rt.Env.Context.System,
+			Prefix:       prefix,
+			Prompt:       sb.String(),
+			MaxTokens:    maxTokens,
+			CachePrefix:  rt.Env.CachePrefix,
+			Continuation: rt.Continuation.Hint(),
 		})
 		if err != nil {
 			return nil, usage, modelID, err
@@ -289,11 +296,12 @@ func (r *reduceRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Tas
 		return nil, core.Usage{}, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 	}
 	resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
-		System:      rt.Env.Context.System,
-		Prefix:      prefix,
-		Prompt:      sb.String(),
-		MaxTokens:   maxTokens,
-		CachePrefix: rt.Env.CachePrefix,
+		System:       rt.Env.Context.System,
+		Prefix:       prefix,
+		Prompt:       sb.String(),
+		MaxTokens:    maxTokens,
+		CachePrefix:  rt.Env.CachePrefix,
+		Continuation: rt.Continuation.Hint(),
 	})
 	if err != nil {
 		return nil, core.Usage{}, modelID, err

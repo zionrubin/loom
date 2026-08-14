@@ -88,6 +88,22 @@ type Config struct {
 	// paid for by the time it runs, and the alternative to landing it is a
 	// redelivery that spends the money again.
 	Commits int
+	// Locality reports the state keys this worker currently holds, so the queue
+	// can offer it work it can serve faster. Nil means this worker expresses no
+	// locality, which is the default and costs nothing.
+	//
+	// It is a function rather than a list because residency changes underneath
+	// the worker: a state is admitted when a context is materialized and
+	// evicted when the ceiling is reached, and a snapshot taken at startup
+	// would be wrong within a round. It is called on every claim, so it wants
+	// to be cheap — delta.Store.Resident is a map walk under a mutex — and it
+	// wants to be bounded, because a claim carrying ten thousand keys is a
+	// claim nobody wants to send.
+	//
+	// Nothing depends on it being right. A key reported after the state was
+	// evicted costs a rebuild; a key not reported costs the affinity that would
+	// have avoided one.
+	Locality func() []string
 	// Bus publishes this worker's task events.
 	Bus *observe.Bus
 }
@@ -108,7 +124,13 @@ type WorkerStats struct {
 	// Duplicate counts committed results the queue already had: this worker
 	// executed a task somebody else had finished. Above zero is normal for
 	// at-least-once delivery; growing is a signal the TTL is too short.
-	Duplicate  int           `json:"duplicate"`
+	Duplicate int `json:"duplicate"`
+	// Local counts tasks the queue sent here because this worker already held
+	// their state. Read against Claimed it is how well locality is working, and
+	// it is a performance number rather than a correctness one: the tasks in
+	// the difference ran on a worker that had to rebuild, and produced the same
+	// results a moment later.
+	Local      int           `json:"local"`
 	Rehydrated int           `json:"rehydrated"`
 	Busy       time.Duration `json:"busy"`
 }
@@ -208,9 +230,13 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 
-		assignments, err := w.cfg.Queue.Claim(ctx, Claim{
+		claim := Claim{
 			Worker: w.cfg.Name, Caps: w.cfg.Caps, Max: free, TTL: w.cfg.LeaseTTL,
-		})
+		}
+		if w.cfg.Locality != nil {
+			claim.Resident = w.cfg.Locality()
+		}
+		assignments, err := w.cfg.Queue.Claim(ctx, claim)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -274,6 +300,9 @@ func (w *Worker) handle(ctx context.Context, a Assignment) {
 			s.Busy += time.Since(start)
 			if a.Delivery > 1 {
 				s.Redelivered++
+			}
+			if a.Local {
+				s.Local++
 			}
 		})
 	}()

@@ -77,6 +77,16 @@ type ClientConfig struct {
 	Inline int
 	// Deliveries bounds redelivery per task (zero uses the queue's default).
 	Deliveries int
+	// Affinity is how long the queue holds a task carrying a continuation back
+	// from workers that do not hold its state (default zero: no waiting, pure
+	// preference).
+	//
+	// It buys locality under contention and costs, at most and at worst, this
+	// much latency once per task whose state-holder has died. A poll interval
+	// or two is the useful size; anything approaching a lease is trading the
+	// wrong thing, since the work would run correctly on any worker in the
+	// fleet the whole time it was being held.
+	Affinity time.Duration
 	// Calls bounds how many times a queue call is retried through an
 	// unreachable queue (default 5), and Backoff is the first delay between
 	// tries, doubling to a tenth of a second (default 10ms).
@@ -214,6 +224,12 @@ func (c *Client) submission(t task.Task) (Submission, error) {
 	sub := Submission{
 		Task: t, Needs: Require(t), Client: c.cfg.Name,
 		Deliveries: c.cfg.Deliveries,
+	}
+	// Where the work would rather run, derived from what it carries rather than
+	// declared beside it: a task whose envelope references an evolving context
+	// belongs, if anywhere, on the worker that has already materialized one.
+	if key := t.Locality(); key != "" {
+		sub.Affinity = Affinity{Key: key, Grace: c.cfg.Affinity}
 	}
 	if len(t.Input) == 0 {
 		return sub, nil
