@@ -78,6 +78,18 @@ rather than something bolted onto a generic DAG runner.
   └─────────────────────┘
 ```
 
+The last box is the one that moves. `executor.Local` is the default, and
+`worker.Client` is the same interface over a leased queue — so the right-hand
+column can be another process, or several, without the two to its left
+changing:
+
+```
+  scheduler ──task+envelope──▶ worker.Client ──▶ queue (leases, fencing) ──▶ worker
+       ▲                             │                                        │
+       │                             └──── CAS: inputs, broadcasts, outputs ──┘
+       └────────── task.Result ◀── receipt (usage, cost, output hash)
+```
+
 A run flows: **author** a pipeline → **compile** it into a plan (validation,
 fusion, fingerprints, envelopes) → the **driver** walks stages in
 topological order, building tasks and handing each stage's batch to the
@@ -191,6 +203,45 @@ local implementation:
 Because providers resolve credentials **per call through the broker**,
 executors and ops never hold raw secrets — the same property as vault-style
 egress injection, implemented at the framework boundary.
+
+**The seam, used** (`worker`). `worker.Client` is a second implementation of
+that one method: it puts the task on a durable queue and waits. Local stays the
+default and remote is an adapter, selected at provisioning
+(`loom.WithWorkerService`) and nowhere else, so nothing above the seam learns
+that execution moved off-process. The other side, `loom.Serve`, takes the same
+options and wraps an ordinary `executor.Local` — so *how* a task runs remains
+one implementation rather than two that must be kept in agreement.
+
+Three properties carry it:
+
+- **The queue owns delivery.** Leases with heartbeats, expiry, and **fencing
+  tokens** that increase on every claim. A worker that dies loses its claim
+  rather than the task; a worker that stalled past its expiry is told apart from
+  the live owner by comparing integers rather than by trusting clocks. Delivery
+  is at-least-once, and redelivery is bounded so a task that kills every worker
+  it touches is eventually declared the problem.
+- **The CAS owns payloads.** Inputs above a size threshold, broadcast values,
+  and outputs travel by content hash through storage both sides reach. This is
+  what makes at-least-once delivery produce exactly-once *work*: two workers
+  executing one task write identical bytes to one address, and exactly one of
+  their commits becomes the receipt. A commit against a finished task returns
+  the winning receipt rather than creating a second one; a commit under a fenced
+  lease against an unfinished task is refused.
+- **Workers advertise capabilities.** Stages (a runner is code and cannot be
+  serialized), providers, tools, sandbox profiles, MCP servers, and concurrency.
+  In one process "this executor can run this task" is true by construction;
+  across a fleet it is a question, and a claim refused before it is made costs
+  nothing where a task failed after a model call does not.
+
+Recovery policy stays with the scheduler. The queue redelivers *silence* — a
+lease nobody renewed — while a task that failed is reported to the client with
+its `FailureClass` intact, so backoff, the escalation ladder and dead-lettering
+continue to happen where the run's budget and the binding's ladder are known.
+
+Two queue backends implement one contract and pass one conformance suite
+(`worker/queuetest`): `worker.MemQueue` for a process with several workers in
+it, and `worker/filequeue` — an append-only log plus an `O_EXCL` lock
+directory — for several processes over a shared directory.
 
 ### 4.6 Model layer
 
@@ -431,17 +482,38 @@ The local runtime is a complete, correct single-node system. Scaling out
 does not change the programming model or the planner — it replaces the
 executor and the state backends behind existing interfaces.
 
-**Phase 1 — remote executor fleet.** Implement `Executor` as a client to a
-worker service: tasks (already serializable, envelope included) go onto a
-queue with **leases**; workers claim, execute, and report. Lease expiry
-gives at-least-once execution; the deterministic cache key makes duplicate
-execution harmless (idempotent writes into the CAS). The scheduler's
-admission control moves to a shared token-bucket service so the whole fleet
-respects provider limits collectively.
+**Phase 1 — remote executor fleet (implemented).** `Executor` implemented as a
+client to a worker service: tasks (already serializable, envelope included) go
+onto a queue with **leases**; workers claim, execute, and report. It landed
+exactly where the interface said it would — no change to the planner, the
+scheduler, the ops, or a single pipeline — and the one thing the design note
+underestimated is worth stating: lease expiry gives at-least-once *delivery*,
+and turning that into at-least-once *execution without duplicate results* needs
+two mechanisms rather than one. Content addressing makes a duplicate
+execution's output identical and its write idempotent, as predicted; a
+**fencing token** on the commit is what stops the worker that was presumed dead
+from overwriting the worker that replaced it when it turns out to have been
+merely slow. §4.5 has the details, `examples/worker-fleet` runs it, and
+`worker_process_test.go` kills a worker mid-call and checks the run's answers
+against a single-process baseline.
+
+Still open in this phase: the scheduler's admission control is still per-client,
+so a fleet's collective respect for provider limits rests on how the clients are
+configured rather than on a shared token-bucket service; per-call telemetry
+stays in the process that made the calls, so a remote run's report is exact in
+tokens, cost and cache rate but counts model calls per task; and the queue is a
+directory or a map, with a broker-backed implementation of the same contract
+left to whoever needs many hosts.
 
 **Phase 2 — shared state.** The CAS maps naturally onto object storage
 (S3/GCS) with the same hash keys; the cache index and lineage onto any
-KV/OLTP store. Nothing in the interfaces assumes locality.
+KV/OLTP store. Nothing in the interfaces assumes locality. Phase 1 took the
+first step of this on its way past: a state directory shared by a fleet is
+already shared state, and `store.Cache` now re-reads its append-only index on a
+miss so a worker replays what a *sibling process* paid for rather than only what
+it paid for itself. What remains is the same trick against storage that is not a
+filesystem, behind a `worker.Blobs`-shaped interface the executor already talks
+through.
 
 **Phase 3 — sandbox depth.** The envelope's sandbox profiles are implemented
 by worker runtimes: subprocess isolation for untrusted pure ops, containers
@@ -521,11 +593,19 @@ subjects, negative results, per-topic volatility horizons, append-only revision
 and retraction with dependent reporting, and capability containment), mock,
 Anthropic,
 OpenAI, and llama.cpp providers (the last with device-width admission control,
-loopback egress, no-credential envelopes, and KV-cache prefix reuse), and
-cross-restart cache resume.
+loopback egress, no-credential envelopes, and KV-cache prefix reuse),
+cross-restart and cross-process cache resume, and the remote executor fleet
+(`worker`: a durable queue with leases, heartbeats, expiry and fencing tokens;
+capability-advertising workers; CAS-referenced inputs and outputs; idempotent
+result commit; two queue backends behind one conformance suite; and failure
+tests for worker death, late results, lease expiry, network interruption and
+duplicate execution, including a multi-process test that SIGKILLs a worker
+mid-call).
 
-Designed but not yet implemented: remote executor backends, shared state
-stores, subprocess/container/WASM sandbox runtimes, ensemble operators,
+Designed but not yet implemented: a shared admission-control service so a fleet
+respects provider limits collectively rather than per client, a broker-backed
+queue for fleets spanning hosts, object-storage state backends,
+subprocess/container/WASM sandbox runtimes, ensemble operators,
 priority/preemptive scheduling, result-cache eviction, a single-flight lease on
 the *result* cache (the findings gate has one; the result cache does not, so
 concurrent identical tasks still both run — see `examples/commons`), findings

@@ -29,6 +29,7 @@ import (
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
 	"github.com/zionrubin/loom/task"
+	"github.com/zionrubin/loom/worker"
 )
 
 // Config controls a run. Build it with Options passed to Run.
@@ -50,6 +51,16 @@ type Config struct {
 	EventHandler    func(observe.Event)
 	Streaming       bool
 	BatchWait       time.Duration
+	// Queue routes execution to a worker fleet instead of this process. Nil —
+	// the default — keeps every task local.
+	Queue worker.Queue
+	// QueueWait bounds how long one task may sit on the queue unfinished
+	// before the client gives up on it (zero: until the run's context ends).
+	QueueWait time.Duration
+	// WorkerName is this process's identity in the fleet, and WorkerLease how
+	// long its claims stand without a heartbeat. Both apply to Serve only.
+	WorkerName  string
+	WorkerLease time.Duration
 	// AdmissionAging tunes a fleet's slot-admission fairness (zero = the
 	// runtime default). It has no effect on a single Run, whose tasks all
 	// belong to one program and therefore tie.
@@ -300,6 +311,70 @@ func WithBatchWait(d time.Duration) Option { return func(c *Config) { c.BatchWai
 // WithEventHandler attaches a synchronous observer of all run events.
 func WithEventHandler(fn func(observe.Event)) Option {
 	return func(c *Config) { c.EventHandler = fn }
+}
+
+// WithWorkerService runs this pipeline's tasks on a fleet of worker processes
+// instead of executing them here: tasks go onto q with leases, workers claim
+// them, and the results come back through shared content-addressed storage.
+//
+// It changes one thing and deliberately nothing else. The planner still
+// compiles the same plan, the scheduler still applies the same admission
+// control, class-aware retry, escalation ladder and budget, and the run still
+// returns the same RunResult — because Executor is one method over serializable
+// data, and this option swaps which implementation of it the scheduler calls.
+// A pipeline does not know it has been distributed.
+//
+// The other side of the queue is loom.Serve, and it takes the same options:
+//
+//	// every worker process
+//	loom.Serve(ctx, pipeline, opts...)
+//
+//	// the process driving the run
+//	loom.Run(ctx, pipeline, append(opts, loom.WithWorkerService(q))...)
+//
+// Two things must be true of the fleet, and both fail loudly rather than
+// quietly. Every worker needs the pipeline compiled into it, because an op is
+// code and a runner cannot be serialized — a worker advertises the stages it
+// has and claims nothing else. And every worker must share this process's
+// content-addressed storage, because inputs, broadcast values and outputs
+// travel by hash: use WithStateDir pointing at shared storage, and a task whose
+// blob cannot be resolved fails as the deployment error it is.
+func WithWorkerService(q worker.Queue) Option {
+	return func(c *Config) { c.Queue = q }
+}
+
+// WithWorkerWait bounds how long the client waits for one task before giving
+// up on it and letting the scheduler retry.
+//
+// Giving up is not cancelling: re-submitting the same task ID re-attaches to
+// the work already in flight rather than enqueueing a second copy, so the
+// bound costs a wait and never a duplicate. What it buys is a run that fails
+// loudly when no worker in the fleet advertises a stage, instead of one that
+// hangs until somebody looks at it.
+func WithWorkerWait(d time.Duration) Option {
+	return func(c *Config) { c.QueueWait = d }
+}
+
+// WithWorkerName names this process in the fleet. It is the lease owner
+// recorded against every task the worker claims, so it must be unique across
+// the fleet; the default — host, pid and entropy — is.
+//
+// Set it when the deployment already has stable identities worth seeing in a
+// report: a pod name, a systemd instance, a shard number.
+func WithWorkerName(name string) Option {
+	return func(c *Config) { c.WorkerName = name }
+}
+
+// WithWorkerLease sets how long this worker's claims stand without a
+// heartbeat (default 30s, and never longer than the queue's own maximum).
+//
+// It is the bound on how long a killed worker delays the task it was holding,
+// so shorter recovers faster — and the reason it can be short at all is that a
+// live worker renews. The renewal interval follows the lease the queue
+// actually granted rather than this number, so a queue that clamps cannot
+// starve a healthy worker of heartbeats.
+func WithWorkerLease(d time.Duration) Option {
+	return func(c *Config) { c.WorkerLease = d }
 }
 
 // RunResult is the outcome of a run: outputs, telemetry, dead letters,

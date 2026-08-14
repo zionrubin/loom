@@ -182,7 +182,28 @@ Continuum — and says which rows are honestly still empty.
 - **Content-addressed caching = checkpointing** — task results are keyed by
   op fingerprint + input content. Reruns and crash recovery replay
   completed AI work with zero model calls and zero cost, across process
-  restarts with a state dir.
+  restarts with a state dir, and across the *processes of a fleet* with a
+  shared one.
+- **A fleet of worker processes** — `loom.WithWorkerService` puts a run's tasks
+  on a durable queue with leases and lets worker processes claim them;
+  `loom.Serve` is the other side, and takes the same options. Nothing above the
+  executor seam changes, because `Executor` is one method over serializable
+  data: the planner, the admission control, the escalation ladder, the governor,
+  the cache and the event stream cannot tell which process a task ran in. What
+  distribution costs is a lease, and the lease is what makes it survivable — a
+  worker killed mid-call loses its claim rather than the task, and the task is
+  redelivered. Delivery is therefore at-least-once, and it produces
+  exactly-once *work*: results are written to an address derived from their own
+  bytes and committed under a **fencing token**, so a duplicate execution writes
+  the same blob to the same place and exactly one of the two commits becomes the
+  result — the other is told which one won, and a worker that stalled past its
+  expiry cannot overwrite the worker that replaced it. Workers advertise what
+  they can serve (stages, providers, tools, sandbox profiles, MCP servers,
+  concurrency) and claim nothing else, because across a fleet "this executor can
+  run this task" stops being true by construction. Two queues ship behind one
+  contract and one conformance suite: in-memory for a process with several
+  workers in it, and `worker/filequeue` for several processes over a shared
+  directory.
 - **A commons for external research** — `loom.WithFindings` gates the tools that
   reach public sources, keying on the *question* rather than on the bytes,
   because that is the duplication a result cache cannot see: one question in
@@ -331,6 +352,15 @@ go run ./examples/on-device -fast http://127.0.0.1:8080 -deep http://127.0.0.1:8
 # workers against two decode slots, admitted two at a time
 go run ./examples/on-device -view localhost:8077 -slow 400ms
 
+# one pipeline across several worker *processes*, with one of them killed by
+# SIGKILL while it holds a paid model call. Prints what the kill cost (the
+# calls the dead worker had started, re-executed — and nothing else) and
+# checks every record's answer against a single-process run of the same
+# pipeline
+go run ./examples/worker-fleet
+go run ./examples/worker-fleet -workers 5 -docs 40
+go run ./examples/worker-fleet -kill=false   # the undisturbed fleet: same cost as local
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -375,6 +405,7 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `observe` | Event bus, metrics collector, run reports |
 | `viz` | Constellation view: live web visualization of a run (tasks and executors as stars), and the universe of every run in the process |
 | `studio` | Loom Studio: the pipeline as an editable document — canvas, live projection, ⌘K proposals, and a Go export that compiles |
+| `worker` | The executor seam used: a durable task queue with leases, heartbeats, expiry and fencing tokens; a client that implements `Executor` over it; and the worker that claims, executes and commits. `worker/filequeue` spans processes over a shared directory; `worker/queuetest` is the conformance suite both queues pass |
 | `task` | Task + envelope types (serializable — the distribution seam) |
 
 ## Knowing what a run will cost

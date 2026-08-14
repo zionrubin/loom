@@ -24,6 +24,7 @@ import (
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/worker"
 )
 
 // Fleet runs many pipelines at once as one engine.
@@ -718,6 +719,11 @@ type host struct {
 	// config was given, which leaves every tool exactly as it was.
 	commons *findings.Gate
 	ledger  *findings.Ledger
+	// remote is the executor that puts tasks on a worker queue instead of
+	// running them here. Nil unless WithWorkerService was given, which is what
+	// keeps local execution the default: distribution is an adapter installed
+	// at provisioning, not a mode the scheduler knows about.
+	remote *worker.Client
 
 	mu     sync.Mutex
 	traces map[string]*agentTrace
@@ -796,6 +802,15 @@ func newHost(cfg Config) (*host, error) {
 	h.shared = store.NewBroadcasts(cas)
 	h.client = &executor.ModelClient{
 		Registry: cfg.Registry, Broker: h.broker, Audit: audit, Bus: h.bus,
+	}
+	if cfg.Queue != nil {
+		// The workers read and write through the same CAS this host holds, which
+		// is why the client is built here rather than by the caller: a queue
+		// client pointed at a different store would be a fleet that cannot
+		// resolve its own inputs.
+		h.remote = worker.NewClient(worker.ClientConfig{
+			Queue: cfg.Queue, Blobs: h.cas, Bus: h.bus, Wait: cfg.QueueWait,
+		})
 	}
 
 	// MCP servers are connected before anything else, because everything else
@@ -1034,14 +1049,20 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		return nil, err
 	}
 
-	local := &executor.Local{
+	// Local is the default and the fallback both: a fleet of workers is one
+	// more implementation of the same one method, chosen here and nowhere else,
+	// so nothing downstream of this line can tell which it got.
+	var exec executor.Executor = &executor.Local{
 		Runners: runners, Client: h.client, Tools: h.tools,
 		Broadcasts: h.shared,
 		Audit:      h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
 	}
+	if h.remote != nil {
+		exec = h.remote
+	}
 	sched := runtime.Scheduler{
 		Workers: cfg.Workers, Retry: cfg.Retry, Limiter: h.limiter,
-		Governor: h.gov, Registry: cfg.Registry, Exec: local, Bus: h.bus,
+		Governor: h.gov, Registry: cfg.Registry, Exec: exec, Bus: h.bus,
 		ContinueOnError: cfg.ContinueOnError,
 	}
 

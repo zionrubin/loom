@@ -6,6 +6,7 @@ reports
 # Binaries built from ./examples/... by a bare `go build`
 /mcp-desk
 /agent-forge
+/worker-fleet
 blueprint
 .loom-run
 .agent
