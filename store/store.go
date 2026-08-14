@@ -10,11 +10,11 @@
 package store
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -102,11 +102,22 @@ func (c *CAS) Get(hash string) ([]byte, bool) {
 // Cache maps deterministic task keys to CAS artifacts holding record slices.
 // With dir != "", the index is persisted as JSONL and reloaded on open,
 // giving cross-run resume.
+//
+// The index is also re-read on a miss, which is what makes resume work across
+// *processes* rather than only across runs. Several executors sharing a state
+// directory — a fleet of worker processes, a batch beside a service — each
+// hold their own fold of one append-only file, and an entry another process
+// wrote is invisible until this one looks again. Looking on a miss is the
+// cheapest possible place to do it: a miss is about to cost a model call, so a
+// file read is free by comparison, and a hit never touches the disk at all. A
+// size check keeps a cold run from re-reading its own writes.
 type Cache struct {
 	mu   sync.Mutex
 	idx  map[string]string
 	cas  *CAS
 	file *os.File
+	path string // the index, "" when memory-only
+	off  int64  // how far into the index this process has folded
 }
 
 type cacheIndexEntry struct {
@@ -124,18 +135,12 @@ func NewCache(cas *CAS, dir string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, "index.jsonl")
-	if data, err := os.ReadFile(path); err == nil {
-		dec := json.NewDecoder(bytes.NewReader(data))
-		for dec.More() {
-			var e cacheIndexEntry
-			if err := dec.Decode(&e); err != nil {
-				break
-			}
-			c.idx[e.Key] = e.Artifact
-		}
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	c.path = filepath.Join(dir, "index.jsonl")
+	c.mu.Lock()
+	c.syncLocked()
+	c.mu.Unlock()
+
+	f, err := os.OpenFile(c.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -143,10 +148,50 @@ func NewCache(cas *CAS, dir string) (*Cache, error) {
 	return c, nil
 }
 
+// syncLocked folds whatever has been appended to the index since this process
+// last looked. Callers hold c.mu.
+//
+// Only whole records advance the offset, so an append another process is in
+// the middle of writing is picked up on the next look rather than folded in
+// half.
+func (c *Cache) syncLocked() {
+	if c.path == "" {
+		return
+	}
+	info, err := os.Stat(c.path)
+	if err != nil || info.Size() <= c.off {
+		return
+	}
+	f, err := os.Open(c.path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	base := c.off
+	if _, err := f.Seek(base, io.SeekStart); err != nil {
+		return
+	}
+	dec := json.NewDecoder(f)
+	for {
+		var e cacheIndexEntry
+		if err := dec.Decode(&e); err != nil {
+			return
+		}
+		c.idx[e.Key] = e.Artifact
+		c.off = base + dec.InputOffset()
+	}
+}
+
 // Get returns cached records for key.
 func (c *Cache) Get(key string) ([]core.Record, bool) {
 	c.mu.Lock()
 	artifact, ok := c.idx[key]
+	if !ok {
+		// A miss is worth one look at what other processes have written: the
+		// alternative is re-running work the fleet has already paid for.
+		c.syncLocked()
+		artifact, ok = c.idx[key]
+	}
 	c.mu.Unlock()
 	if !ok {
 		return nil, false
@@ -178,7 +223,15 @@ func (c *Cache) Put(key string, recs []core.Record) (string, error) {
 		c.idx[key] = artifact
 		if c.file != nil {
 			line, _ := json.Marshal(cacheIndexEntry{Key: key, Artifact: artifact})
-			_, _ = c.file.Write(append(line, '\n'))
+			if _, err := c.file.Write(append(line, '\n')); err == nil {
+				// Where the append landed, so a later miss does not re-read
+				// this process's own writes. With O_APPEND the write goes to
+				// the end and leaves the descriptor there, wherever another
+				// process has since written.
+				if at, err := c.file.Seek(0, io.SeekCurrent); err == nil {
+					c.off = at
+				}
+			}
 		}
 	}
 	return artifact, nil
