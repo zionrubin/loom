@@ -222,19 +222,29 @@ func (c *Cache) Put(key string, recs []core.Record) (string, error) {
 	if _, dup := c.idx[key]; !dup {
 		c.idx[key] = artifact
 		if c.file != nil {
-			line, _ := json.Marshal(cacheIndexEntry{Key: key, Artifact: artifact})
-			if _, err := c.file.Write(append(line, '\n')); err == nil {
-				// Where the append landed, so a later miss does not re-read
-				// this process's own writes. With O_APPEND the write goes to
-				// the end and leaves the descriptor there, wherever another
-				// process has since written.
-				if at, err := c.file.Seek(0, io.SeekCurrent); err == nil {
+			line := append(mustMarshal(cacheIndexEntry{Key: key, Artifact: artifact}), '\n')
+			if n, err := c.file.Write(line); err == nil {
+				// Advance past our own append, but only when it landed exactly
+				// where our fold ended. With O_APPEND the write goes to the
+				// end of the file, which is further along than we have read if
+				// another process has written since — and skipping to it would
+				// silently drop that process's entries. When that has happened
+				// the offset stays put and the next miss re-folds our own line,
+				// which costs a few bytes and cannot lose anything.
+				if at, err := c.file.Seek(0, io.SeekCurrent); err == nil && at == c.off+int64(n) {
 					c.off = at
 				}
 			}
 		}
 	}
 	return artifact, nil
+}
+
+// mustMarshal encodes an index entry, which cannot fail: both fields are
+// strings.
+func mustMarshal(e cacheIndexEntry) []byte {
+	b, _ := json.Marshal(e)
+	return b
 }
 
 // Len returns the number of cached entries.

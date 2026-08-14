@@ -71,6 +71,10 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	// From here on the host's config is the one that counts: newHost fills in
+	// what was left unset — a registry, above all — and compiling against the
+	// caller's copy would compile against the holes.
+	cfg = h.cfg
 
 	// The plan is compiled here for exactly one reason: its runners. A worker
 	// never schedules, never fans out and never reads the DAG — it needs the

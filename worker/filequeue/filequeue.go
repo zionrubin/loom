@@ -26,10 +26,15 @@
 //   - durability that outlives every process holding it, which is the whole
 //     point of leasing work rather than assigning it.
 //
-// What it is not is a distributed queue. A shared directory is a machine (or an
-// NFS mount, whose locking guarantees are exactly as good as its
-// administrator's claims), so use it for many processes on one host, and put a
-// real queue behind worker.Queue for many hosts.
+// Two limits are worth knowing before deploying it. It is not a *distributed*
+// queue: a shared directory is a machine (or an NFS mount, whose locking
+// guarantees are exactly as good as its administrator's claims), so use it for
+// many processes on one host and put a real queue behind worker.Queue for many
+// hosts. And the log does not compact — every submission, claim, heartbeat and
+// commit is a line that stays — so a queue serving continuous work indefinitely
+// grows a replay a new handle has to fold and a claim has to scan past. A
+// directory per batch, or per day, is the answer that needs no code; compaction
+// under the same lock is the answer that would need some.
 package filequeue
 
 import (
@@ -53,6 +58,7 @@ import (
 type Queue struct {
 	dir  string
 	opts Options
+	id   string // this handle's identity, stamped on the locks it takes
 
 	mu     sync.Mutex
 	offset int64 // how far into the log this process has replayed
@@ -73,9 +79,10 @@ type Options struct {
 	// one stat and a read of whatever was appended since the last one.
 	Poll        time.Duration
 	PollCeiling time.Duration
-	// LockTimeout is how long a writer waits for the directory lock (default
-	// 5s), and LockStale how old a lock must be before it is assumed to belong
-	// to a process that died holding it (default 30s).
+	// LockStale is how long a lock must sit unmoved before a waiter may break
+	// it (default 5s), and LockTimeout how long a writer waits for it before
+	// giving up (default 12s, and always more than twice LockStale — a wait
+	// shorter than the stale window could never break a dead holder's lock).
 	LockTimeout time.Duration
 	LockStale   time.Duration
 	// Now is the clock, injectable for tests.
@@ -87,8 +94,14 @@ const (
 	lockName           = "queue.lock"
 	defaultPoll        = 20 * time.Millisecond
 	defaultPollCeiling = 250 * time.Millisecond
-	defaultLockTimeout = 5 * time.Second
-	defaultLockStale   = 30 * time.Second
+	// A mutation is a handful of file operations — microseconds to
+	// milliseconds — so five seconds of no movement is three orders of
+	// magnitude past "slow" and firmly into "gone". Breaking a lock takes a
+	// full stale window of watching, so the wait has to outlast one or a
+	// process that died holding the lock would fail every call instead of
+	// costing one pause.
+	defaultLockStale   = 5 * time.Second
+	defaultLockTimeout = 12 * time.Second
 )
 
 func (o Options) normalize() Options {
@@ -104,11 +117,16 @@ func (o Options) normalize() Options {
 	if o.PollCeiling < o.Poll {
 		o.PollCeiling = max(defaultPollCeiling, o.Poll)
 	}
+	if o.LockStale <= 0 {
+		o.LockStale = defaultLockStale
+	}
 	if o.LockTimeout <= 0 {
 		o.LockTimeout = defaultLockTimeout
 	}
-	if o.LockStale <= 0 {
-		o.LockStale = defaultLockStale
+	if o.LockTimeout <= o.LockStale {
+		// A wait shorter than the stale window can never break a dead holder's
+		// lock: it gives up while still earning the right to remove it.
+		o.LockTimeout = o.LockStale * 2
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -124,7 +142,7 @@ func Open(dir string, opts Options) (*Queue, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Queue{dir: dir, opts: opts.normalize(), state: newState()}, nil
+	return &Queue{dir: dir, opts: opts.normalize(), id: worker.ID("fq"), state: newState()}, nil
 }
 
 // Dir returns the directory this queue lives in.
@@ -342,35 +360,84 @@ func (q *Queue) sync() error {
 //
 // A directory created with O_EXCL is the portable atomic test-and-set: the
 // filesystem either creates it or reports that it exists, everywhere, with no
-// advisory-locking semantics to reason about. The stale break keeps a process
-// that died holding it from stopping the queue forever — which is the same
-// reasoning the leases one level up are built on, applied to the lock itself.
+// advisory-locking semantics to reason about. The interesting part is what
+// happens when the holder dies, and the answer is the same one the leases a
+// level up give — with the same two mechanisms, for the same reasons.
+//
+// The lock is *stamped* with a token unique to the acquisition, and:
+//
+//   - a breaker may only remove a lock whose token *it* has watched, unchanged,
+//     for the whole stale window. A process that just arrived cannot break a
+//     lock it has never seen, so a lock taken and released quickly by a healthy
+//     writer is never a candidate however slow the clock;
+//   - a release only removes the lock if the token still there is its own. That
+//     is the fencing check, and it is what stops the one hazard a timeout-based
+//     break really has: a holder that was declared dead, was broken, and then
+//     woke up would otherwise release the *new* owner's lock and leave two
+//     writers appending at once.
+//
+// What remains is a window in which a suspended holder and its replacement both
+// believe they hold the lock. It is bounded by the stale window, which is three
+// orders of magnitude longer than a mutation takes, and it is the price of a
+// lock whose owner can die. A queue that cannot afford it wants a backend with
+// real transactions.
 func (q *Queue) lock() (func(), error) {
 	path := filepath.Join(q.dir, lockName)
+	stamp := filepath.Join(path, "owner")
+	token := fmt.Sprintf("%s-%d-%d", q.id, os.Getpid(), time.Now().UnixNano())
+
 	deadline := time.Now().Add(q.opts.LockTimeout)
 	wait := 200 * time.Microsecond
+	// seen is the token this process has been watching, and since when. It is
+	// per-attempt state deliberately: the right to break a lock is earned by
+	// waiting on it, and cannot be inherited from an earlier wait.
+	var seenToken string
+	var seenAt time.Time
+
 	for {
 		err := os.Mkdir(path, 0o755)
 		if err == nil {
-			return func() { _ = os.Remove(path) }, nil
+			_ = os.WriteFile(stamp, []byte(token), 0o644)
+			return func() { q.unlock(path, stamp, token) }, nil
 		}
 		if !os.IsExist(err) {
 			return nil, err
 		}
-		if info, serr := os.Stat(path); serr == nil {
-			if time.Since(info.ModTime()) > q.opts.LockStale {
-				_ = os.Remove(path)
-				continue
-			}
+
+		held, _ := os.ReadFile(stamp)
+		switch cur := string(held); {
+		case cur == "" || cur != seenToken:
+			// A lock we have not been watching, or one that changed hands while
+			// we waited. Either way the clock starts now.
+			seenToken, seenAt = cur, time.Now()
+		case time.Since(seenAt) > q.opts.LockStale:
+			// The same holder, unmoved for the whole stale window. Remove the
+			// stamp before the directory so a holder that wakes up finds its
+			// token gone and declines to release anyone else's lock.
+			_ = os.Remove(stamp)
+			_ = os.Remove(path)
+			seenToken, seenAt = "", time.Time{}
+			continue
 		}
+
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("filequeue: lock at %s is held (waited %s)", path, q.opts.LockTimeout)
+			return nil, fmt.Errorf("filequeue: lock at %s is held (waited %s)",
+				path, q.opts.LockTimeout)
 		}
 		time.Sleep(wait)
 		if wait < 5*time.Millisecond {
 			wait *= 2
 		}
 	}
+}
+
+// unlock releases the lock, but only if it is still ours.
+func (q *Queue) unlock(path, stamp, token string) {
+	if held, err := os.ReadFile(stamp); err != nil || string(held) != token {
+		return // broken and re-taken: releasing now would release its owner
+	}
+	_ = os.Remove(stamp)
+	_ = os.Remove(path)
 }
 
 // read replays and runs fn against the state, under q.mu.

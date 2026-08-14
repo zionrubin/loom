@@ -30,7 +30,7 @@ func TestConformance(t *testing.T) {
 // A second process opening the same directory sees the first one's work. This
 // is the property the in-memory queue cannot have and the whole reason this
 // backend exists — tested here at the level of two independent handles, and
-// end-to-end with real processes in worker/process_test.go.
+// end-to-end with real processes in the root package's worker_process_test.go.
 func TestTwoHandlesShareOneQueue(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *filequeue.Queue {

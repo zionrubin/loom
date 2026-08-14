@@ -101,6 +101,10 @@ type WorkerStats struct {
 	// Fenced counts tasks dropped mid-execution because the lease was lost.
 	// It is the number that says the TTL is short relative to the work.
 	Fenced int `json:"fenced"`
+	// Dropped counts tasks cut short because this worker was stopped past its
+	// drain window — work the fleet will redeliver, and the cost of not
+	// letting a worker finish.
+	Dropped int `json:"dropped"`
 	// Duplicate counts committed results the queue already had: this worker
 	// executed a task somebody else had finished. Above zero is normal for
 	// at-least-once delivery; growing is a signal the TTL is too short.
@@ -316,6 +320,20 @@ func (w *Worker) handle(ctx context.Context, a Assignment) {
 
 	a.Lease, a.Task = lease, t
 	if err != nil {
+		if ctx.Err() != nil {
+			// Not the task's failure: this worker was stopped past its drain
+			// window and cut its own work short. Reporting it would mark the
+			// task failed and put its recovery under the scheduler's retry
+			// policy, when what should happen is the thing a kill would have
+			// done anyway — the lease expires and the task is redelivered.
+			w.count(func(s *WorkerStats) { s.Dropped++ })
+			w.publish(observe.Event{
+				Type: observe.TaskRetried, RunID: t.Envelope.RunID, Stage: t.Stage,
+				TaskID: t.ID, Worker: w.cfg.Name, Attempt: a.Delivery,
+				Note: "worker stopped: the lease will expire and the task be redelivered",
+			})
+			return
+		}
 		w.settleFailure(ctx, a, err)
 		return
 	}

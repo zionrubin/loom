@@ -101,11 +101,14 @@ type ClientConfig struct {
 // ClientStats is what the client saw: how much work it dispatched, and the
 // shape of what came back.
 type ClientStats struct {
-	Submitted   int           `json:"submitted"`
-	Completed   int           `json:"completed"`
-	Failed      int           `json:"failed"`
-	Duplicate   int           `json:"duplicate"`
-	Detached    int           `json:"detached"`
+	Submitted int `json:"submitted"`
+	Completed int `json:"completed"`
+	Failed    int `json:"failed"`
+	Detached  int `json:"detached"`
+	// Redelivered counts results whose task had been handed out more than once
+	// — the client's view of a worker having died holding it. Duplicate
+	// *execution* is not visible from here: only the worker that lost the race
+	// knows it ran, so worker.WorkerStats.Duplicate is where that is counted.
 	Redelivered int           `json:"redelivered"`
 	TimedOut    int           `json:"timed_out"`
 	Wait        time.Duration `json:"wait"`

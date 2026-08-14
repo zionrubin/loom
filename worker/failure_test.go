@@ -760,3 +760,80 @@ func TestUnservableTaskFailsWithADiagnosis(t *testing.T) {
 func wildcard(name string) worker.Capabilities {
 	return worker.Capabilities{Worker: name, Wildcard: true, Concurrency: 4}
 }
+
+// --- graceful stop ------------------------------------------------------
+
+// A worker stopped past its drain window cuts its work short. That is the
+// worker's problem, not the task's, and reporting it as a task failure would be
+// worse than saying nothing: a cancelled context classifies as permanent, so
+// the queue would record a dead letter for a task that is perfectly runnable
+// and the scheduler would never retry it. Silence is the right answer, because
+// silence is what the queue already knows how to recover from.
+func TestStoppedWorkerLeavesTheTaskRedeliverable(t *testing.T) {
+	f := newFleet(t)
+	ctx := t.Context()
+
+	tk := job("t1", "hello")
+	if _, err := f.q.Submit(ctx, worker.Submission{Task: tk, Needs: worker.Require(tk)}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	held := newScripted()
+	held.hold() // never finishes on its own: the drain window has to expire
+	w, err := worker.New(worker.Config{
+		Queue: f.q, Blobs: f.cas, Exec: held, Name: "stopping",
+		Caps: wildcard("stopping"), LeaseTTL: ttl, Heartbeat: ttl / 4,
+		Poll: 2 * time.Millisecond, PollCeiling: 10 * time.Millisecond,
+		Drain: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+	wctx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Run(wctx) }()
+
+	select {
+	case <-held.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the worker never started the task")
+	}
+
+	stop()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker did not stop within its drain window")
+	}
+	held.release()
+
+	s, _, err := f.q.Status(ctx, "t1")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if s.State == worker.StateFailed {
+		t.Fatalf("a stopped worker dead-lettered its task: %+v", s.Failure)
+	}
+	if st := w.Stats(); st.Dropped != 1 {
+		t.Fatalf("the worker reported %d dropped tasks, want 1 (%+v)", st.Dropped, st)
+	}
+
+	// And the fleet recovers it the way it recovers from a kill: the lease
+	// expires and somebody else claims it.
+	survivor := newScripted()
+	f.start("survivor", f.q, survivor)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, _, err := f.q.Status(ctx, "t1")
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if s.State == worker.StateDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the task never came back: it is %s", s.State)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

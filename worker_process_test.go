@@ -109,8 +109,10 @@ func fleetOptions(spec workerSpec, reg *model.Registry) []loom.Option {
 // actually do — spans all of them.
 func countingMock(reg *model.Registry, callLog string, latency time.Duration) error {
 	_, err := model.RegisterMock(reg, "mock-fast", model.TierFast,
-		model.WithLatency(latency),
 		model.WithHandler(func(req model.Request) (string, error) {
+			// Logged as the call starts, with the delay taken afterwards: a
+			// worker killed mid-call has already spent the money, and a log of
+			// completed calls only would report the kill as free.
 			if callLog != "" {
 				f, err := os.OpenFile(callLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 				if err == nil {
@@ -121,6 +123,7 @@ func countingMock(reg *model.Registry, callLog string, latency time.Duration) er
 					_ = f.Close()
 				}
 			}
+			time.Sleep(latency)
 			return "SUMMARY: " + strings.TrimPrefix(req.Prompt, "Summarize: "), nil
 		}))
 	return err

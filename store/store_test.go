@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/zionrubin/loom/core"
@@ -160,5 +161,65 @@ func TestLineage(t *testing.T) {
 	entries := l.Entries()
 	if len(entries) != 1 || entries[0].Artifact != "a" || entries[0].Time.IsZero() {
 		t.Fatalf("unexpected lineage: %+v", entries)
+	}
+}
+
+// Two live handles on one state directory are what a fleet of worker processes
+// is, and the checkpoint property has to hold across them: work one member
+// paid for must not be paid for again by the next.
+//
+// The interleaving is the point. Each handle appends to the same index and
+// folds it independently, so a handle that advanced its read offset past
+// another's writes would lose them silently — the run would simply cost more,
+// with nothing in it looking wrong.
+func TestCacheSharedBetweenConcurrentHandles(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *Cache {
+		cas, err := NewCAS(dir + "/cas")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := NewCache(cas, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	a, b := open(), open()
+
+	rec := func(v string) []core.Record {
+		return []core.Record{core.NewRecord("r", map[string]any{"v": v})}
+	}
+
+	// Interleaved, so each handle's own append lands after the other's.
+	for i := range 6 {
+		key := fmt.Sprintf("key%d", i)
+		writer := a
+		if i%2 == 1 {
+			writer = b
+		}
+		if _, err := writer.Put(key, rec(key)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	for _, c := range []*Cache{a, b} {
+		for i := range 6 {
+			key := fmt.Sprintf("key%d", i)
+			got, ok := c.Get(key)
+			if !ok {
+				t.Fatalf("%s is missing from a handle that did not write it: "+
+					"the fleet would re-run work it has already paid for", key)
+			}
+			if got[0].String("v") != key {
+				t.Fatalf("%s resolved to %q", key, got[0].String("v"))
+			}
+		}
+	}
+
+	// And a handle opened afterwards sees everything both of them wrote.
+	if fresh := open(); fresh.Len() != 6 {
+		t.Fatalf("a fresh handle folded %d entries, want 6", fresh.Len())
 	}
 }

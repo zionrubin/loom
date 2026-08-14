@@ -323,12 +323,34 @@ func (q *MemQueue) Await(ctx context.Context, taskID string) (Status, error) {
 		q.waiters[taskID] = append(q.waiters[taskID], ch)
 		q.mu.Unlock()
 
+		timer := time.NewTimer(q.opts.LeaseTTL / 4)
 		select {
 		case <-ch:
-		case <-time.After(q.opts.LeaseTTL / 4):
+			timer.Stop()
+		case <-timer.C:
+			q.drop(taskID, ch)
 		case <-ctx.Done():
+			timer.Stop()
+			q.drop(taskID, ch)
 			return Status{}, ctx.Err()
 		}
+	}
+}
+
+// drop removes a waiter that gave up, so a long wait does not accumulate one
+// channel per periodic wake.
+func (q *MemQueue) drop(taskID string, ch chan struct{}) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	waiting := q.waiters[taskID]
+	for i, w := range waiting {
+		if w == ch {
+			q.waiters[taskID] = append(waiting[:i], waiting[i+1:]...)
+			break
+		}
+	}
+	if len(q.waiters[taskID]) == 0 {
+		delete(q.waiters, taskID)
 	}
 }
 
