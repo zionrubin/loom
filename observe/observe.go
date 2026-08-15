@@ -109,6 +109,24 @@ const (
 	// behind. Convergence and exhaustion produce the same records, so the
 	// reason is the only thing that distinguishes them.
 	StageConverged EventType = "stage.converged"
+
+	// DeltaSpliced is a context materialized from state this process already
+	// held, plus the change: Retained bytes were reused under a certificate and
+	// Repaired bytes re-rendered.
+	DeltaSpliced EventType = "delta.spliced"
+	// DeltaRebuilt is a context rendered in full. It is the reference path, and
+	// it is not a failure — Note carries the reason, which is as likely to be
+	// "the router chose it" as "this worker has never seen this session".
+	DeltaRebuilt EventType = "delta.rebuilt"
+	// DeltaDiverged is a certified splice that disagreed with a full render.
+	//
+	// It is the only event in this list that means something is wrong rather
+	// than that something happened. The renderer that produced it is
+	// quarantined for the life of the process, every later context is rendered
+	// in full, and the run continues on exact results — but a divergence says a
+	// renderer is not what this system assumed it was, and no amount of
+	// falling back makes that uninteresting.
+	DeltaDiverged EventType = "delta.diverged"
 )
 
 // Event is one observation. Fields are populated as relevant per type.
@@ -161,6 +179,21 @@ type Event struct {
 	// which is what this design rations instead of connections.
 	InFlight int `json:"in_flight,omitempty"`
 	Slots    int `json:"slots,omitempty"`
+	// Continuation is the evolving context's key on delta.* events, with
+	// Artifact its revision hash and Detail the renderer version.
+	//
+	// Base is the rendered size of the state the materialization built on and
+	// Delta the source bytes of change since it — the two numbers the router
+	// compared. Retained is what was reused without rendering it again and
+	// Repaired what had to be rendered; on a rebuild the first is zero and the
+	// second is the whole context, which is exactly how a report should read.
+	// Window is how many already-rendered segments the repair covered.
+	Continuation string `json:"continuation,omitempty"`
+	Base         int    `json:"base,omitempty"`
+	Delta        int    `json:"delta,omitempty"`
+	Retained     int    `json:"retained,omitempty"`
+	Repaired     int    `json:"repaired,omitempty"`
+	Window       int    `json:"window,omitempty"`
 	// Round is the 1-based superstep number on round.* events, and the total
 	// number of rounds on stage.converged. Messages is how many messages were
 	// delivered into the round.
@@ -283,6 +316,15 @@ type StageStats struct {
 	// kind of stage). Tasks and cost are already per stage; this is what says
 	// whether they were spent once or ten times over.
 	Rounds int
+	// Splices and Rebuilds count how this stage's evolving contexts were
+	// materialized, and RetainedBytes totals what the splices did not have to
+	// render. Read together they are the delta layer's whole claim: a stage
+	// with rebuilds and no splices is paying full price every round, and one
+	// with splices whose retained bytes are small is splicing contexts too
+	// small to be worth it.
+	Splices       int
+	Rebuilds      int
+	RetainedBytes int64
 	// ToolCalls counts MCP tool calls the stage's tasks made, and ToolTime the
 	// wall-clock they took. They buy nothing in tokens and can dominate a
 	// stage's duration, so a report that only totalled cost would explain a
@@ -454,6 +496,12 @@ func (c *Collector) Handle(e Event) {
 		c.stage(e.Stage).CacheHits++
 	case RoundFinished:
 		c.stage(e.Stage).Rounds++
+	case DeltaSpliced:
+		s := c.stage(e.Stage)
+		s.Splices++
+		s.RetainedBytes += int64(e.Retained)
+	case DeltaRebuilt:
+		c.stage(e.Stage).Rebuilds++
 	case MCPCalled:
 		s := c.stage(e.Stage)
 		s.ToolCalls++

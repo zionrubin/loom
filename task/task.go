@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/security"
 )
@@ -44,6 +45,22 @@ type Fragment struct {
 type ContextBundle struct {
 	System    string     `json:"system,omitempty"`
 	Fragments []Fragment `json:"fragments,omitempty"`
+	// Chain references an evolving context held in shared storage: the
+	// envelope carries one revision's hash where it would otherwise carry the
+	// transcript.
+	//
+	// It is the same indirection Broadcasts uses, applied to a value that
+	// changes. A broadcast is shipped once because every task reads the same
+	// bytes; a continuation is shipped as a hash because the next task reads
+	// almost the same bytes, and copying a megabyte to express that two
+	// kilobytes were added is the cost this removes. What an executor does with
+	// it — splice onto state it already holds, or render the whole chain — is
+	// its own business and cannot change the result. See package delta.
+	//
+	// Unlike a broadcast it needs no grant, because it is not reachable by
+	// name from inside a prompt: the planner put it here, the executor
+	// materializes it, and nothing a model says can widen it.
+	Chain delta.Ref `json:"chain,omitzero"`
 }
 
 // Envelope declares everything a task may use.
@@ -100,6 +117,16 @@ type Task struct {
 	Escalation    int    `json:"escalation,omitempty"`
 	ResolvedModel string `json:"resolved_model,omitempty"`
 }
+
+// Locality is the evolving object this task's context belongs to, or "" when it
+// has none.
+//
+// It is what a queue scores worker affinity on, and it is deliberately derived
+// rather than declared. A second field saying where a task would rather run
+// could disagree with the context it actually carries, and the failure that
+// produced — work steered toward a worker holding state for something else —
+// would be invisible in every report.
+func (t Task) Locality() string { return t.Envelope.Context.Chain.Key }
 
 // Result is the outcome of one executed task.
 type Result struct {

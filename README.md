@@ -204,6 +204,37 @@ Continuum — and says which rows are honestly still empty.
   contract and one conformance suite: in-memory for a process with several
   workers in it, and `worker/filequeue` for several processes over a shared
   directory.
+- **Stateful delta execution** — a context that grows a turn at a time is
+  Loom's fourth kind of repeated work, and the first three caches cannot see it:
+  the result cache asks "same computation?", the commons asks "same question?",
+  the prompt prefix asks "same head?", and none of them asks *"same evolving
+  object?"*. `pipeline.WithContinuation` declares that a stage reads one;
+  `loom.WithContinuation` supplies the revision. The context lives in the CAS as
+  an immutable chain — each revision holds what it *added* and the hash of what
+  it extends — so an **envelope carries a couple of hundred bytes where it would
+  otherwise carry the transcript** (2981× on the example's 617 kB session), and
+  an executor that already materialized an earlier revision **splices**: keep its
+  bytes, render the change and a small repair window, and check that the window
+  came out byte-identical where it overlaps what the parent held. Rendering is
+  not compositional — a closing wrapper moves when you append, a numbered header
+  rewrites its front — so nothing here trusts the shortcut. A `Renderer` declares
+  how far a change reaches back and one that cannot bound it is never spliced; a
+  certificate re-derives every splice's arithmetic in time proportional to the
+  *change* (a seam-chain hash, not a 400 kB memcmp), so it runs on all of them
+  rather than a sample; a sampled fraction are recomputed from scratch and
+  compared, and a divergence quarantines that renderer for the life of the
+  process; and a state miss, an oversized append, and an unprovable seam all
+  route to the same full render — widening the repair window far enough *is* that
+  render, so a failed fast path costs work and never an answer. Each request
+  tells its provider how many leading bytes are **certified** identical to the
+  previous revision's rendering (99.7% after appending a turn), which is what a
+  KV cache can act on rather than guess at. On a fleet, workers advertise what
+  they hold and the queue prefers them — *softly*: `Affinity` is a preference, not
+  a `Requirement`, because a task that only its state-holder could claim would be
+  unclaimable the moment that worker died. SIGKILL the process carrying a session
+  and the next round lands on one that has never seen it, rebuilds from the chain,
+  and answers identically — one round of latency, no lost work. See
+  [docs/DELTA.md](docs/DELTA.md).
 - **A commons for external research** — `loom.WithFindings` gates the tools that
   reach public sources, keying on the *question* rather than on the bytes,
   because that is the duplication a result cache cannot see: one question in
@@ -360,6 +391,16 @@ go run ./examples/on-device -view localhost:8077 -slow 400ms
 go run ./examples/worker-fleet
 go run ./examples/worker-fleet -workers 5 -docs 40
 go run ./examples/worker-fleet -kill=false   # the undisturbed fleet: same cost as local
+
+# one long agent session across worker processes, appending a turn per round,
+# with the worker holding that session's state killed halfway through. Prints
+# what crossed the queue (a 212-byte reference against a 617 kB transcript),
+# how much of each prompt was certified unchanged since the previous round,
+# and the one rebuild the kill cost — then checks every answer against a
+# single process doing the whole session by itself
+go run ./examples/delta-session
+go run ./examples/delta-session -turns 400 -rounds 12   # a bigger context to carry
+go run ./examples/delta-session -kill=false             # the undisturbed session
 
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -1054,6 +1095,25 @@ token (`loom.Explain` against hosted rates: no key, no socket, no call).
   can: the answer is the same either way and only the spend differs, which is
   the trade worth making and the one `examples/commons` asserts rather than
   claims. [docs/FINDINGS.md](docs/FINDINGS.md).
+- A continuation is a *reference to something that changes*, which is the one
+  thing Loom had no shape for. A broadcast is registered once because every task
+  reads the same bytes; a continuation is registered per run because each run
+  reads a little more than the last. Getting that distinction into the type
+  system is what makes the rest fall out: the envelope holds a revision hash, so
+  it stays small; the hash joins the fingerprint, so the cache invalidates
+  exactly the round that changed; the key is what a queue scores locality on;
+  and the parent hash is what tells an executor which of its own state it may
+  build on. [docs/DELTA.md](docs/DELTA.md).
+- The certificate in `delta` deliberately does **not** prove the splice was
+  right, and saying so is the point. It proves the splice's arithmetic — that
+  the result is the parent's first *n* bytes plus what was re-rendered, that the
+  segments just before the boundary came out identical, that the digest follows
+  — in time proportional to the change. Proving more would mean reading the
+  bytes it did not touch, which is the rebuild it exists to avoid. So the honest
+  design is a ladder: a declared bound on how far a change reaches, evidence at
+  the seam on every splice, a sampled full recomputation to test the declaration
+  itself, and a fallback that is the same code path with the window widened all
+  the way. [docs/DELTA.md](docs/DELTA.md).
 - The cheapest tier of the findings gate is also the most certain, and that is
   structural rather than lucky. Matching on topic-and-facets says two questions
   are about one subject; matching on embedding similarity says only that they
@@ -1089,6 +1149,22 @@ nor a scheduler to test. [docs/ALGORITHMS.md](docs/ALGORITHMS.md) is the design;
 `examples/multi-hop` is it answering a research question by walking a citation
 graph the model chooses as it goes, reaching a conclusion three hops from
 anything the question named.
+
+Iteration is also what makes the newest layer worth having. A loop's context
+grows by a finding, a critique, a turn — a little each round, all of it needed
+every round — and until now every round paid for the whole of it, twice over:
+once to render it and once to ship it to whichever process was running. **Stateful
+delta execution** ([docs/DELTA.md](docs/DELTA.md)) makes that context an
+immutable chain in the CAS, so what an envelope carries is a hash and what an
+executor holding the previous revision does is splice. The design worth reading
+for is not the splice but the discipline around it, borrowed almost verbatim
+from TokTier's guarantee ladder: a declared bound on how far a change can reach,
+per-splice evidence at the seam, sampled recomputation against the reference
+path, and a fallback that is the same code with the repair window opened all the
+way. State makes a round cheap; it is never what makes it right. Kill the worker
+carrying a session and the next round rebuilds from the chain and answers
+identically, which is the whole claim and the thing `examples/delta-session`
+checks rather than asserts.
 
 ## Demo
 

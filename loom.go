@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/findings"
 	"github.com/zionrubin/loom/mcp"
@@ -46,11 +47,28 @@ type Config struct {
 	MCPServers      []mcp.Server
 	MCPResources    []MCPResource
 	Broadcasts      map[string]any
-	Topics          map[string]bool
-	Findings        *findings.Config
-	EventHandler    func(observe.Event)
-	Streaming       bool
-	BatchWait       time.Duration
+	// Continuations are the run's evolving contexts, key → revision, supplied
+	// with WithContinuation and read by stages that declared the key with
+	// pipeline.WithContinuation.
+	Continuations map[string]delta.Ref
+	// DeltaPolicy routes how those contexts are materialized, and DeltaRenderer
+	// turns their segments into bytes. Both have defaults that work; see
+	// package delta before changing either, because the renderer is pinned into
+	// every revision a chain holds.
+	DeltaPolicy   delta.Policy
+	DeltaRenderer delta.Renderer
+	// DeltaBytes bounds the rendered context this process keeps resident (zero:
+	// the delta package's default).
+	DeltaBytes int64
+	// Affinity is how long the queue holds a task carrying a continuation back
+	// from workers that do not hold its state (zero: no waiting, pure
+	// preference). It applies only to a run on a fleet.
+	Affinity     time.Duration
+	Topics       map[string]bool
+	Findings     *findings.Config
+	EventHandler func(observe.Event)
+	Streaming    bool
+	BatchWait    time.Duration
 	// Queue routes execution to a worker fleet instead of this process. Nil —
 	// the default — keeps every task local.
 	Queue worker.Queue
@@ -115,6 +133,86 @@ func WithContinueOnError() Option { return func(c *Config) { c.ContinueOnError =
 // capability.
 func WithTools(tools ...executor.Tool) Option {
 	return func(c *Config) { c.Tools = append(c.Tools, tools...) }
+}
+
+// WithContinuation supplies one of the run's evolving contexts: a revision of a
+// chain written with delta.Chain, read by every stage that declared the key
+// with pipeline.WithContinuation.
+//
+// It is the moving counterpart of WithBroadcast, and the difference is the
+// whole feature. A broadcast is registered once because every task reads the
+// same bytes. A continuation is registered per run because each run reads a
+// little more than the last — a turn, a finding, a critique — and the point is
+// that saying so costs a hash rather than a transcript:
+//
+//	chain, _ := state.Chain("session/" + id)
+//	ref, _ := chain.Root(delta.Segment{Name: "brief", Body: brief})
+//	for _, turn := range turns {
+//	    ref, _ = chain.Append(ref, delta.Segment{Name: "turn", Body: turn})
+//	    loom.Run(ctx, p, loom.WithContinuation("session", ref), …)
+//	}
+//
+// The envelope carries the revision hash, so a task stays small however long
+// the session gets; the hash joins the fingerprint of every stage that reads
+// it, so the cache invalidates exactly the round that changed; and an executor
+// that has already materialized an earlier revision extends it instead of
+// rendering the whole thing again. None of which any stage has to know: what a
+// prompt receives is the context, entire, every round.
+func WithContinuation(key string, ref delta.Ref) Option {
+	return func(c *Config) {
+		if c.Continuations == nil {
+			c.Continuations = map[string]delta.Ref{}
+		}
+		if ref.Key == "" {
+			ref.Key = key
+		}
+		c.Continuations[key] = ref
+	}
+}
+
+// WithDeltaPolicy tunes how evolving contexts are materialized: when to splice
+// onto state this process holds and when to render everything, how far a repair
+// window may widen, and how often an accepted splice is recomputed from scratch
+// and compared.
+//
+// The defaults are sane and the knobs are performance knobs. Every route
+// produces identical bytes, so the worst a bad policy can do is spend time —
+// with one exception worth stating: setting Verify to zero turns off the only
+// check that can catch a renderer whose output is not as local as it claims.
+// Leave it on unless the renderer is one of this package's.
+func WithDeltaPolicy(p delta.Policy) Option {
+	return func(c *Config) { c.DeltaPolicy = p }
+}
+
+// WithDeltaRenderer sets how a continuation's segments become bytes (default
+// delta.Tags, which matches the format ordinary context fragments arrive in).
+//
+// It must be the same renderer the chain was written with — the version is
+// stored in every revision and a mismatch is refused on the first read — so
+// changing it means starting a new chain rather than reinterpreting an old one.
+func WithDeltaRenderer(r delta.Renderer) Option {
+	return func(c *Config) { c.DeltaRenderer = r }
+}
+
+// WithStateBytes bounds the rendered context this process keeps resident
+// (default 64 MiB). Past it the least recently used state is dropped, which
+// costs a rebuild and nothing else.
+func WithStateBytes(n int64) Option {
+	return func(c *Config) { c.DeltaBytes = n }
+}
+
+// WithAffinity asks the queue to hold a task carrying a continuation back from
+// workers that do not hold its state, for at most d.
+//
+// Without it, locality is a pure preference: the state-holder is offered the
+// work first and loses it to anyone who asks while it is busy. With it, the
+// state-holder gets a moment to ask. The cost is bounded and paid only when
+// nobody holds the state — after d the task goes to whoever wants it, which is
+// what keeps a dead worker from stalling a session rather than slowing it.
+//
+// A poll interval or two is the useful size.
+func WithAffinity(d time.Duration) Option {
+	return func(c *Config) { c.Affinity = d }
 }
 
 // WithMCPServer registers Model Context Protocol servers whose tools stages

@@ -137,35 +137,68 @@ func (q *MemQueue) Claim(ctx context.Context, c Claim) ([]Assignment, error) {
 	}
 	now := q.now()
 
+	// Two passes over the queue in submission order. The first takes only work
+	// this worker already holds state for; the second takes everything else it
+	// is allowed to run. That is the whole of soft affinity: a preference
+	// expressed as an ordering rather than as a filter, so a worker never
+	// leaves with an empty claim because the work it could do was earmarked for
+	// somebody else.
+	//
+	// A keyed task the state-holder has not asked for yet may be held back
+	// during its grace window — the one case where affinity costs latency, and
+	// bounded by construction, since the window is measured from when the task
+	// became claimable and expires whether or not anybody ever holds the state.
 	var out []Assignment
-	for _, id := range q.order {
-		if len(out) >= maxN {
-			break
-		}
-		e := q.tasks[id]
-		if e == nil {
-			continue
-		}
-		q.expireLocked(e, now)
-		if e.state != StatePending {
-			continue
-		}
-		if err := c.Caps.CanRun(e.sub.Needs); err != nil {
-			continue // somebody else's work
-		}
+	for pass := range 2 {
+		for _, id := range q.order {
+			if len(out) >= maxN {
+				return out, nil
+			}
+			e := q.tasks[id]
+			if e == nil {
+				continue
+			}
+			q.expireLocked(e, now)
+			if e.state != StatePending {
+				continue
+			}
+			if err := c.Caps.CanRun(e.sub.Needs); err != nil {
+				continue // somebody else's work
+			}
+			local := c.Prefers(e.sub.Affinity)
+			if pass == 0 {
+				if !local {
+					continue
+				}
+			} else {
+				if local {
+					continue // already offered in the first pass
+				}
+				if e.sub.Affinity.Held(e.updated, now) {
+					continue
+				}
+			}
 
-		q.token++
-		e.lease = Lease{
-			TaskID: id, Worker: c.Worker, Token: q.token,
-			Granted: now, Expires: now.Add(ttl),
+			q.token++
+			e.lease = Lease{
+				TaskID: id, Worker: c.Worker, Token: q.token,
+				Granted: now, Expires: now.Add(ttl),
+			}
+			e.state = StateLeased
+			e.deliveries++
+			e.updated = now
+			q.stats.Claims++
+			switch {
+			case local:
+				q.stats.Local++
+			case !e.sub.Affinity.Zero():
+				q.stats.Displaced++
+			}
+			out = append(out, Assignment{
+				Lease: e.lease, Task: e.sub.Task, Input: e.sub.Input,
+				Delivery: e.deliveries, Local: local,
+			})
 		}
-		e.state = StateLeased
-		e.deliveries++
-		e.updated = now
-		q.stats.Claims++
-		out = append(out, Assignment{
-			Lease: e.lease, Task: e.sub.Task, Input: e.sub.Input, Delivery: e.deliveries,
-		})
 	}
 	return out, nil
 }
@@ -434,8 +467,18 @@ func (q *MemQueue) expireLocked(e *entry, now time.Time) {
 		return
 	}
 	q.stats.Expired++
+	// The task became claimable when the lease ran out, not when somebody
+	// finally looked. Recording the expiry rather than the observation keeps
+	// the affinity grace window measured from the same instant a queue that
+	// derives expiry lazily would measure it from — and keeps a task that sat
+	// unobserved for a minute from being held back for a grace it has already
+	// served.
+	at := e.lease.Expires
+	if at.IsZero() || at.After(now) {
+		at = now
+	}
 	e.lease = Lease{}
-	e.updated = now
+	e.updated = at
 
 	limit := e.sub.Deliveries
 	if limit <= 0 {

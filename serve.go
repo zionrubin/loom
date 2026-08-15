@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/ops"
 	"github.com/zionrubin/loom/pipeline"
@@ -81,7 +82,8 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 	// map from stage ID to the code that runs it, and compiling the same
 	// pipeline the client compiled is how it gets one that agrees.
 	pl, err := plan.Compile(p, cfg.Registry,
-		plan.WithBroadcasts(h.shared.Hashes()), plan.WithMCP(h.manifest))
+		plan.WithBroadcasts(h.shared.Hashes()), plan.WithContinuations(declared(p, cfg)),
+		plan.WithMCP(h.manifest))
 	if err != nil {
 		_ = h.close()
 		return nil, err
@@ -94,8 +96,8 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 
 	local := &executor.Local{
 		Runners: runners, Client: h.client, Tools: h.tools,
-		Broadcasts: h.shared,
-		Audit:      h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
+		Broadcasts: h.shared, State: h.state,
+		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
 	}
 	caps := worker.CapabilitiesFor(local, cfg.Registry, cfg.Workers)
 	if cfg.WorkerName != "" {
@@ -111,12 +113,39 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 	wk, err := worker.New(worker.Config{
 		Queue: cfg.Queue, Blobs: h.cas, Exec: local, Caps: caps, Bus: h.bus,
 		Name: cfg.WorkerName, LeaseTTL: cfg.WorkerLease,
+		// What this worker holds, asked fresh on every claim. It is the only
+		// thing the queue is told that is not a capability, and the only thing
+		// it may act on without being obliged to.
+		Locality: h.state.Resident,
 	})
 	if err != nil {
 		_ = h.close()
 		return nil, err
 	}
 	return &Worker{host: h, w: wk, caps: wk.Capabilities()}, nil
+}
+
+// declared is the continuation set a worker compiles against: whatever the run
+// bound, plus the keys the pipeline itself names.
+//
+// A worker is sent revisions; it never picks one. Requiring it to name one at
+// startup would be requiring it to hold a fact that is stale by the first
+// round, and reading the keys off the pipeline it *is* costs nothing and cannot
+// disagree with what it will be asked to run. The client keeps its typo check,
+// because the client is the side that binds.
+func declared(p *pipeline.Pipeline, cfg Config) map[string]delta.Ref {
+	out := make(map[string]delta.Ref, len(cfg.Continuations))
+	for k, v := range cfg.Continuations {
+		out[k] = v
+	}
+	for _, s := range p.Stages() {
+		if k := s.Opts.Continuation; k != "" {
+			if _, ok := out[k]; !ok {
+				out[k] = delta.Ref{Key: k}
+			}
+		}
+	}
+	return out
 }
 
 // Run claims and executes tasks until ctx ends.

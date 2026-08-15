@@ -171,7 +171,11 @@ type op struct {
 	Fail   *worker.Failure    `json:"failure,omitempty"`
 	Token  int64              `json:"token,omitempty"`
 	Reason string             `json:"reason,omitempty"`
-	At     time.Time          `json:"at,omitempty"`
+	// Local records that a claim matched the worker's residency, so the
+	// accounting a report reads is folded from the log like everything else
+	// rather than counted in whichever process happened to grant the lease.
+	Local bool      `json:"local,omitempty"`
+	At    time.Time `json:"at,omitempty"`
 }
 
 const (
@@ -246,6 +250,12 @@ func (s *state) apply(o op) {
 			s.token = o.Lease.Token
 		}
 		s.stats.Claims++
+		switch {
+		case o.Local:
+			s.stats.Local++
+		case !e.sub.Affinity.Zero():
+			s.stats.Displaced++
+		}
 	case opRenew:
 		if e == nil || o.Lease == nil || e.lease.Token != o.Lease.Token {
 			return
@@ -307,6 +317,20 @@ func (q *Queue) effective(e *entry, now time.Time) (worker.State, *worker.Failur
 		}
 	}
 	return worker.StatePending, nil
+}
+
+// claimable is when this entry last became available to a worker: when it was
+// submitted or re-armed, or when the lease somebody was holding ran out.
+//
+// Expiry writes nothing to the log — it is a fact about a lease already there
+// and the current time, which every reader derives identically — so the moment
+// a task became claimable has to be derived here too, rather than read off a
+// field nobody updated.
+func (q *Queue) claimable(e *entry) time.Time {
+	if e.state == worker.StateLeased && !e.lease.Expires.IsZero() {
+		return e.lease.Expires
+	}
+	return e.updated
 }
 
 func (q *Queue) status(e *entry, now time.Time) worker.Status {
@@ -553,29 +577,49 @@ func (q *Queue) Claim(ctx context.Context, c worker.Claim) ([]worker.Assignment,
 	err := q.mutate(func(st *state, now time.Time) ([]op, error) {
 		var ops []op
 		token := st.token
-		for _, id := range st.order {
-			if len(ops) >= maxN {
-				break
+		// Two passes, exactly as MemQueue does them: work this worker holds
+		// state for first, everything else it may run second. Soft affinity is
+		// an ordering rather than a filter, so no worker leaves empty-handed
+		// because the queue was saving something for somebody.
+		for pass := range 2 {
+			for _, id := range st.order {
+				if len(ops) >= maxN {
+					return ops, nil
+				}
+				e := st.tasks[id]
+				if e == nil {
+					continue
+				}
+				if cur, _ := q.effective(e, now); cur != worker.StatePending {
+					continue
+				}
+				if err := c.Caps.CanRun(e.sub.Needs); err != nil {
+					continue // somebody else's work
+				}
+				local := c.Prefers(e.sub.Affinity)
+				if pass == 0 {
+					if !local {
+						continue
+					}
+				} else {
+					if local {
+						continue // already offered in the first pass
+					}
+					if e.sub.Affinity.Held(q.claimable(e), now) {
+						continue
+					}
+				}
+				token++
+				l := worker.Lease{
+					TaskID: id, Worker: c.Worker, Token: token,
+					Granted: now, Expires: now.Add(ttl),
+				}
+				ops = append(ops, op{Kind: opClaim, Task: id, Lease: &l, At: now, Local: local})
+				out = append(out, worker.Assignment{
+					Lease: l, Task: e.sub.Task, Input: e.sub.Input,
+					Delivery: e.deliveries + 1, Local: local,
+				})
 			}
-			e := st.tasks[id]
-			if e == nil {
-				continue
-			}
-			if cur, _ := q.effective(e, now); cur != worker.StatePending {
-				continue
-			}
-			if err := c.Caps.CanRun(e.sub.Needs); err != nil {
-				continue // somebody else's work
-			}
-			token++
-			l := worker.Lease{
-				TaskID: id, Worker: c.Worker, Token: token,
-				Granted: now, Expires: now.Add(ttl),
-			}
-			ops = append(ops, op{Kind: opClaim, Task: id, Lease: &l, At: now})
-			out = append(out, worker.Assignment{
-				Lease: l, Task: e.sub.Task, Input: e.sub.Input, Delivery: e.deliveries + 1,
-			})
 		}
 		return ops, nil
 	})

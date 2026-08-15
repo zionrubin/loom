@@ -261,6 +261,7 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	// wrong number.
 	pl, err := plan.Compile(p, cfg.Registry,
 		plan.WithBroadcasts(broadcasts.Hashes()),
+		plan.WithContinuations(cfg.Continuations),
 		plan.WithMCP(mcp.Declared(cfg.MCPServers...)))
 	if err != nil {
 		return nil, err

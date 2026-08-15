@@ -48,9 +48,11 @@ type StageOpts struct {
 	Sandbox     task.SandboxProfile
 	Grants      []security.Capability
 	Broadcasts  []string // run-level shared values this stage may read
-	MCP         []MCPUse // MCP servers and tools this stage may call
-	Version     string   // content-version for Go-func stages; enables caching
-	NoCache     bool
+	// Continuation names the evolving context this stage's tasks read, if any.
+	Continuation string
+	MCP          []MCPUse // MCP servers and tools this stage may call
+	Version      string   // content-version for Go-func stages; enables caching
+	NoCache      bool
 	// NoPrefixCache opts the stage out of provider prompt-prefix caching.
 	NoPrefixCache bool
 }
@@ -84,6 +86,34 @@ func WithGrants(caps ...security.Capability) Option {
 // invalidates the cached results that saw it.
 func WithBroadcast(names ...string) Option {
 	return func(o *StageOpts) { o.Broadcasts = append(o.Broadcasts, names...) }
+}
+
+// WithContinuation declares that this stage's tasks read an evolving context —
+// a growing transcript, a research thread, an agent session — supplied for the
+// run with loom.WithContinuation and held in shared storage as an immutable
+// chain of revisions.
+//
+// It is the third way a stage can be given context, and the three differ in
+// what they are for rather than in what they can hold:
+//
+//	Context fragments   fixed at planning time and carried in every envelope.
+//	                    For the small and unchanging: a rubric, a style note.
+//	Broadcasts          registered once per run and carried as a hash. For the
+//	                    large and unchanging, read by name from a template.
+//	Continuations       a chain of revisions, carried as a hash. For the large
+//	                    and *changing*, where each run reads a little more than
+//	                    the last.
+//
+// The revision's hash joins the stage fingerprint, so a round that appended a
+// turn recomputes exactly the tasks that could have seen it and leaves every
+// earlier round's results in the cache — the same treatment a changed
+// broadcast gets. Unlike a broadcast it needs no capability grant: it is not
+// reachable by name from a prompt, so there is no name for a grant to guard.
+//
+// What it costs an executor is described in package delta. What it costs a
+// pipeline is this line.
+func WithContinuation(key string) Option {
+	return func(o *StageOpts) { o.Continuation = key }
 }
 
 // MCPUse is one stage's declaration of an MCP server it may call, and
