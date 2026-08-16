@@ -108,6 +108,42 @@ func (p *Plan) Terminal() []string {
 	return out
 }
 
+// Windowed reports whether the stage has a Window among its ancestors — that
+// is, whether its input arrives in panes rather than as one open-ended stream.
+//
+// It is what tells a stream job which aggregates are legal: folding a set has
+// to have a set, and on an unbounded input only a window produces one.
+func (p *Plan) Windowed(id string) bool {
+	sp, ok := p.ByID[id]
+	for ok && sp.Stage.Upstream != nil {
+		up := sp.Stage.Upstream
+		if up.Kind == pipeline.KindWindow {
+			return true
+		}
+		sp, ok = p.ByID[up.ID]
+	}
+	return false
+}
+
+// Unbounded reports whether the plan reads from a stream source, which is what
+// distinguishes a pipeline that finishes from one that runs until it is stopped.
+func (p *Plan) Unbounded() bool {
+	for _, sp := range p.Order {
+		if pipeline.StreamSource(sp.Stage) {
+			return true
+		}
+	}
+	return false
+}
+
+// Aggregate reports whether a stage folds its whole input, which is the
+// property that needs a bounded set: Combine folds pairwise over everything,
+// ReduceAI aggregates a level at a time, and Iterate cannot start a superstep
+// before every vertex's mail has arrived.
+func Aggregate(k pipeline.StageKind) bool {
+	return k == pipeline.KindCombine || k == pipeline.KindReduceAI || k == pipeline.KindIterate
+}
+
 func isPure(k pipeline.StageKind) bool {
 	return k == pipeline.KindMap || k == pipeline.KindFilter || k == pipeline.KindFlatMap
 }
@@ -333,6 +369,20 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			// Go closures aren't content-addressable: only Version makes a
 			// pure stage cacheable.
 			sp.Cacheable = s.Opts.Version != "" && !s.Opts.NoCache
+
+		case pipeline.KindWindow:
+			// A window is driver state, not an operation: it buffers records and
+			// decides when a set is closed, and neither of those is something a
+			// cache key could stand for. What it does get is validation, here,
+			// so an incoherent window fails compilation rather than the first
+			// record that reaches it.
+			if s.Window == nil {
+				return nil, fmt.Errorf("stage %q: window stage without a spec", s.ID)
+			}
+			if err := s.Window.Validate(); err != nil {
+				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			sp.Cacheable = false
 
 		case pipeline.KindSource, pipeline.KindCombine:
 			sp.Cacheable = false

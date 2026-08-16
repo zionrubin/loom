@@ -29,6 +29,7 @@ import (
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
+	"github.com/zionrubin/loom/stream"
 	"github.com/zionrubin/loom/task"
 	"github.com/zionrubin/loom/worker"
 )
@@ -83,6 +84,32 @@ type Config struct {
 	// runtime default). It has no effect on a single Run, whose tasks all
 	// belong to one program and therefore tie.
 	AdmissionAging float64
+
+	// Stream-mode settings. They configure Stream and are ignored by Run, so
+	// one config can describe both a backfill and the live job that follows it.
+	//
+	// Sources bind stream.Source implementations to the stages declared with
+	// pipeline.FromStream, and Sinks bind destinations to the stages whose
+	// output leaves the job. JobID is the identity a restart resumes under, and
+	// Checkpoints is where the recoverable points are kept.
+	Sources         map[string]stream.Source
+	Sinks           map[string]stream.Sink
+	JobID           string
+	Checkpoints     stream.Store
+	CheckpointEvery time.Duration
+	// Lateness is the source's bounded out-of-orderness and IdleTimeout is how
+	// long a split may be silent before it stops holding the watermark back.
+	Lateness    time.Duration
+	IdleTimeout time.Duration
+	// StreamLimit stops the job once a bound is reached, which is how an
+	// endless pipeline becomes a test.
+	StreamLimit stream.Limit
+	PollRecords int
+	PollWait    time.Duration
+	// DrainOnStop overrides whether windows still open when the job stops are
+	// fired. Nil defers to why it stopped: a job whose sources ran out drains,
+	// a job that was cancelled does not.
+	DrainOnStop *bool
 
 	// Explain-only settings. They configure the pre-flight projection and are
 	// ignored by Run, so one config can describe a run and be asked what that
@@ -690,11 +717,17 @@ func stageDetail(s *pipeline.Stage) string {
 
 	switch s.Kind {
 	case pipeline.KindSource:
-		if s.SourceFn != nil {
+		switch {
+		case s.Stream:
+			line("stream source (records arrive from a bound stream.Source)")
+		case s.SourceFn != nil:
 			line("source function (records produced at run time)")
-		} else {
+		default:
 			line("%d source records", len(s.SourceRecords))
 		}
+	case pipeline.KindWindow:
+		line("window · %s", s.Window.Describe())
+		line("everything downstream runs once per pane")
 	case pipeline.KindFused:
 		line("fused pure stages, applied per record in order:")
 		for _, sub := range s.Fused {

@@ -137,6 +137,20 @@ Continuum — and says which rows are honestly still empty.
   the workers behind it, and aggregates (`Combine`, `ReduceAI`) remain the
   natural barriers they have to be. The trade is ordering — records flow in
   completion order — so the barrier driver stays the default.
+- **Stream mode — an input that never ends** — `loom.Stream` runs a pipeline
+  against a `stream.Source` until it is stopped. A Loom pipeline is bounded
+  because its aggregates are, so the one thing stream mode adds is a **window**:
+  `Dataset.Window` cuts an endless input into finite sets, and everything
+  downstream of it runs once per pane. Watermarks say when a set is complete —
+  the minimum across the source's splits, held back per stage by the model calls
+  still in flight — and a **checkpoint** ties window state, source positions and
+  sink commits into one recoverable point, taken by briefly quiescing the job
+  rather than by flowing barriers through it (a pause of one task latency, on a
+  workload whose tasks are model calls, costs nothing worth defending against).
+  Delivery is at-least-once and spend is exactly-once: a replayed record hashes
+  to the same cache key, so an interrupted job costs wall clock rather than
+  tokens. File and Kafka sources and sinks ship. See
+  [docs/STREAMING.md](docs/STREAMING.md).
 - **Fleets — many agents on one engine** — `loom.Fleet` runs any number of
   pipelines at once and holds the things that were never properties of a
   pipeline in the first place: **one** rate limiter (a quota belongs to an
@@ -402,6 +416,17 @@ go run ./examples/delta-session
 go run ./examples/delta-session -turns 400 -rounds 12   # a bigger context to carry
 go run ./examples/delta-session -kill=false             # the undisturbed session
 
+# an input that never ends: an incident feed graded per event and digested per
+# minute. Panes fire on event time rather than wall clock, so the same feed
+# always produces the same windows; the report prints panes next to model calls,
+# because a pane is the unit that costs money. -crash stops the job a third of
+# the way through and starts it again: it resumes at the checkpointed offsets
+# with its half-filled windows intact, and the replay costs zero model calls
+go run ./examples/watchtower
+go run ./examples/watchtower -live      # tail the feed as a writer appends
+go run ./examples/watchtower -crash     # price the interruption
+go run ./examples/watchtower -window 30s # twice the panes, the same gradings
+
 # watch cache-resume: second run makes zero model calls
 LOOM_STATE=/tmp/loom go run ./examples/triage
 LOOM_STATE=/tmp/loom go run ./examples/triage
@@ -441,6 +466,9 @@ LOOM_STATE=/tmp/loom-desk OPENAI_API_KEY=sk-... go run ./examples/support-desk -
 | `providers/llamacpp` | Local inference against a llama.cpp server: loopback egress, no credential, the KV cache as the prompt prefix cache, and the device's slot count as the admission ceiling |
 | `providers/llamacpp/llamacpptest` | A scriptable in-process llama.cpp server for tests and offline examples — what `mcp/mcptest` is to a server, on a real loopback socket |
 | `findings` | The commons: a gate agents pass before reaching a public source, so research one agent paid for is served to the next instead of repeated. `findings/pgstore` and `findings/filestore` share it between executor processes |
+| `stream` | Stream mode's vocabulary: sources with resumable positions, watermarks, the windower that turns an endless input into finite sets, sinks, and checkpoints. Plain data and single-goroutine logic — no model, scheduler or run in sight |
+| `stream/file` | A directory of JSONL as a stream: a file is a split, a byte offset is a position. The source you develop against, the one that makes a test deterministic, and the one a backfill uses |
+| `stream/kafka` | Topics as streams: a partition is a split, an offset is a position, and offsets advance only after the checkpoint that covers them. Narrow `Consumer`/`Producer` seams with a franz-go binding supplied |
 | `security` | Grants, secret broker, egress policy, audit log |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
@@ -712,6 +740,83 @@ pushes past the limit.
 [`examples/game-forge`](./examples/game-forge) is the three-run shape, where
 each run consumes what the last one produced — plan the modules, write them,
 link them into a playable game.
+
+## Input that never ends: stream mode
+
+A Loom pipeline is bounded because its aggregates are. `ReduceAI` folds a set,
+`Combine` folds a set, `Iterate` cannot begin a superstep before every vertex's
+mail has arrived — and on a finite dataset the end of the input is what tells
+them the set is closed. A stream has no end, so stream mode answers one
+question, **when is a set complete?**, and everything else follows from the
+answer.
+
+The answer is a window. `loom.Stream` runs the same pipeline, planner,
+envelopes, scheduler, cache and budget as `loom.Run`; the only new line in the
+pipeline is the one that makes an endless input finite:
+
+```go
+p := pipeline.New("incident-desk")
+events := p.FromStream("incidents")            // unbounded, bound at run time
+
+events.
+    Infer("grade", pipeline.InferSpec{...}).   // per record, the moment it arrives
+    Window("per-minute", stream.WindowSpec{    // the finite set
+        Assigner: stream.Tumbling(time.Minute),
+        Key:      func(r core.Record) string { return r.String("service") },
+        Time:     stream.EventTime("at"),
+        Lateness: 30 * time.Second,
+    }).
+    ReduceAI("digest", pipeline.ReduceAISpec{...}) // once per pane, over its records
+
+res, err := loom.Stream(ctx, p,
+    loom.WithSource("incidents", kafkaSrc),
+    loom.WithSink("digest", sink),
+    loom.WithStateDir("./state"),              // result cache *and* checkpoints
+    loom.WithJobID("incident-desk"),           // what a restart resumes
+)
+```
+
+Everything **upstream** of the window runs per record, fully pipelined — a
+grading call starts the moment an event lands. Everything **downstream** is
+scoped to the pane. That one rule is the whole semantics: *a window replaces
+"the end of the input" with "the end of the pane"*.
+
+Four things follow, and each is a place where being an AI framework changes the
+answer a stream engine would give:
+
+- **A window fires once.** Lateness *delays* the firing rather than causing
+  another one, and speculative panes are opt-in (`stream.AtInterval`,
+  `stream.AtCount`). A classic engine re-fires a whole window on every
+  straggler; when the operator is a model call that is not a latency choice, it
+  is a bill multiplied by the stragglers.
+- **A pane is the unit that costs money.** Halving the interval doubles the
+  aggregations; a keyed window multiplies them by the key's cardinality;
+  `Sliding` multiplies them by `size/slide`. `loom.Explain` prices a window as
+  one pane for exactly this reason.
+- **Checkpoints quiesce.** Ingestion stops, the graph finishes what it is
+  holding, and window buffers, source positions and sink commits are recorded
+  together — then positions advance last. Barrier-based checkpointing exists
+  because stopping a stream engine costs throughput measured against
+  microsecond operators; a pause of one task latency every thirty seconds, on a
+  workload whose tasks are model calls, buys a snapshot with no in-flight state
+  to serialize and no alignment to get wrong.
+- **At-least-once delivery, exactly-once spend.** A crash loses the work since
+  the last checkpoint. On restart those records are re-read, re-planned into the
+  same tasks, hashed to the same cache keys — and served. Loom does not need a
+  transactional source to avoid paying twice; it needs deterministic record IDs
+  and event-time-ordered panes, and it has both.
+
+`stream/file` reads a directory of JSONL — a file is a split, a byte offset is a
+position — and without `Follow` a fully-read file *ends*, which is what makes the
+same job a backfill. `stream/kafka` reads topics with Loom's checkpoint as the
+source of truth for offsets, writing group offsets afterwards for whatever
+watches consumer lag.
+
+`go run ./examples/watchtower` is the whole shape end to end, offline, and
+[docs/STREAMING.md](docs/STREAMING.md) is the design — including the phases not
+yet built: transactional sinks, renewing rate budgets with backpressure /
+shedding / model-ladder degradation, session windows, and split assignment
+across a fleet.
 
 ## Sharing data across tasks
 

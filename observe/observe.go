@@ -127,6 +127,40 @@ const (
 	// renderer is not what this system assumed it was, and no amount of
 	// falling back makes that uninteresting.
 	DeltaDiverged EventType = "delta.diverged"
+
+	// SplitOpened is a stream source partition taken up by a job, with
+	// Detail naming it and Note saying where reading resumed from.
+	SplitOpened EventType = "split.opened"
+	// SplitRetired is a partition that will produce nothing further.
+	SplitRetired EventType = "split.retired"
+	// WatermarkAdvanced is event time moving forward: Watermark is how far, and
+	// it is the claim on which every window closes. It is published from the
+	// ingestor rather than per stage, because the job has one watermark and
+	// stages only ever hold it back.
+	WatermarkAdvanced EventType = "watermark.advanced"
+	// PaneFired is a window emitting: Pane identifies the firing, Records is
+	// how many it carried, Watermark is the evidence that it was complete, and
+	// Note says whether it closed the window or was speculative.
+	//
+	// It is the event to watch in a stream job, because a pane is the unit that
+	// costs money: everything downstream of the window runs once per pane.
+	PaneFired EventType = "pane.fired"
+	// RecordsLate counts records that arrived for a window already gone.
+	// Records is how many, and a stream whose count grows has a lateness bound
+	// that does not match its source.
+	RecordsLate EventType = "records.late"
+	// SinkWrote is a pane's output made durable: Stage is the stage it came
+	// from, Pane the firing, Records how many, Bytes the batch's own estimate.
+	SinkWrote EventType = "sink.wrote"
+	// CheckpointCommitted is a recoverable point recorded: Epoch numbers it,
+	// Latency is how long the job was held still to take it, Records is how
+	// much window state it captured, and Watermark where event time stood.
+	CheckpointCommitted EventType = "checkpoint.committed"
+	// CheckpointSkipped is a checkpoint that could not be taken because the job
+	// would not come to rest inside its timeout. Note says what was still
+	// moving. Skipping is safe — the previous checkpoint still stands — but a
+	// job that keeps skipping is a job that cannot be restarted cheaply.
+	CheckpointSkipped EventType = "checkpoint.skipped"
 )
 
 // Event is one observation. Fields are populated as relevant per type.
@@ -215,6 +249,17 @@ type Event struct {
 	// Budget is the run budget a projection was measured against
 	// (run.projected), so an observer can say whether it covers the ceiling.
 	Budget core.Budget `json:"budget,omitempty"`
+	// Pane identifies a window firing on pane.fired and sink.wrote, and
+	// Watermark is how far event time had advanced when it happened — on
+	// watermark.advanced it is the new value. Epoch numbers a checkpoint.
+	//
+	// Split names a source partition on split.* events. Lag is how far behind
+	// the job's watermark that split was holding.
+	Pane      string        `json:"pane,omitempty"`
+	Watermark time.Time     `json:"watermark,omitempty"`
+	Epoch     int64         `json:"epoch,omitempty"`
+	Split     string        `json:"split,omitempty"`
+	Lag       time.Duration `json:"lag,omitempty"`
 }
 
 // PayloadCap bounds the large observability payloads (record JSON, prompts,

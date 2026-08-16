@@ -66,7 +66,7 @@ func BuildRunners(pl *plan.Plan) (map[string]executor.OpRunner, error) {
 				return nil, err
 			}
 			runners[s.ID] = &reduceRunner{spec: s.Reduce, tmpl: tmpl, prefix: prefix}
-		case pipeline.KindSource, pipeline.KindCombine:
+		case pipeline.KindSource, pipeline.KindCombine, pipeline.KindWindow:
 			// Executed by the driver, not the scheduler.
 		}
 	}

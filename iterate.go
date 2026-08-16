@@ -501,10 +501,19 @@ func budgetSpent(b core.Budget, u core.Usage, since time.Time) bool {
 	return false
 }
 
+// maxIterationReports bounds what a driver keeps. A run produces one report per
+// iterative stage and never reaches it; a stream job produces one per pane, for
+// as long as it runs, so the list is capped and the newest kept — a report from
+// four hours ago is not what anyone is looking at.
+const maxIterationReports = 64
+
 // iteration records one stage's iteration report on the run.
 func (d *driver) iteration(rep IterationReport) {
 	d.mu.Lock()
 	d.iterations = append(d.iterations, rep)
+	if n := len(d.iterations) - maxIterationReports; n > 0 {
+		d.iterations = append(d.iterations[:0], d.iterations[n:]...)
+	}
 	d.mu.Unlock()
 }
 
