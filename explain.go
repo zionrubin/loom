@@ -456,6 +456,14 @@ func (e *explainer) stage(sp *plan.StagePlan) (StageProjection, error) {
 	case pipeline.KindFused:
 		e.recs[s.ID] = e.applyFused(s, input)
 
+	case pipeline.KindWindow:
+		// A window neither creates nor changes records; it decides when a set
+		// of them is closed. Projecting it as a pass-through therefore prices
+		// one pane — which is the right unit, because a pane is what a stream
+		// job's downstream stages run once per. Multiply by the panes you
+		// expect per hour to get the hourly bill.
+		e.recs[s.ID] = input
+
 	case pipeline.KindCombine:
 		folded, err := foldCombine(s, input)
 		if err != nil {

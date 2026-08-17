@@ -17,6 +17,7 @@ import (
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/security"
+	"github.com/zionrubin/loom/stream"
 	"github.com/zionrubin/loom/task"
 )
 
@@ -38,6 +39,9 @@ const (
 	// KindFused is produced by the planner: a run of adjacent pure stages
 	// collapsed into one task boundary.
 	KindFused StageKind = "fused"
+	// KindWindow cuts an unbounded input into finite sets so the aggregates
+	// downstream of it have an end to fold to. See Dataset.Window.
+	KindWindow StageKind = "window"
 )
 
 // StageOpts carries per-stage tuning, applied via Option functions.
@@ -255,6 +259,9 @@ type Stage struct {
 
 	SourceRecords []core.Record
 	SourceFn      func(ctx context.Context) ([]core.Record, error)
+	// Stream marks a source stage as unbounded: its records arrive from a
+	// stream.Source bound at run time rather than from this declaration.
+	Stream bool
 
 	MapFn     func(r core.Record) (core.Record, error)
 	MapCtxFn  func(ctx context.Context, s core.Session, r core.Record) (core.Record, error)
@@ -264,6 +271,7 @@ type Stage struct {
 	Infer   *InferSpec
 	Reduce  *ReduceAISpec
 	Iterate *IterateSpec
+	Window  *stream.WindowSpec
 	Combine func(a, b core.Record) (core.Record, error)
 
 	// Fused is populated by the planner for KindFused stages.

@@ -594,7 +594,14 @@ and retraction with dependent reporting, and capability containment), mock,
 Anthropic,
 OpenAI, and llama.cpp providers (the last with device-width admission control,
 loopback egress, no-credential envelopes, and KV-cache prefix reuse),
-cross-restart and cross-process cache resume, and the remote executor fleet
+cross-restart and cross-process cache resume, stream mode (`loom.Stream`:
+unbounded partitioned sources with resumable positions, per-split watermarks
+with bounded lateness, idleness and retirement, watermark holdback across
+asynchronous stages, event-time windowing with keyed and sliding assigners and
+count/interval triggers, pane-delimited aggregates, sinks with pane-stable
+batch identity, quiesce checkpointing tying window state to source positions and
+sink commits, restart-and-resume, and file and Kafka sources and sinks — see
+[STREAMING.md](./STREAMING.md)), and the remote executor fleet
 (`worker`: a durable queue with leases, heartbeats, expiry and fencing tokens;
 capability-advertising workers; CAS-referenced inputs and outputs; idempotent
 result commit; two queue backends behind one conformance suite; and failure
@@ -609,6 +616,8 @@ subprocess/container/WASM sandbox runtimes, ensemble operators,
 priority/preemptive scheduling, result-cache eviction, a single-flight lease on
 the *result* cache (the findings gate has one; the result cache does not, so
 concurrent identical tasks still both run — see `examples/commons`), findings
-eviction and bi-temporal validity, and the inbox tree-reduce for high-degree
-vertices. The interfaces above are the contract
+eviction and bi-temporal validity, the inbox tree-reduce for high-degree
+vertices, and the later phases of stream mode (transactional sinks, renewing
+rate budgets with backpressure/shed/degrade policies, session windows, split
+assignment across a fleet, and windowing in a bounded run as a group-by). The interfaces above are the contract
 those implementations plug into.

@@ -50,6 +50,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,11 @@ type Node struct {
 	// stage (0 everywhere else). It is what lets the view draw a stage that
 	// ran more than once as something other than one undifferentiated cluster.
 	Round int `json:"round,omitempty"`
+	// Pane is the window firing this task's records came from, empty outside a
+	// stream job and upstream of every window in one. It is the streaming
+	// counterpart of Round: a windowed stage runs once per pane forever, so a
+	// view that cannot separate the panes shows one growing smudge.
+	Pane string `json:"pane,omitempty"`
 	// Error intentionally has no omitempty: it clears when a retry succeeds,
 	// and clients that merge deltas must see the transition back to "".
 	Error string     `json:"error"`
@@ -220,6 +226,49 @@ type StageInfo struct {
 	// cap exists for.
 	Rounds []RoundInfo `json:"rounds,omitempty"`
 	Halt   string      `json:"halt,omitempty"`
+
+	// Panes is the firing history of a window stage (pipeline.Window), empty
+	// for every other kind. Windowed is what marks the stage as one, so a
+	// window that has not fired yet still reads as a window rather than as a
+	// stage that has done nothing.
+	//
+	// It is bounded: a stream job fires panes for as long as it runs, and a
+	// view that kept all of them would be a memory leak with a nice picture on
+	// it. The newest are kept, because the newest are what anyone is looking at.
+	Panes    []*PaneInfo `json:"panes,omitempty"`
+	Windowed bool        `json:"windowed,omitempty"`
+	// PaneCount is how many panes this stage has ever fired, which outlives the
+	// bounded list above; Late is how many records arrived for windows already
+	// gone, and WindowRecords how many were assigned to a window at all.
+	PaneCount     int   `json:"paneCount,omitempty"`
+	Late          int   `json:"late,omitempty"`
+	WindowRecords int64 `json:"windowRecords,omitempty"`
+	// Batches is how many panes of this stage's output reached a sink.
+	Batches int `json:"batches,omitempty"`
+}
+
+// PaneInfo is one firing of one window: the streaming counterpart of RoundInfo,
+// and the unit a stream job's cost is actually incurred in.
+//
+// Everything downstream of a window runs once per pane, so a pane is where the
+// money goes — which is why the tasks attributed to it, and their tokens and
+// cost, are accumulated here rather than only on the stage.
+type PaneInfo struct {
+	ID     string `json:"id"`
+	Window string `json:"window"`
+	Seq    int    `json:"seq"`
+	// Kind is "final" for a window's last word, "early" for a speculative
+	// firing, "late" for one carrying tolerated stragglers.
+	Kind      string  `json:"kind,omitempty"`
+	Records   int     `json:"records"`
+	Watermark int64   `json:"watermark,omitempty"`
+	FiredAt   int64   `json:"firedAt,omitempty"`
+	Tasks     int     `json:"tasks,omitempty"`
+	Done      int     `json:"done,omitempty"`
+	Tokens    int     `json:"tokens,omitempty"`
+	CostUSD   float64 `json:"costUsd,omitempty"`
+	// Written marks a pane whose output reached a sink.
+	Written bool `json:"written,omitempty"`
 }
 
 // RoundInfo is one superstep of an iterative stage.
@@ -232,6 +281,55 @@ type RoundInfo struct {
 	CostUSD   float64 `json:"costUsd,omitempty"`
 	StartedAt int64   `json:"startedAt,omitempty"`
 	EndedAt   int64   `json:"endedAt,omitempty"`
+}
+
+// StreamInfo is a stream job's own state — the half of an unbounded run that a
+// task-and-stage picture cannot show.
+//
+// A batch run is read by how much of it is done. A stream job has no "done": it
+// is read by how far event time has advanced, how far behind the slowest split
+// is, how many windows have closed, and how long ago it recorded a point it
+// could be restarted from. Those are the four numbers here.
+type StreamInfo struct {
+	// Watermark is how far event time has advanced, in unix ms. It is the claim
+	// every window closes on, and the only clock a stream job actually obeys.
+	Watermark int64 `json:"watermark,omitempty"`
+	// Laggard is the split holding the watermark back and LagMS by how much,
+	// because a watermark is a minimum and the useful half of a minimum is
+	// which member set it.
+	Laggard string `json:"laggard,omitempty"`
+	LagMS   int64  `json:"lagMs,omitempty"`
+
+	Records int64 `json:"records"`
+	Panes   int64 `json:"panes"`
+	Late    int64 `json:"late,omitempty"`
+	Batches int64 `json:"batches,omitempty"`
+
+	// Epoch is the last checkpoint recorded, CheckpointAt when, QuiesceMS how
+	// long the job was held still to take it, and Skipped how many were
+	// abandoned because it would not come to rest. A job that keeps skipping is
+	// a job that cannot be restarted cheaply.
+	Epoch        int64  `json:"epoch,omitempty"`
+	Checkpoints  int64  `json:"checkpoints,omitempty"`
+	CheckpointAt int64  `json:"checkpointAt,omitempty"`
+	QuiesceMS    int64  `json:"quiesceMs,omitempty"`
+	Skipped      int64  `json:"skipped,omitempty"`
+	Note         string `json:"note,omitempty"`
+
+	Splits []*SplitInfo `json:"splits,omitempty"`
+}
+
+// SplitInfo is one source partition as the view knows it.
+type SplitInfo struct {
+	ID    string `json:"id"`
+	Stage string `json:"stage,omitempty"`
+	// Note says where reading resumed from, which is the first thing worth
+	// knowing about a restarted job.
+	Note     string `json:"note,omitempty"`
+	OpenedAt int64  `json:"openedAt,omitempty"`
+	EndedAt  int64  `json:"endedAt,omitempty"`
+	Retired  bool   `json:"retired,omitempty"`
+	Err      string `json:"err,omitempty"`
 }
 
 // StageProjection is one stage's forecast, published before the run by
@@ -411,6 +509,10 @@ type RunSummary struct {
 	CostUSD    float64      `json:"cost"`
 	Projected  float64      `json:"projectedUsd,omitempty"`
 	Stages     []StageBrief `json:"stages,omitempty"`
+	// Panes and Watermark let the universe overview rank a stream job by what
+	// it is actually doing, since "tasks completed" never converges for one.
+	Panes     int64 `json:"panes,omitempty"`
+	Watermark int64 `json:"watermark,omitempty"`
 }
 
 // Snapshot is the complete state of one run, plus the roster of every run
@@ -429,6 +531,8 @@ type Snapshot struct {
 	Broadcasts []*BroadcastInfo `json:"broadcasts"`
 	MCP        []*MCPInfo       `json:"mcp"`
 	Projection *ProjectionInfo  `json:"projection,omitempty"`
+	// Stream is present only for a run driven by loom.Stream.
+	Stream *StreamInfo `json:"stream,omitempty"`
 }
 
 // delta is one incremental update: which run it belongs to, that run's header
@@ -455,6 +559,12 @@ type delta struct {
 	// run exists, so a client applies it to whatever sky it is showing.
 	MCP        *MCPInfo        `json:"mcp,omitempty"`
 	Projection *ProjectionInfo `json:"projection,omitempty"`
+	Stream     *StreamInfo     `json:"stream,omitempty"`
+	// Dropped names tasks the server has forgotten, so a client's copy can
+	// forget them too. A stream job produces tasks for as long as it runs, and
+	// a view that only ever appended would keep the whole history of an endless
+	// run in a browser tab.
+	Dropped []string `json:"dropped,omitempty"`
 }
 
 const (
@@ -472,6 +582,10 @@ const (
 	// task, prompt, and response — so the history is finite by construction:
 	// the oldest run is dropped when a new one pushes past the limit.
 	defaultRetainedRuns = 12
+	// defaultRetainedTasks bounds one *stream* job's held tasks. A run ends and
+	// is therefore finite already; a stream job does not, so its sky is the
+	// recent past rather than all of it. See RetainTasks.
+	defaultRetainedTasks = 1500
 )
 
 type subscriber struct {
@@ -508,6 +622,16 @@ type runState struct {
 	// iterative stages in flight at once.
 	round map[string]int
 
+	// stream is the job-level state of a run driven by loom.Stream, nil for
+	// every other kind. It is held beside the stages rather than inside one
+	// because a watermark, a checkpoint and a split belong to the job: no stage
+	// owns them, and every stage is downstream of them.
+	stream  *StreamInfo
+	splitIx map[string]*SplitInfo
+	// paneIx locates a pane by identity, so a task completing minutes after its
+	// window fired still lands on the right one.
+	paneIx map[string]*PaneInfo
+
 	// The forecast this run was measured against (loom.Explain), and the
 	// run-level half of it. Held per run so a second pipeline's prediction
 	// never lands on the first one's stages.
@@ -517,7 +641,12 @@ type runState struct {
 	// Totals, kept incrementally. The overview shows every run at once, and
 	// re-tallying each run's tasks on every event is how a view that watches
 	// several runs stops keeping up with any of them.
-	byStatus  map[string]int
+	byStatus map[string]int
+	// taskTotal counts every task this run has ever had, which is not
+	// len(tasks) once a stream job has started forgetting the oldest. It is
+	// what the overview counts, because "tasks so far" is a fact about the run
+	// and "tasks still held" is a fact about the viewer.
+	taskTotal int
 	retries   int
 	cacheHits int
 	tokens    int
@@ -534,6 +663,8 @@ func newRunState(hdr runHeader) *runState {
 		serveIx:  map[string]*MCPInfo{},
 		byStatus: map[string]int{},
 		round:    map[string]int{},
+		splitIx:  map[string]*SplitInfo{},
+		paneIx:   map[string]*PaneInfo{},
 	}
 }
 
@@ -554,7 +685,10 @@ type Server struct {
 	seq   int       // runs seen, ever — the source of Index
 	// retain bounds how many runs are held at once; see Retain.
 	retain int
-	subs   map[*subscriber]struct{}
+	// retainTasks bounds how many tasks a *stream* job holds; see RetainTasks.
+	// A bounded run is kept whole, because it ends.
+	retainTasks int
+	subs        map[*subscriber]struct{}
 
 	// Projections outlive the runs they describe. A forecast is published
 	// before its run starts (loom.Explain), and the run that follows is
@@ -592,15 +726,29 @@ func Retain(n int) Option {
 	}
 }
 
+// RetainTasks bounds how many tasks a stream job's sky holds at once (default
+// 1500). It has no effect on a bounded run, which is kept whole because it ends.
+//
+// An unbounded job produces tasks forever, so something has to forget them, and
+// what a viewer wants is the recent past rather than the whole of it: the oldest
+// *settled* tasks are dropped, running ones are never dropped, and the
+// cumulative counters — tasks, panes, cost, per-stage totals — are kept on the
+// run and its stages rather than derived from the list. Values below 1 disable
+// forgetting, which is a choice about how long the tab survives.
+func RetainTasks(n int) Option {
+	return func(s *Server) { s.retainTasks = n }
+}
+
 // New returns a Server with an empty universe.
 func New(opts ...Option) *Server {
 	s := &Server{
-		runIx:     map[string]*runState{},
-		forecasts: map[string]*forecast{},
-		serverIx:  map[string]*MCPInfo{},
-		retain:    defaultRetainedRuns,
-		subs:      map[*subscriber]struct{}{},
-		viewer:    make(chan struct{}),
+		runIx:       map[string]*runState{},
+		retainTasks: defaultRetainedTasks,
+		forecasts:   map[string]*forecast{},
+		serverIx:    map[string]*MCPInfo{},
+		retain:      defaultRetainedRuns,
+		subs:        map[*subscriber]struct{}{},
+		viewer:      make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
@@ -797,10 +945,24 @@ func (s *Server) Handle(e observe.Event) {
 		n.Input = e.Input
 		n.InputIDs = e.InputIDs
 		n.Round = r.round[e.Stage]
-		if n.Round > 0 {
+		n.Pane = e.Pane
+		// The pane is carried by the task rather than inferred from what fired
+		// most recently, so a window that fired again while this one's
+		// aggregation was still running cannot steal its tasks.
+		if p := r.paneLocked(e.Pane); p != nil {
+			p.Tasks++
+			if st := r.paneStageLocked(e.Pane); st != nil {
+				d.Stage = st
+			}
+		}
+		switch {
+		case n.Round > 0:
 			logf(n, now, "scheduled in round %d (%d vertex%s)", n.Round,
 				e.Records, map[bool]string{true: "", false: "es"}[e.Records == 1])
-		} else {
+		case n.Pane != "":
+			logf(n, now, "scheduled for pane %s (%d record%s)",
+				paneLabel(n.Pane), e.Records, plural(e.Records))
+		default:
 			logf(n, now, "scheduled (%d record%s)", e.Records, plural(e.Records))
 		}
 		d.Task = n
@@ -894,6 +1056,14 @@ func (s *Server) Handle(e observe.Event) {
 		n.Output = e.Output
 		n.OutputIDs = e.OutIDs
 		n.Error = ""
+		if p := r.paneLocked(e.Pane); p != nil {
+			p.Done++
+			p.Tokens += e.Usage.TotalTokens()
+			p.CostUSD += e.Usage.CostUSD
+			if st := r.paneStageLocked(e.Pane); st != nil {
+				d.Stage = st
+			}
+		}
 		logf(n, now, "completed in %s (attempt %d)", e.Latency.Round(time.Millisecond), e.Attempt)
 		d.Task = n
 		d.Worker = r.workerEndLocked(e.Worker, e.TaskID, now, false)
@@ -907,6 +1077,94 @@ func (s *Server) Handle(e observe.Event) {
 		logf(n, now, "failed after %d attempt%s: %s", e.Attempt, plural(e.Attempt), e.Err)
 		d.Task = n
 		d.Worker = r.workerEndLocked(e.Worker, e.TaskID, now, true)
+
+	case observe.SplitOpened:
+		sp := r.splitLocked(e.Split)
+		sp.Stage = e.Stage
+		sp.Note = e.Note
+		sp.Err = e.Err
+		sp.Retired = false
+		if sp.OpenedAt == 0 {
+			sp.OpenedAt = now
+		}
+		d.Stream = r.stream
+
+	case observe.SplitRetired:
+		sp := r.splitLocked(e.Split)
+		sp.Retired = true
+		sp.EndedAt = now
+		if e.Err != "" {
+			sp.Err = e.Err
+		}
+		d.Stream = r.stream
+
+	case observe.WatermarkAdvanced:
+		si := r.streamLocked()
+		si.Watermark = e.Watermark.UnixMilli()
+		si.Laggard, si.LagMS = e.Split, e.Lag.Milliseconds()
+		if int64(e.Records) > si.Records {
+			si.Records = int64(e.Records)
+		}
+		d.Stream = si
+
+	case observe.PaneFired:
+		st := r.stageLocked(e.Stage)
+		st.Windowed = true
+		st.PaneCount++
+		st.WindowRecords += int64(e.Records)
+		p := &PaneInfo{
+			ID: e.Pane, Window: e.Detail, Records: e.Records, Kind: e.Note,
+			Watermark: e.Watermark.UnixMilli(), FiredAt: now,
+		}
+		if i := strings.LastIndex(e.Pane, "#"); i >= 0 {
+			p.Seq, _ = strconv.Atoi(e.Pane[i+1:])
+		}
+		// The identity a task carries is the stage's, so index it that way: two
+		// window stages can fire windows of the same interval, and a pane has
+		// to belong to exactly one of them.
+		r.addPaneLocked(e.Stage, p)
+		si := r.streamLocked()
+		si.Panes++
+		d.Stage, d.Stream = st, si
+
+	case observe.RecordsLate:
+		st := r.stageLocked(e.Stage)
+		st.Windowed = true
+		st.Late += e.Records
+		si := r.streamLocked()
+		si.Late += int64(e.Records)
+		d.Stage, d.Stream = st, si
+
+	case observe.SinkWrote:
+		st := r.stageLocked(e.Stage)
+		st.Batches++
+		if p := r.paneLocked(e.Pane); p != nil {
+			p.Written = true
+		}
+		si := r.streamLocked()
+		si.Batches++
+		d.Stage, d.Stream = st, si
+
+	case observe.CheckpointCommitted:
+		si := r.streamLocked()
+		si.Checkpoints++
+		si.Epoch = e.Epoch
+		si.CheckpointAt = now
+		si.QuiesceMS = e.Latency.Milliseconds()
+		si.Note = ""
+		if e.Watermark.After(time.Time{}) {
+			si.Watermark = e.Watermark.UnixMilli()
+		}
+		d.Stream = si
+
+	case observe.CheckpointSkipped:
+		si := r.streamLocked()
+		si.Skipped++
+		si.Note = e.Note
+		if si.Note == "" {
+			si.Note = e.Err
+		}
+		d.Stream = si
 
 	case observe.BroadcastRegistered:
 		bc := r.sharedLocked(e.Broadcast)
@@ -1018,6 +1276,9 @@ func (s *Server) Handle(e observe.Event) {
 	}
 
 	if r != nil {
+		// Forgetting happens after the event has been folded in, so a task can
+		// never be dropped in the same breath as the delta that created it.
+		d.Dropped = s.forgetSettledLocked(r)
 		d.RunID = r.hdr.RunID
 		d.Run = r.hdr
 		d.Summary = s.summaryLocked(r, false)
@@ -1026,6 +1287,39 @@ func (s *Server) Handle(e observe.Event) {
 		d.Live = s.cur.hdr.RunID
 	}
 	s.broadcastLocked(d)
+}
+
+// forgetSettledLocked drops the oldest finished tasks of a stream job, keeping
+// the run's held task count under the retention bound.
+//
+// A batch run ends, so holding all of it is a bounded promise. A stream job does
+// not: it produces tasks for as long as it is up, and a view that only ever
+// appended would keep the entire history of an endless run in a browser tab.
+// So the sky of a stream job is a *recent* sky — the oldest settled stars are
+// forgotten, the running ones never are, and the cumulative counters that say
+// what the job has done live on the run and its stages rather than in the list.
+func (s *Server) forgetSettledLocked(r *runState) []string {
+	if r.stream == nil || s.retainTasks <= 0 || len(r.tasks) <= s.retainTasks {
+		return nil
+	}
+	drop := len(r.tasks) - s.retainTasks
+	kept := r.tasks[:0]
+	var dropped []string
+	for _, n := range r.tasks {
+		settled := n.Status == "completed" || n.Status == "failed"
+		if drop > 0 && settled {
+			drop--
+			dropped = append(dropped, n.ID)
+			delete(r.taskIx, n.ID)
+			continue
+		}
+		kept = append(kept, n)
+	}
+	r.tasks = kept
+	// byStatus is deliberately not decremented: it is the run's census of what
+	// happened, not an inventory of what is still being held, and a completed
+	// task does not become uncompleted because nobody is looking at it.
+	return dropped
 }
 
 // startRunLocked opens a new sky for a run, retiring the oldest one if the
@@ -1037,6 +1331,13 @@ func (s *Server) startRunLocked(e observe.Event, now int64) *runState {
 		RunID: e.RunID, Pipeline: e.Pipeline, Index: s.seq,
 		StartedAt: now, Driver: e.Kind,
 	})
+	// A stream job says so in its header, and that is what makes it one — not
+	// whether a watermark has happened to arrive yet. The view keys "is this a
+	// job or a run?" off the presence of this state, and a job with no splits
+	// open should still read as a job.
+	if e.Kind == "stream" {
+		r.stream = &StreamInfo{}
+	}
 	if fc := s.matchForecastLocked(e.Pipeline); fc != nil {
 		r.fc = fc
 		r.proj = fc.run
@@ -1284,6 +1585,79 @@ func shortHash(h string) string {
 	return h
 }
 
+// streamLocked returns this run's stream state, creating it on the first
+// streaming event. Its presence is what tells the view a run is a stream job
+// rather than a run, so nothing else needs to be told.
+func (r *runState) streamLocked() *StreamInfo {
+	if r.stream == nil {
+		r.stream = &StreamInfo{}
+	}
+	return r.stream
+}
+
+// splitLocked returns one source partition's state, creating it on first sight.
+func (r *runState) splitLocked(id string) *SplitInfo {
+	si := r.streamLocked()
+	if sp, ok := r.splitIx[id]; ok {
+		return sp
+	}
+	sp := &SplitInfo{ID: id}
+	r.splitIx[id] = sp
+	si.Splits = append(si.Splits, sp)
+	return sp
+}
+
+// maxPanesPerStage bounds a window stage's firing history. A stream job fires
+// panes for as long as it runs, so the list is a window onto the recent past
+// rather than a record of everything: the counters that must not reset live on
+// the stage as totals.
+const maxPanesPerStage = 48
+
+// addPaneLocked records a firing, keyed by the identity its tasks carry.
+//
+// Panes are held by pointer rather than by value, and that is load-bearing: a
+// task can complete long after its window fired — that is the whole shape of an
+// aggregation — and the index has to still be pointing at the pane it lands on.
+// Values in a growing slice do not survive the slice growing.
+func (r *runState) addPaneLocked(stage string, p *PaneInfo) {
+	st := r.stageLocked(stage)
+	st.Panes = append(st.Panes, p)
+	r.paneIx[p.ID] = p
+	if n := len(st.Panes) - maxPanesPerStage; n > 0 {
+		for _, old := range st.Panes[:n] {
+			delete(r.paneIx, old.ID)
+		}
+		st.Panes = append(st.Panes[:0], st.Panes[n:]...)
+	}
+}
+
+// paneLocked finds a pane by the identity a task carries.
+func (r *runState) paneLocked(id string) *PaneInfo {
+	if id == "" {
+		return nil
+	}
+	return r.paneIx[id]
+}
+
+// paneStageLocked returns the window stage a pane identity belongs to. The
+// identity is "<stage>#<window>#<seq>", so the stage is its head.
+func (r *runState) paneStageLocked(id string) *StageInfo {
+	i := strings.Index(id, "#")
+	if i <= 0 {
+		return nil
+	}
+	return r.stageIx[id[:i]]
+}
+
+// paneLabel renders a pane identity for a log line: the window and firing,
+// without the stage that already names itself.
+func paneLabel(id string) string {
+	if i := strings.Index(id, "#"); i >= 0 {
+		return id[i+1:]
+	}
+	return id
+}
+
 func (r *runState) stageLocked(id string) *StageInfo {
 	if st, ok := r.stageIx[id]; ok {
 		return st
@@ -1316,6 +1690,7 @@ func (r *runState) nodeLocked(id, stage string) *Node {
 	n := &Node{ID: id, Stage: stage, Status: "pending"}
 	r.taskIx[id] = n
 	r.tasks = append(r.tasks, n)
+	r.taskTotal++
 	r.byStatus["pending"]++
 	r.stageLocked(stage).Tasks++
 	return n
@@ -1389,7 +1764,7 @@ func orDash(s string) string {
 func (s *Server) summaryLocked(r *runState, withStages bool) *RunSummary {
 	sum := &RunSummary{
 		runHeader:  r.hdr,
-		Tasks:      len(r.tasks),
+		Tasks:      r.taskTotal,
 		Completed:  r.byStatus["completed"],
 		Failed:     r.byStatus["failed"],
 		Running:    r.byStatus["running"] + r.byStatus["retrying"],
@@ -1402,6 +1777,9 @@ func (s *Server) summaryLocked(r *runState, withStages bool) *RunSummary {
 	}
 	if r.proj != nil {
 		sum.Projected = r.proj.ExpectedUSD
+	}
+	if r.stream != nil {
+		sum.Panes, sum.Watermark = r.stream.Panes, r.stream.Watermark
 	}
 	if withStages {
 		sum.Stages = make([]StageBrief, 0, len(r.stages))
@@ -1443,6 +1821,7 @@ func (s *Server) snapshotLocked(r *runState) []byte {
 		snap.Broadcasts = r.shared
 		snap.MCP = r.servers
 		snap.Projection = r.proj
+		snap.Stream = r.stream
 	} else {
 		// Nothing has run yet. If a forecast has been published it is the only
 		// thing there is to show, and this is the one moment when knowing the

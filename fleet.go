@@ -1051,6 +1051,23 @@ func (h *host) open(runID string) *agentTrace {
 // launch compiles p and drives it as one program on this host. A non-nil pool
 // makes it an agent on a shared engine; nil leaves the driver choice to the
 // config, which is how Run keeps its barrier default.
+// executorFor builds the executor a plan's tasks run on.
+//
+// Local is the default and the fallback both: a fleet of workers is one more
+// implementation of the same one method, chosen here and nowhere else, so
+// nothing downstream of this line can tell which it got — and a stream job,
+// which calls this too, is distributed by the same one line as a run.
+func (h *host) executorFor(runners map[string]executor.OpRunner) executor.Executor {
+	if h.remote != nil {
+		return h.remote
+	}
+	return &executor.Local{
+		Runners: runners, Client: h.client, Tools: h.tools,
+		Broadcasts: h.shared, State: h.state,
+		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
+	}
+}
+
 func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	cfg Config, pool *runtime.Pool) (*RunResult, error) {
 
@@ -1064,22 +1081,26 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	if err != nil {
 		return nil, err
 	}
+	// A bounded driver has no answer to "when is the input complete?" for a
+	// source that never ends, and no meaning for a window that would answer it.
+	// Refusing here is better than running: the alternative is a run that reads
+	// nothing from a stream source and quietly reports success.
+	for _, sp := range pl.Order {
+		switch {
+		case pipeline.StreamSource(sp.Stage):
+			return nil, fmt.Errorf("stage %q reads an unbounded stream: run it "+
+				"with loom.Stream, not loom.Run", sp.Stage.ID)
+		case sp.Stage.Kind == pipeline.KindWindow:
+			return nil, fmt.Errorf("stage %q is a window, which only means "+
+				"something on a stream: run this pipeline with loom.Stream", sp.Stage.ID)
+		}
+	}
 	runners, err := ops.BuildRunners(pl)
 	if err != nil {
 		return nil, err
 	}
 
-	// Local is the default and the fallback both: a fleet of workers is one
-	// more implementation of the same one method, chosen here and nowhere else,
-	// so nothing downstream of this line can tell which it got.
-	var exec executor.Executor = &executor.Local{
-		Runners: runners, Client: h.client, Tools: h.tools,
-		Broadcasts: h.shared, State: h.state,
-		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
-	}
-	if h.remote != nil {
-		exec = h.remote
-	}
+	exec := h.executorFor(runners)
 	sched := runtime.Scheduler{
 		Workers: cfg.Workers, Retry: cfg.Retry, Limiter: h.limiter,
 		Governor: h.gov, Registry: cfg.Registry, Exec: exec, Bus: h.bus,
