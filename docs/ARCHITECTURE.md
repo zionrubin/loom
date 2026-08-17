@@ -621,3 +621,118 @@ vertices, and the later phases of stream mode (transactional sinks, renewing
 rate budgets with backpressure/shed/degrade policies, session windows, split
 assignment across a fleet, and windowing in a bounded run as a group-by). The interfaces above are the contract
 those implementations plug into.
+
+---
+
+## 8. Design notes
+
+Short rationales that belong to no single component, collected.
+
+### Working notes
+
+- AI operators are pure data and tasks are JSON-serializable (tested), so
+  remote/sandboxed executors plug in behind the `Executor` interface without
+  touching planning or scheduling.
+- Go-function stages run in-process; give them `pipeline.WithVersion("v1")` to
+  make them cacheable (bump the version when behavior changes).
+- Unclassified errors are treated as permanent so user-code bugs fail fast
+  instead of burning paid retries; providers classify their own errors.
+
+### One path, so nothing can drift
+
+- Both drivers execute tasks through the same `Scheduler.RunTask`, so retry,
+  escalation, admission control, and the budget governor cannot drift between
+  barrier and streaming execution. `loom.Run` is a fleet of one, built through
+  the same construction path, so what a run and an agent share cannot drift
+  either.
+- A fleet's agents coordinate at agent boundaries, not inside a task. A task
+  that could publish mid-run would make its own cached result depend on
+  execution order, and a task replayed from cache would not publish at all — so
+  the board's contents would depend on how warm the cache happened to be.
+  [ASYNC.md](./ASYNC.md).
+- Findings are written from *inside* a task, which the blackboard deliberately
+  forbids — and the exemption is earned rather than assumed. A blackboard post
+  changes what a later stage in the same run reads, so it cannot happen
+  mid-task. A findings hit is *substitutable* for the call it replaces, so it
+  can: the answer is the same either way and only the spend differs, which is
+  the trade worth making and the one `examples/commons` asserts rather than
+  claims. [FINDINGS.md](./FINDINGS.md).
+
+### Why a declaration beats a closure
+
+- The studio's document is declarative because it has to survive a round trip
+  through a browser, and that constraint pays for itself: a step's cache version
+  can be the hash of its own declaration, an assistant can propose a diff rather
+  than generate code, and the answer shape can be one declaration instead of
+  three that agree until someone edits one. What it cannot express is arbitrary
+  Go — which is what the Go export is for. [STUDIO.md](./STUDIO.md).
+- A continuation is a *reference to something that changes*, which is the one
+  thing Loom had no shape for. A broadcast is registered once because every task
+  reads the same bytes; a continuation is registered per run because each run
+  reads a little more than the last. Getting that distinction into the type
+  system is what makes the rest fall out: the envelope holds a revision hash, so
+  it stays small; the hash joins the fingerprint, so the cache invalidates
+  exactly the round that changed; the key is what a queue scores locality on;
+  and the parent hash is what tells an executor which of its own state it may
+  build on. [DELTA.md](./DELTA.md).
+
+### Proving only what can be proved cheaply
+
+- The certificate in `delta` deliberately does **not** prove the splice was
+  right, and saying so is the point. It proves the splice's arithmetic — that
+  the result is the parent's first *n* bytes plus what was re-rendered, that the
+  segments just before the boundary came out identical, that the digest follows
+  — in time proportional to the change. Proving more would mean reading the
+  bytes it did not touch, which is the rebuild it exists to avoid. So the honest
+  design is a ladder: a declared bound on how far a change reaches, evidence at
+  the seam on every splice, a sampled full recomputation to test the declaration
+  itself, and a fallback that is the same code path with the window widened all
+  the way. [DELTA.md](./DELTA.md).
+- The cheapest tier of the findings gate is also the most certain, and that is
+  structural rather than lucky. Matching on topic-and-facets says two questions
+  are about one subject; matching on embedding similarity says only that they
+  look alike, so it yields candidates that must then be *checked*. The tier that
+  needs a model is therefore the last one tried, its verdicts are memoized per
+  question-and-finding pair, and it is skipped entirely when the ledger's own
+  record of what a topic costs to research says the judgement would cost more
+  than the lookup could save. [FINDINGS.md](./FINDINGS.md).
+
+---
+
+## 9. Where the layers came from
+
+The dimension Loom was missing longest was **iteration**: records flowed forward
+once, so nothing could look at a stage's output and decide to go around again —
+which ruled out the workloads people most want, deep research, entity
+resolution, knowledge-graph construction and refine-until-good, all of which are
+loops and most of which are loops over a graph.
+[ITERATION.md](./ITERATION.md) makes the case that Loom is the only place this
+can be built *safely*: the governor bounds a loop in dollars, content-addressed
+caching makes cost per round *fall* as it converges, envelopes contain a program
+that discovers its own targets, and lineage is the only way to audit six hops of
+model-derived inference.
+
+It is now built, and one step further than that document proposed. Rather than a
+graph operator, `pipeline.Iterate` is an operator whose *control flow* is a
+plug-in — so Pregel is one algorithm among several rather than the only shape
+available, and writing a new one is two pure methods that need neither a model
+nor a scheduler to test. [ALGORITHMS.md](./ALGORITHMS.md) is the design;
+`examples/multi-hop` is it answering a research question by walking a citation
+graph the model chooses as it goes, reaching a conclusion three hops from
+anything the question named.
+
+Iteration is also what makes the newest layer worth having. A loop's context
+grows by a finding, a critique, a turn — a little each round, all of it needed
+every round — and until then every round paid for the whole of it, twice over:
+once to render it and once to ship it to whichever process was running.
+**Stateful delta execution** ([DELTA.md](./DELTA.md)) makes that context an
+immutable chain in the CAS, so what an envelope carries is a hash and what an
+executor holding the previous revision does is splice. The design worth reading
+for is not the splice but the discipline around it, borrowed almost verbatim
+from TokTier's guarantee ladder: a declared bound on how far a change can reach,
+per-splice evidence at the seam, sampled recomputation against the reference
+path, and a fallback that is the same code with the repair window opened all the
+way. State makes a round cheap; it is never what makes it right. Kill the worker
+carrying a session and the next round rebuilds from the chain and answers
+identically, which is the whole claim and the thing `examples/delta-session`
+checks rather than asserts.

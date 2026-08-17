@@ -24,6 +24,21 @@ and becomes the thing you are editing against.
    the same pipeline, as a Go program you can leave with
 ```
 
+```go
+doc, _ := studio.Load("vertical-digest.json")   // or build one in Go
+s := studio.New(doc,
+    studio.Models(reg),                          // what the steps bind to
+    studio.File("vertical-digest.json"),         // autosave every edit
+    studio.Constellation(vizURL),                // where the RUN tab goes
+    studio.Runner(run),                          // what the Run button does
+)
+url, _ := s.Start("localhost:8078")
+```
+
+```sh
+go run ./examples/studio    # offline: invented archive, mock models, real arithmetic
+```
+
 ---
 
 ## 1. What the studio is not

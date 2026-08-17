@@ -151,6 +151,42 @@ containing the whole thing inside the capability model.
 
 ---
 
+## 3.1 Wiring it up
+
+`loom.WithFindings` puts the gate in front of the tools that reach public
+sources. Nothing in the pipeline changes — the stage declares the tool it always
+declared, and whether the call reaches the source or the ledger is decided
+beneath it.
+
+```go
+fleet, _ := loom.NewFleet(
+    loom.WithMCPServer(web),
+    loom.WithFindings(findings.Config{
+        Gate: []string{"mcp/web/search"},                 // ← the public source
+        Policy: findings.Policy{
+            Topics: map[string]findings.TopicPolicy{
+                "mcp/web/search": {Volatility: findings.Slow},
+            },
+        },
+    }),
+)
+```
+
+One field extends the same gate across executor processes (§11):
+
+```go
+backend, _ := pgstore.Open(ctx, dsn, pgstore.Options{Dimensions: 1536})
+loom.WithFindings(findings.Config{
+    Gate:   []string{"mcp/web/search"},
+    Shared: findings.NewShared(findings.SharedConfig{Backend: backend}),   // ← every executor
+})
+```
+
+`examples/commons` is the single-process shape and `examples/commons-shared`
+the four-process one; both print the same fleet with the gate and without it.
+
+---
+
 ## 4. What is worth storing
 
 The distinction that decides everything is whether an answer is about the
