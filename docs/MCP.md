@@ -10,6 +10,40 @@ operates at.
 This document is the design: where connections come from, what a task carries,
 what the cache does with a tool call, and what is deliberately not built.
 
+## In practice
+
+Register the servers a run may use; declare, per stage, what it may call.
+
+```go
+inventory := mcp.Stdio("inventory", "npx", "-y", "@example/inventory-mcp").
+    WithTools("lookup_sku", "stock_level")            // least privilege, at the deployment
+
+src.MapTools("enrich", func(ctx context.Context, s core.Session, r core.Record) (core.Record, error) {
+    out, err := s.Invoke(ctx, mcp.ToolName("inventory", "lookup_sku"),
+        map[string]any{"sku": r.String("sku")})
+    if err != nil {
+        return core.Record{}, err
+    }
+    r.Data["product"] = mcp.Text(out)
+    return r, nil
+}, pipeline.WithMCP("inventory", "lookup_sku"), pipeline.WithVersion("v1"))
+
+loom.Run(ctx, p,
+    loom.WithMCPServer(inventory),
+    loom.WithMCPResource("voice", "inventory", "mem://voice"),  // a doc → a broadcast
+)
+```
+
+That single `WithMCP` declaration produces the grant
+(`tool:mcp/inventory/lookup_sku` — an ordinary capability; MCP needed no second
+permission mechanism), the server's host on the stage's egress allowlist, and the
+digest of the tool descriptors the stage was compiled against. A server nobody
+registered fails compilation, not the first record.
+
+[`examples/mcp-desk`](../examples/mcp-desk) is all of it running offline against
+a real child-process server. The rest of this document is why it is shaped that
+way.
+
 ## 1. The connection question
 
 A pipeline that calls one MCP tool per record over ten thousand records has to
