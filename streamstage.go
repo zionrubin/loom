@@ -247,8 +247,15 @@ func (j *streamJob) publishWatermarks(ctx context.Context, emit func([]runtime.E
 		}
 		last = wm
 		emit([]runtime.Element{mark(runtime.MarkWatermark, wm, "")})
+		// The watermark is a minimum, so the interesting half of it is which
+		// split is setting it. Naming the laggard here is what turns "event
+		// time is nine seconds behind" into something actionable.
+		split, lag := j.laggard()
+		// The running ingest total rides along, because this is already the
+		// event that fires at the cadence a viewer wants it at: publishing a
+		// count per record would be an event per record.
 		j.bus.Publish(observe.Event{Type: observe.WatermarkAdvanced, RunID: j.runID,
-			Watermark: wm})
+			Watermark: wm, Split: split, Lag: lag, Records: int(j.records.Load())})
 	}
 	for {
 		select {
@@ -261,6 +268,24 @@ func (j *streamJob) publishWatermarks(ctx context.Context, emit func([]runtime.E
 			push()
 		}
 	}
+}
+
+// laggard names the split furthest behind the job's watermark, and by how much.
+// It is the one number that says where to look when panes stop firing.
+func (j *streamJob) laggard() (string, time.Duration) {
+	var (
+		worst string
+		lag   time.Duration
+	)
+	for _, l := range j.wm.Lags() {
+		if l.Retired || l.Idle {
+			continue
+		}
+		if l.Lag > lag {
+			worst, lag = l.Split, l.Lag
+		}
+	}
+	return worst, lag
 }
 
 // positionOf returns the checkpointed position for a split, if the job restored
@@ -338,6 +363,10 @@ func (j *streamJob) pumpLoop(ctx context.Context, cancel context.CancelCauseFunc
 		lastWM    time.Time
 		gen       sync.WaitGroup
 		seq       int
+		// pane is the firing whose records this stage is currently processing,
+		// empty upstream of every window. It is stamped onto the tasks so an
+		// observer can say which window's money a task spent.
+		pane string
 	)
 
 	// forwardWatermark emits the largest watermark this stage can honestly
@@ -375,6 +404,7 @@ func (j *streamJob) pumpLoop(ctx context.Context, cancel context.CancelCauseFunc
 		}
 		for i, t := range tasks {
 			t.Seq = seq
+			t.Pane = pane
 			seq++
 			// Every output of a task inherits the earliest event time among its
 			// inputs. It is the conservative choice — a batch's records may span
@@ -450,10 +480,15 @@ func (j *streamJob) pumpLoop(ctx context.Context, cancel context.CancelCauseFunc
 				}
 				mu.Unlock()
 				forwardWatermark()
-			default:
+			case runtime.MarkPaneOpen:
 				// A pane boundary is an ordering claim: everything before it
 				// must be downstream before it is.
 				gen.Wait()
+				pane = el.Mark.Pane
+				emit([]runtime.Element{el})
+			default:
+				gen.Wait()
+				pane = ""
 				emit([]runtime.Element{el})
 			}
 		}
@@ -588,8 +623,11 @@ func (j *streamJob) emitPanes(emit func([]runtime.Element), stageID string, fire
 		case !f.Pane.Final:
 			note = "early"
 		}
+		// The qualified identity, the same string the tasks carry: two window
+		// stages can fire windows of the same interval, and an observer has to
+		// be able to tell whose pane a task was working on.
 		j.bus.Publish(observe.Event{Type: observe.PaneFired, RunID: j.runID,
-			Stage: stageID, Pane: f.Pane.ID(), Records: len(f.Records),
+			Stage: stageID, Pane: id, Records: len(f.Records),
 			Watermark: f.Pane.Watermark, Detail: f.Pane.Window.String(), Note: note})
 	}
 }
@@ -625,7 +663,7 @@ func (j *streamJob) aggregateLoop(ctx context.Context, cancel context.CancelCaus
 		open bool
 	)
 	fold := func() bool {
-		out, err := j.aggregate(ctx, j.engine, sp, buf)
+		out, err := j.aggregate(ctx, j.engine, sp, buf, pane)
 		j.record(s.ID, out)
 		buf = nil
 		if err != nil {
@@ -752,7 +790,7 @@ func (w *sinkWriter) write(paneID string, recs []core.Record) {
 	}
 	w.job.batches.Add(1)
 	w.job.bus.Publish(observe.Event{Type: observe.SinkWrote, RunID: w.job.runID,
-		Stage: w.stage, Pane: p.ID(), Records: len(recs)})
+		Stage: w.stage, Pane: paneID, Records: len(recs)})
 }
 
 // flush writes whatever a sink on an unwindowed stage has accumulated, as one

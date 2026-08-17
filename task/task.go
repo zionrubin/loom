@@ -112,6 +112,12 @@ type Task struct {
 	Envelope    Envelope      `json:"envelope"`
 	CacheKey    string        `json:"cache_key,omitempty"`
 	EstTokens   int           `json:"est_tokens,omitempty"`
+	// Pane names the window firing this task's records belong to, and is empty
+	// outside stream mode. Nothing about execution reads it: it rides along so
+	// that a task's observations can be attributed to the pane that caused
+	// them, which is the only way a view of an endless run can say what a
+	// window cost.
+	Pane string `json:"pane,omitempty"`
 
 	Attempt       int    `json:"attempt,omitempty"`
 	Escalation    int    `json:"escalation,omitempty"`

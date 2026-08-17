@@ -123,7 +123,7 @@ func (d *driver) streamStage(ctx context.Context, cancel context.CancelCauseFunc
 		if ctx.Err() != nil {
 			return
 		}
-		out, err := d.aggregate(ctx, engine, sp, input)
+		out, err := d.aggregate(ctx, engine, sp, input, "")
 		d.record(s.ID, out)
 		if err != nil {
 			cancel(err)
@@ -252,8 +252,11 @@ type seqRecords struct {
 // aggregate runs a barrier stage — Combine's pairwise fold, or ReduceAI's
 // tree — over a fully drained input, using the shared engine for the model
 // calls so aggregation competes for the same slots as everything else.
+// pane is the window firing this aggregation belongs to, empty for a bounded
+// run. It is stamped onto every task the fold produces so that an observer can
+// attribute the cost of a window to the window.
 func (d *driver) aggregate(ctx context.Context, engine *runtime.Engine,
-	sp *plan.StagePlan, input []core.Record) ([]core.Record, error) {
+	sp *plan.StagePlan, input []core.Record, pane string) ([]core.Record, error) {
 
 	s := sp.Stage
 	switch s.Kind {
@@ -269,7 +272,7 @@ func (d *driver) aggregate(ctx context.Context, engine *runtime.Engine,
 		// superstep competes for the same slots as every other stage instead
 		// of provisioning its own.
 		return d.iterate(ctx, sp, input, func(ctx context.Context, tasks []task.Task) ([]task.Result, error) {
-			return d.runLevel(ctx, engine, tasks)
+			return d.runLevel(ctx, engine, tasks, pane)
 		})
 	}
 
@@ -283,7 +286,7 @@ func (d *driver) aggregate(ctx context.Context, engine *runtime.Engine,
 		if err != nil {
 			return cur, err
 		}
-		results, err := d.runLevel(ctx, engine, tasks)
+		results, err := d.runLevel(ctx, engine, tasks, pane)
 		cur = flatten(results)
 		if err != nil {
 			return cur, err
@@ -299,7 +302,7 @@ func (d *driver) aggregate(ctx context.Context, engine *runtime.Engine,
 // is a barrier — the next level consumes this one's outputs — but the tasks
 // within it run concurrently against the shared engine.
 func (d *driver) runLevel(ctx context.Context, engine *runtime.Engine,
-	tasks []task.Task) ([]task.Result, error) {
+	tasks []task.Task, pane string) ([]task.Result, error) {
 
 	var (
 		mu      sync.Mutex
@@ -308,6 +311,7 @@ func (d *driver) runLevel(ctx context.Context, engine *runtime.Engine,
 		wg      sync.WaitGroup
 	)
 	for _, t := range tasks {
+		t.Pane = pane
 		wg.Add(1)
 		engine.Submit(ctx, t, func(res task.Result, err error) {
 			defer wg.Done()

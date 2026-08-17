@@ -29,7 +29,7 @@ func run(t *testing.T, work string, keyField string, size time.Duration, opts ..
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, _, _ := registry()
+	reg, _, _ := registry(0)
 
 	base := []loom.Option{
 		loom.WithRegistry(reg),
@@ -169,7 +169,7 @@ func TestResumingAfterAnInterruptionCostsNoExtraCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg, fast, deep := registry()
+	reg, fast, deep := registry(0)
 	stream1 := func(opts ...loom.Option) *loom.StreamResult {
 		t.Helper()
 		src, err := file.Open(file.SourceOptions{

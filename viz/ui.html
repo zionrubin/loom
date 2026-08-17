@@ -53,6 +53,10 @@
   #runMeta .chip.done { color: var(--c-done); border-color: rgba(12,163,12,.4); }
   #runMeta .chip.live { color: var(--c-running); border-color: rgba(57,135,229,.4); }
   #runMeta .chip.note { color: var(--c-long); border-color: rgba(250,178,25,.4); }
+  /* A stream job is a different kind of thing from a run, and the header says
+     so before any number does. */
+  #runMeta .chip.stream { color: #8fb8ff; border-color: rgba(143,184,255,.45); }
+  #runMeta .chip.warn { color: var(--c-long); border-color: rgba(250,178,25,.4); }
   #runMeta .chip.conn { color: var(--ink-3); border-color: var(--hairline); margin-left: 8px; }
   #runMeta .chip.conn.ok { color: var(--c-done); border-color: rgba(12,163,12,.35); }
   #runMeta .chip.conn.warn { color: var(--c-long); border-color: rgba(250,178,25,.4); }
@@ -434,8 +438,13 @@ const S = {
   // handed over when that run starts, which is what lets the view show
   // expected against actual.
   projection: null,
+  // The stream state of the run being viewed, when it is one: watermark,
+  // panes, lag, checkpoints. Null for a bounded run, and its presence is what
+  // the chrome reads to decide whether this is a job or a run.
+  stream: null,
   offset: 0,          // Date.now() - server time
   layoutDirty: true,
+  stageOrderDirty: true,
   thresholdsDirty: true,
   lineageDirty: true,
   stageStatsDirty: true,
@@ -454,16 +463,47 @@ let universeDirty = true; // open universe overview needs a rebuild
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const serverNow = () => Date.now() - S.offset;
 
+// orderStages puts the stages in dataflow order — source first, terminal last —
+// by walking each one's upstream chain.
+//
+// A barrier run arrives in that order already, because its stages start one
+// after another. A stream job's stages all start at once, so the order events
+// arrive in is the order goroutines happened to be scheduled: without this the
+// sky would draw the graph differently on every run of the same pipeline.
+function orderStages() {
+  if (!S.stageOrderDirty) return;
+  S.stageOrderDirty = false;
+  const depth = new Map();
+  const depthOf = (st, guard) => {
+    if (!st) return 0;
+    if (depth.has(st.id)) return depth.get(st.id);
+    if (guard > 64) return 0; // a cycle cannot happen, but not looping forever is free
+    const up = st.upstream ? S.stageIx.get(st.upstream) : null;
+    const d = up ? depthOf(up, guard + 1) + 1 : 0;
+    depth.set(st.id, d);
+    return d;
+  };
+  const arrival = new Map();
+  S.stages.forEach((st, i) => arrival.set(st.id, i));
+  S.stages.sort((a, b) => {
+    const d = depthOf(a, 0) - depthOf(b, 0);
+    return d || (arrival.get(a.id) - arrival.get(b.id));
+  });
+}
+
 function upsert(list, ix, item) {
   const cur = ix.get(item.id);
   if (cur) { Object.assign(cur, item); return cur; }
   ix.set(item.id, item);
   list.push(item);
   S.layoutDirty = true;
+  S.stageOrderDirty = true;
   return item;
 }
 
 function clearState() {
+  S.stream = null;
+  S.stageOrderDirty = true;
   S.stages = []; S.stageIx = new Map();
   S.tasks = []; S.taskIx = new Map();
   S.workers = []; S.workerIx = new Map();
@@ -540,6 +580,7 @@ function applySnapshot(snap) {
   S.viewing = S.run.runId;
   if (snap.live !== undefined) S.live = snap.live || '';
   setRoster(snap.runs);
+  S.stream = snap.stream || null;
   (snap.stages || []).forEach(st => upsert(S.stages, S.stageIx, st));
   (snap.tasks || []).forEach(t => upsert(S.tasks, S.taskIx, t));
   (snap.workers || []).forEach(w => upsert(S.workers, S.workerIx, w));
@@ -598,6 +639,11 @@ function applyDelta(d) {
     S.stageStatsDirty = true;
     if (t.status === 'completed' || t.status === 'failed') S.thresholdsDirty = true;
   }
+  if (d.stream) { S.stream = d.stream; chromeDirty = true; }
+  // The server forgets a stream job's oldest settled tasks, and says so. A
+  // client that only ever appended would hold the whole history of an endless
+  // run in a tab; this is the other half of that bound.
+  if (d.dropped && d.dropped.length) forgetTasks(d.dropped);
   if (d.worker) upsert(S.workers, S.workerIx, d.worker);
   if (d.broadcast) upsert(S.broadcasts, S.broadcastIx, d.broadcast);
   // A server delta can arrive with no run behind it — a connection is the
@@ -610,6 +656,23 @@ function applyDelta(d) {
   // so nothing the eye tracks is delayed.
   chromeDirty = true;
   panelDirty = true;
+}
+
+// forgetTasks removes tasks the server has dropped, keeping the selection and
+// the layout honest about what is left.
+function forgetTasks(ids) {
+  let removed = false;
+  for (const id of ids) {
+    if (!S.taskIx.has(id)) continue;
+    S.taskIx.delete(id);
+    detailCache.delete(id);
+    removed = true;
+    if (selected && selected.type === 'task' && selected.id === id) dropSelection();
+  }
+  if (!removed) return;
+  S.tasks = S.tasks.filter(t => S.taskIx.has(t.id));
+  S.layoutDirty = true; S.thresholdsDirty = true;
+  S.lineageDirty = true; S.stageStatsDirty = true;
 }
 
 function parseSSE(raw) {
@@ -742,6 +805,41 @@ const GOLDEN = 2.39996322973;
 // orbitRadius places superstep n's ring inside a stage's cluster. The
 // innermost ring is held off the centre, or a round that ran a single vertex
 // would put it exactly on the cluster's midpoint and read as no ring at all.
+// maxPaneRings bounds how many panes a stage draws as separate orbits. Past it
+// the older panes share the innermost ring: a stream job fires panes for as
+// long as it runs, and thirty concentric circles is not a picture of anything.
+const maxPaneRings = 10;
+
+// assignPaneRings numbers each held task's pane, oldest ring innermost, per
+// stage. It is recomputed with the layout because the set of panes on screen
+// changes as the server forgets the oldest tasks.
+function assignPaneRings() {
+  const order = new Map(); // stage → [paneId] in first-appearance order
+  for (const st of S.stages) st._paneRings = false;
+  for (const t of S.tasks) {
+    t._ring = 0;
+    if (!t.pane || t.round) continue;
+    let list = order.get(t.stage);
+    if (!list) { list = { seq: [], ix: new Map() }; order.set(t.stage, list); }
+    if (!list.ix.has(t.pane)) { list.ix.set(t.pane, list.seq.length); list.seq.push(t.pane); }
+  }
+  const ringOf = new Map();
+  for (const [stage, list] of order) {
+    const first = Math.max(0, list.seq.length - maxPaneRings);
+    const m = new Map();
+    list.seq.forEach((pane, i) => m.set(pane, Math.max(1, i - first + 1)));
+    ringOf.set(stage, m);
+  }
+  for (const t of S.tasks) {
+    if (!t.pane || t.round) continue;
+    const m = ringOf.get(t.stage);
+    if (!m) continue;
+    t._ring = m.get(t.pane) || 0;
+    const st = S.stageIx.get(t.stage);
+    if (st && t._ring) st._paneRings = true;
+  }
+}
+
 function orbitRadius(st, n) {
   const rounds = Math.max(st._rounds || 1, 1);
   return st._rMax * (0.34 + 0.66 * (n - 0.5) / rounds);
@@ -753,12 +851,17 @@ function computeLayout() {
   const panelW = panelOpen && W >= 720 ? Math.min(380, W * 0.92) : 0;
   const mX = 100, mR = 100 + panelW, top = 88, beltH = 110;
   const usableW = Math.max(160, W - mX - mR), midY = top + (H - top - beltH) * 0.5;
+  orderStages();
   const counts = new Map();
   S.tasks.forEach(t => counts.set(t.stage, (counts.get(t.stage) || 0) + 1));
 
   // Only stages with tasks get a cluster; sources and empty stages stay off
   // the sky (edges reroute to the nearest visible upstream ancestor).
-  const visible = S.stages.filter(st => counts.get(st.id));
+  //
+  // A window stage is the exception, and it has to be: it runs no tasks at all
+  // — deciding when a set is closed is not work a model does — yet it is the
+  // stage the whole job is shaped by. Its stars are its panes.
+  const visible = S.stages.filter(st => counts.get(st.id) || st.windowed);
   const k = Math.max(visible.length, 1);
   S.stages.forEach(st => { st._cx = undefined; st._rounds = 0; });
 
@@ -768,12 +871,19 @@ function computeLayout() {
   // something you read off a counter afterwards: the outer rings carry fewer
   // stars than the ones inside them, and a ring that does not thin is a loop
   // that is not settling.
+  // A pane is the streaming counterpart of a superstep, and it draws the same
+  // way: one orbit per firing, the newest outermost. Everything downstream of
+  // a window runs once per pane, so the rings are literally what the job is
+  // spending its money on — and a stage whose outer rings are fuller than its
+  // inner ones is a job whose windows are growing.
+  assignPaneRings();
   const ringN = new Map(), ringSeen = new Map(), lastRound = new Map();
   S.tasks.forEach(t => {
-    if (!t.round) return;
-    const key = t.stage + '\u0000' + t.round;
+    const ring = t.round || t._ring || 0;
+    if (!ring) return;
+    const key = t.stage + '\u0000' + ring;
     ringN.set(key, (ringN.get(key) || 0) + 1);
-    lastRound.set(t.stage, Math.max(lastRound.get(t.stage) || 0, t.round));
+    lastRound.set(t.stage, Math.max(lastRound.get(t.stage) || 0, ring));
   });
 
   visible.forEach((st, i) => {
@@ -792,15 +902,16 @@ function computeLayout() {
     idxIn.set(t.stage, i + 1);
     if (!st || st._cx === undefined) { t._tx = mX + usableW / 2; t._ty = midY; return; }
 
-    if (t.round && st._rounds) {
-      const key = t.stage + '\u0000' + t.round;
+    const ring = t.round || t._ring || 0;
+    if (ring && st._rounds) {
+      const key = t.stage + '\u0000' + ring;
       const n = ringN.get(key) || 1;
       const j = ringSeen.get(key) || 0;
       ringSeen.set(key, j + 1);
-      const r = orbitRadius(st, t.round);
+      const r = orbitRadius(st, ring);
       // Spread the ring's vertices evenly and turn each round a little, so
       // successive orbits do not line their stars up into spokes.
-      const th = (j / n) * Math.PI * 2 + t.round * 0.7 + (hash(t.stage) % 628) / 100;
+      const th = (j / n) * Math.PI * 2 + ring * 0.7 + (hash(t.stage) % 628) / 100;
       t._tx = st._cx + r * Math.cos(th);
       t._ty = st._cy + r * Math.sin(th) * 0.86;
       // A vertex enters at the centre and eases out to its ring: a round is
@@ -993,6 +1104,50 @@ function cross(x, y, s, color, alpha) {
 // They still have to be drawn, but they do not have to twinkle — dropping
 // the glow and sparkle for them keeps the frame budget for the handful of
 // nodes that are actually doing something.
+// drawPanes draws a window stage's closed sets. A pane is not a task — nothing
+// executed to produce it — so it is drawn as a ring rather than a star: an
+// interval of event time that closed, sized by how many records it held.
+//
+// The newest is the only one that pulses, because it is the only one that might
+// still be being aggregated downstream, and a late firing is coloured: a pane
+// that carried stragglers is a different claim from one that closed on time.
+function drawPanes(st, tms) {
+  const panes = st.panes || [];
+  if (!panes.length || st._cx === undefined) return;
+  const peak = Math.max(...panes.map(p => p.records || 1), 1);
+  // Positions are computed here rather than carried on the panes, because a
+  // stage delta replaces its pane array wholesale — anything stashed on those
+  // objects is gone by the next frame. The placement is deterministic, so a
+  // pane does not move between frames anyway.
+  const spread = Math.max(panes.length, 12);
+  panes.forEach((p, i) => {
+    const rr = st._rMax * Math.sqrt((i + 0.65) / spread);
+    const th = i * GOLDEN + (hash(st.id) % 628) / 100;
+    const px = st._cx + rr * Math.cos(th);
+    const py = st._cy + rr * Math.sin(th) * 0.86;
+    const newest = i === panes.length - 1;
+    const r = 3 + 4.5 * Math.sqrt((p.records || 1) / peak);
+    const color = p.kind === 'late' ? COLORS.retry
+                : (p.kind === 'early' ? COLORS.long : COLORS.shared);
+    if (newest && !reduceMotion) {
+      const pulse = .5 + .5 * Math.sin(tms / 380);
+      glow(px, py, r + 8 + 4 * pulse, color, .16 + .12 * pulse);
+    }
+    ctx.globalAlpha = p.written ? .95 : .6;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(px, py, r, 0, 6.2832); ctx.stroke();
+    // A pane whose output reached a sink is filled: the difference between a
+    // window that closed and a window whose answer is durable.
+    if (p.written) {
+      ctx.globalAlpha = .28;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(px, py, r, 0, 6.2832); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
 function drawTask(t, now, tms, lod) {
   const x = t._x, y = t._y;
   const ph = (hash(t.id) % 628) / 100;
@@ -1357,9 +1512,10 @@ function draw(tms) {
   if (taskN < 400) {
     const perStage = new Map();
     for (const t of S.tasks) {
-      // An iterative stage's structure is its orbits; threading its tasks in
-      // arrival order would draw lines across the rings and hide them.
-      if (t.round) continue;
+      // A stage laid out in orbits — an iterative one's rounds, a windowed
+      // one's panes — has its structure *in* the rings; threading its tasks in
+      // arrival order would draw lines across them and hide it.
+      if (t.round || t._ring) continue;
       const prev = perStage.get(t.stage);
       if (prev) {
         ctx.strokeStyle = 'rgba(140,160,220,.06)';
@@ -1413,9 +1569,19 @@ function draw(tms) {
     // An iterative stage names its rounds, and once it has stopped it names
     // *why* — converging and running out of budget leave the same stars behind,
     // so the reason is the only thing that tells them apart.
-    const loop = st._rounds
+    // Orbits mean two different things, and the glyph has to say which: ⟳ is a
+    // superstep of a loop, ≋ is a pane of a window. Both draw as rings, and
+    // reading one as the other would be reading convergence into a stream.
+    const loop = st._rounds && !st._paneRings
       ? `⟳${st._rounds}${st.halt ? ' · ' + (HALT_SHORT[st.halt] || st.halt) : ''}  ` : '';
-    const label = `${st.id}  ${loop}${stats.settled}/${stats.total} ⓘ`;
+    // A window stage runs no tasks of its own, so its counters are empty and
+    // the panes are the only thing it has to say. A stage downstream of one
+    // names the panes it has served instead of a task fraction that never ends.
+    const win = st.windowed
+      ? `≋${st.paneCount || 0} pane${st.paneCount === 1 ? '' : 's'}  `
+      : (st._paneRings ? `≋${st._rounds}  ` : '');
+    const counts = st.windowed && !stats.total ? '' : `${stats.settled}/${stats.total} `;
+    const label = `${st.id}  ${loop}${win}${counts}ⓘ`;
     const lx = st._cx, ly = st._cy + st._rMax + 18;
     const active = hoveredStage === st || (selected && selected.type === 'stage' && selected.id === st.id);
     ctx.fillStyle = active ? '#c3c2b7' : (st.status === 'done' ? '#5f5e58' : '#898781');
@@ -1454,6 +1620,9 @@ function draw(tms) {
     for (const m of S.mcp) drawMCP(m, now, tms, focusM);
   }
 
+  for (const st of S.stages) {
+    if (st.windowed) drawPanes(st, tms);
+  }
   for (const t of S.tasks) drawTask(t, now, tms, lod);
   for (const w of S.workers) drawWorker(w, tms);
 
@@ -1729,6 +1898,33 @@ function fmtCost(c) {
   if (!c) return '$0';
   if (c < 0.0001) return '<$0.0001';
   return '$' + c.toFixed(c < 1 ? 4 : 2);
+}
+// paneWindowLabel shortens a window for a table cell: two clock times, or the
+// word "global" for the window that has no edges. The full label is the cell's
+// title, so nothing is actually lost.
+function paneWindowLabel(p) {
+  const w = String(p.window || '');
+  const m = w.match(/^(\d{4}-\d{2}-\d{2}T([\d:]{8}))Z\.\.(\d{4}-\d{2}-\d{2}T([\d:]{8}))Z(\[.*\])?$/);
+  if (m) return `${m[2]}–${m[4]}${m[5] ? ' ' + m[5] : ''}` + (p.seq > 1 ? ` #${p.seq}` : '');
+  return w + (p.seq > 1 ? ` #${p.seq}` : '');
+}
+function fmtCount(n) {
+  if (!n) return '0';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+// fmtClock renders event time — the watermark, a pane's boundary. It is UTC
+// on purpose: a window's edges are a property of the data, and rendering them
+// in the viewer's zone would make two people reading the same job disagree
+// about which minute a pane covered.
+function fmtClock(ms) {
+  if (!ms) return '—';
+  return new Date(ms).toISOString().slice(11, 19) + 'Z';
+}
+function fmtClockDate(ms) {
+  if (!ms) return '—';
+  return new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
 }
 // costVerdict reads actual spend against a projection. Under the ceiling is
 // the expected state and says so quietly; over it is worth colouring, because
@@ -2132,15 +2328,34 @@ function renderStagePanel(title, body) {
     ['kind', esc(st.kind || '—')],
     ['upstream', st.upstream ? jumpBtn('stage', st.upstream) : '— (pipeline root)'],
     ['duration', (st.endedAt ? '' : '⏱ ') + fmtDur(dur)],
-    ['tasks', `${total} · ${done} done, ${failed} failed, ${active} active, ${queued} queued`],
-    ['records in / out', `${recIn} / ${recOut}`],
-    ['retries', String(retries)],
-    ['cache hits', String(cache)],
-    ['model calls', String(calls)],
-    ['tokens in / out', `${fmtTok(tokIn)} / ${fmtTok(tokOut)}`],
-    ['cost', fmtCost(cost)],
-    ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
   ];
+  // A window stage executes nothing — deciding when a set is closed is not work
+  // a model does — so a column of zeroes for tasks, tokens and cost would be
+  // answering a question nobody asked about it. Its own numbers go in instead.
+  if (!(st.windowed && !total)) {
+    rows.push(
+      ['tasks', `${total} · ${done} done, ${failed} failed, ${active} active, ${queued} queued`],
+      ['records in / out', `${recIn} / ${recOut}`],
+      ['retries', String(retries)],
+      ['cache hits', String(cache)],
+      ['model calls', String(calls)],
+      ['tokens in / out', `${fmtTok(tokIn)} / ${fmtTok(tokOut)}`],
+      ['cost', fmtCost(cost)],
+      ['task p50 / p95', durations.length ? `${fmtDur(pct(durations, .5))} / ${fmtDur(pct(durations, .95))}` : '—'],
+    );
+  }
+  if (st.windowed) {
+    // A window stage runs no tasks of its own — it decides when a set is
+    // closed — so the task counters above say nothing about it. These do.
+    rows.splice(2, 0,
+      ['panes fired', `${st.paneCount || 0}` +
+        (st.batches ? ` <span class="none">· ${st.batches} written to a sink</span>` : '')],
+      ['records windowed', fmtCount(st.windowRecords || 0)],
+      ['late', st.late
+        ? `<span class="accent-fail">${st.late}</span> <span class="none">— arrived after ` +
+          `their window was gone; the lateness bound does not match this source</span>`
+        : '0 <span class="none">— every record reached its window in time</span>']);
+  }
   if (rounds.length) {
     rows.splice(2, 0,
       ['rounds', `${rounds.length}${st.halt ? '' : ' <span class="none">· still running</span>'}`],
@@ -2197,6 +2412,37 @@ function renderStagePanel(title, body) {
   }
   let html = `<span class="status-chip" style="color:${st.status === 'done' ? COLORS.done : COLORS.running}">${statusTxt}</span>`;
   html += '<dl class="kv">' + rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
+
+  // The recent panes. A window stage's output is a sequence of firings, and
+  // the thing worth reading off it is not the total but the shape: how many
+  // records each window held, what its aggregation cost, and whether any of
+  // them fired early or late rather than because event time said they were
+  // complete. Everything downstream of this stage ran once per row.
+  const panes = st.panes || [];
+  if (panes.length) {
+    const peak = Math.max(...panes.map(p => p.records), 1);
+    const shown = panes.slice().reverse();
+    html += `<h4>panes · ${st.paneCount || panes.length}` +
+      (panes.length < (st.paneCount || 0)
+        ? ` <span class="none">(most recent ${panes.length})</span>` : '') + `</h4>` +
+      `<table class="rounds">` +
+      '<tr><th>window</th><th>records</th><th>tasks</th><th>cost</th><th></th></tr>' +
+      shown.map(p => {
+        const pending = p.tasks && p.done < p.tasks;
+        const w = Math.max(2, Math.round(100 * p.records / peak));
+        const kind = p.kind && p.kind !== 'final'
+          ? ` <span style="color:${p.kind === 'late' ? COLORS.retry : COLORS.long}">${esc(p.kind)}</span>` : '';
+        return `<tr${pending ? ' class="live"' : ''}>` +
+          `<td title="${esc(p.window)}">${esc(paneWindowLabel(p))}${kind}</td>` +
+          `<td>${p.records}</td>` +
+          `<td>${p.tasks ? `${p.done || 0}/${p.tasks}` : '—'}</td>` +
+          `<td>${p.tasks && !pending ? fmtCost(p.costUsd || 0) : '⏱'}</td>` +
+          `<td class="bar"><span style="width:${w}%"></span></td></tr>`;
+      }).join('') + '</table>';
+    html += `<p class="none" style="margin:6px 0 0">Every stage below this one ` +
+      `runs once per row. Halving the window doubles the rows and changes ` +
+      `nothing upstream — which is what makes the window the shape of the bill.</p>`;
+  }
 
   // The per-round shape. A total says what the loop cost; only the sequence
   // says whether it was converging — a frontier that narrows is settling, one
@@ -2285,6 +2531,63 @@ function aggStage(id) {
   return a;
 }
 
+// streamSection is a stream job's own half of the summary: where event time
+// has reached, which split is holding it there, and how long ago the job
+// recorded a point it could be restarted from.
+//
+// None of it has an equivalent in a bounded run, and none of it is derivable
+// from the tasks: a run is read by how much of it is done, and a job that never
+// finishes has to be read by something else.
+function streamSection(sm) {
+  const splits = sm.splits || [];
+  const active = splits.filter(sp => !sp.retired).length;
+  let html = '<h4>stream</h4><dl class="kv">';
+  const row = (k, v) => { html += `<dt>${k}</dt><dd>${v}</dd>`; };
+
+  row('watermark', sm.watermark
+    ? `${fmtClockDate(sm.watermark)} <span class="none">— no record older than this ` +
+      `will arrive again, which is the claim every window closes on</span>`
+    : '<span class="none">— not yet established; every window is still open</span>');
+  if (sm.laggard) {
+    row('held back by', `${esc(sm.laggard)}` +
+      (sm.lagMs ? ` <span class="none">— ${fmtDur(sm.lagMs)} behind the furthest split. ` +
+        `The watermark is a minimum, so this is the partition your windows are waiting on.</span>` : ''));
+  }
+  row('ingested', `${fmtCount(sm.records || 0)} records → <b>${sm.panes || 0}</b> panes` +
+    (sm.batches ? ` → ${sm.batches} written to sinks` : ''));
+  row('late', sm.late
+    ? `<span style="color:${COLORS.fail}">${sm.late}</span> <span class="none">— arrived ` +
+      `after their window was gone. That is a fact about the source: its ` +
+      `out-of-orderness exceeds the lateness the job allows for.</span>`
+    : '0 <span class="none">— every record reached its window in time</span>');
+  row('checkpoints', sm.checkpoints
+    ? `<b>${sm.checkpoints}</b>, latest epoch ${sm.epoch}` +
+      (sm.quiesceMs ? ` <span class="none">— the job was held still for ` +
+        `${fmtDur(sm.quiesceMs)} to take it</span>` : '')
+    : '<span class="none">— none yet; a crash now replays from the start</span>');
+  if (sm.skipped) {
+    row('skipped', `<span style="color:${COLORS.retry}">${sm.skipped}</span> ` +
+      `<span class="none">— the job would not come to rest inside the timeout` +
+      (sm.note ? `: ${esc(sm.note)}` : '') + `. The previous checkpoint still ` +
+      `stands, but a job that keeps skipping cannot be restarted cheaply.</span>`);
+  }
+  html += '</dl>';
+
+  if (splits.length) {
+    html += `<h4>splits · ${active} active of ${splits.length}</h4><table class="rounds">` +
+      '<tr><th>split</th><th>state</th><th>note</th></tr>' +
+      splits.map(sp => {
+        const state = sp.err
+          ? `<span style="color:${COLORS.fail}">failed</span>`
+          : (sp.retired ? '<span class="none">ended</span>' : '◉ reading');
+        return `<tr${sp.retired || sp.err ? '' : ' class="live"'}>` +
+          `<td>${esc(sp.id)}</td><td>${state}</td>` +
+          `<td class="none">${esc(sp.err || sp.note || '')}</td></tr>`;
+      }).join('') + '</table>';
+  }
+  return html;
+}
+
 function renderSummary() {
   document.getElementById('summaryRun').textContent =
     (S.run.pipeline ? S.run.pipeline + ' · ' : '') + S.run.runId +
@@ -2305,11 +2608,22 @@ function renderSummary() {
     prefixWritten += st.writtenTokens || 0;
     prefixSaved += st.savedUsd || 0;
   }
+  // A stream job's sky holds only its recent tasks, so its totals come from
+  // the run's own census. See RetainTasks in the server.
+  const censusSum = S.stream ? S.runIx.get(S.viewing) : null;
+  let taskTotal = S.tasks.length;
+  if (censusSum) {
+    done = censusSum.completed || 0; retries = censusSum.retries || 0;
+    cache = censusSum.cacheHits || 0; tok = censusSum.tokens || 0;
+    cost = censusSum.cost || 0; taskTotal = censusSum.tasks || 0;
+  }
   const elapsed = S.run.startedAt ? (S.run.endedAt || serverNow()) - S.run.startedAt : null;
   const stat = (v, l) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`;
   let html = '<div class="totals">' +
     stat(elapsed != null ? fmtDur(elapsed) : '—', 'elapsed') +
-    stat(`${done}/${S.tasks.length}`, 'tasks done') +
+    (S.stream ? stat(String(S.stream.panes || 0), 'panes fired') : '') +
+    (S.stream ? stat(fmtCount(S.stream.records || 0), 'ingested') : '') +
+    stat(`${done}/${taskTotal}`, 'tasks done') +
     stat(String(cache), 'cache replays') +
     stat(String(retries), 'retries') +
     stat(fmtTok(tok), 'tokens') +
@@ -2322,6 +2636,7 @@ function renderSummary() {
   // column only appears when a projection was published, so a run without one
   // reads exactly as it did before.
   const proj = S.projection;
+  orderStages();
   html += '<h4>steps</h4><table><tr><th>stage</th><th>kind</th><th>tasks</th>' +
     '<th>records</th><th>retries</th><th>cached</th><th>tokens</th>' +
     (proj ? '<th>projected</th>' : '') + '<th>cost</th><th>p95</th></tr>';
@@ -2343,6 +2658,8 @@ function renderSummary() {
       `<td>${a.durs.length ? fmtDur(pct(a.durs, .95)) : '—'}</td></tr>`;
   }
   html += '</table>';
+
+  if (S.stream) html += streamSection(S.stream);
 
   if (proj) {
     const share = proj.expectedUsd ? Math.round(100 * cost / proj.expectedUsd) : null;
@@ -2641,15 +2958,33 @@ function refreshChrome() {
     const sumBtn = `<button type="button" class="chip btn" data-summary title="run summary (s)">☰ summary</button>`;
     // Which driver ran is part of reading the picture: under streaming the
     // stages overlap and the executors are shared engine slots.
-    const drv = S.run.driver === 'streaming'
-      ? `<span class="chip" title="pipelined execution — stages overlap, executors are shared engine slots">⇄ streaming</span>`
-      : (S.run.driver === 'barrier'
-          ? `<span class="chip" title="one stage at a time">▮ barrier</span>` : '');
+    // Which driver ran is part of reading the picture, and a stream job is a
+    // different picture again: it has no end, so the header says where event
+    // time has reached instead of how much is left.
+    const drv = S.run.driver === 'stream'
+      ? `<span class="chip stream" title="stream mode — an unbounded source, windowed into panes">≋ stream</span>`
+      : (S.run.driver === 'streaming'
+          ? `<span class="chip" title="pipelined execution — stages overlap, executors are shared engine slots">⇄ streaming</span>`
+          : (S.run.driver === 'barrier'
+              ? `<span class="chip" title="one stage at a time">▮ barrier</span>` : ''));
+    const wm = S.stream && S.stream.watermark
+      ? `<span class="chip" title="event time — the claim every window closes on${
+            S.stream.laggard ? `, held back by ${esc(S.stream.laggard)}` : ''}">` +
+        `⌚ ${fmtClock(S.stream.watermark)}` +
+        (S.stream.lagMs > 1000 ? ` <span class="none">·${fmtDur(S.stream.lagMs)} lag</span>` : '') +
+        `</span>`
+      : '';
+    const ckpt = S.stream && S.stream.epoch
+      ? `<span class="chip${S.stream.skipped ? ' warn' : ''}" title="last recoverable point${
+            S.stream.quiesceMs ? ` — the job was held still for ${fmtDur(S.stream.quiesceMs)}` : ''}${
+            S.stream.skipped ? `; ${S.stream.skipped} skipped` : ''}">` +
+        `⛘ epoch ${S.stream.epoch}</span>`
+      : '';
     const pipe = S.run.pipeline
       ? `<span class="pipe" title="pipeline">${esc(S.run.pipeline)}</span>&nbsp;`
       : '';
     metaHTML = `${pipe}<span style="font-family:ui-monospace,Menlo,monospace">${esc(S.run.runId)}</span>` +
-      `${state}${drv}${note}${nav}${uniBtn}${sumBtn}${elsewhere}${connChip}`;
+      `${state}${drv}${wm}${ckpt}${note}${nav}${uniBtn}${sumBtn}${elsewhere}${connChip}`;
   }
   if (meta.dataset.html !== metaHTML) {
     meta.innerHTML = metaHTML;
@@ -2666,12 +3001,30 @@ function refreshChrome() {
     tok += ((t.usage && t.usage.in) || 0) + ((t.usage && t.usage.out) || 0);
     cost += (t.usage && t.usage.cost) || 0;
   }
+  // A stream job's sky holds only the recent past — the server forgets the
+  // oldest settled tasks, because an endless run would otherwise fill the tab.
+  // So its totals come from the run's own census rather than from what is
+  // still on screen, or the counters would fall as the job kept going.
+  const sum = S.stream ? S.runIx.get(S.viewing) : null;
+  if (sum) {
+    done = sum.completed || 0; failed = sum.failed || 0;
+    retries = sum.retries || 0; cache = sum.cacheHits || 0;
+    tok = sum.tokens || 0; cost = sum.cost || 0;
+  }
+  const taskTotal = sum ? (sum.tasks || 0) : S.tasks.length;
   const elapsed = S.run.startedAt ? (S.run.endedAt || serverNow()) - S.run.startedAt : null;
   const stat = (v, l, cls) => `<div class="stat"><b${cls ? ` class="${cls}"` : ''}>${v}</b><span>${l}</span></div>`;
   const statsHTML =
     stat(elapsed != null ? fmtDur(elapsed) : '—', 'elapsed') +
-    stat(`${done}/${S.tasks.length}`, 'tasks') +
+    stat(`${done}/${taskTotal}`, 'tasks') +
     stat(String(running), 'active') +
+    // Panes first among a stream job's own numbers, because a pane is the unit
+    // that costs money: everything downstream of a window runs once per pane.
+    (S.stream
+      ? stat(String(S.stream.panes || 0), 'panes') +
+        stat(fmtCount(S.stream.records || 0), 'ingested') +
+        (S.stream.late ? stat(`<span class="accent-fail">${S.stream.late}</span>`, 'late') : '')
+      : '') +
     stat(failed ? `<span class="accent-fail">${failed}</span>` : '0', 'failed') +
     stat(String(retries), 'retries') +
     stat(String(cache), 'cached') +

@@ -289,7 +289,7 @@ func (s *Scheduler) ExecuteAll(ctx context.Context, tasks []task.Task) ([]task.R
 	// with the full input payload and record IDs for lineage tracking.
 	for _, t := range tasks {
 		s.publish(observe.Event{Type: observe.TaskScheduled, RunID: t.Envelope.RunID,
-			Stage: t.Stage, TaskID: t.ID, Records: len(t.Input),
+			Stage: t.Stage, TaskID: t.ID, Records: len(t.Input), Pane: t.Pane,
 			Input: recordsJSON(t.Input), InputIDs: recordIDs(t.Input)})
 	}
 
@@ -409,7 +409,8 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		}
 
 		s.publish(observe.Event{Type: observe.TaskStarted, RunID: t.Envelope.RunID,
-			Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Model: t.ResolvedModel})
+			Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt,
+			Model: t.ResolvedModel, Pane: t.Pane})
 
 		res, err := s.Exec.Execute(ctx, t)
 		release()
@@ -424,7 +425,7 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			}
 			s.publish(observe.Event{Type: observe.TaskCompleted, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Model: res.Model,
-				Usage: res.Usage, Latency: res.Latency,
+				Usage: res.Usage, Latency: res.Latency, Pane: t.Pane,
 				Output: recordsJSON(res.Output), OutIDs: recordIDs(res.Output)})
 			return res, attempt, nil
 		}
@@ -437,7 +438,8 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		retryable := class == core.FailTransient || class == core.FailSemantic
 		if !retryable || attempt >= maxAttempts {
 			s.publish(observe.Event{Type: observe.TaskFailed, RunID: t.Envelope.RunID,
-				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Err: err.Error()})
+				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt,
+				Pane: t.Pane, Err: err.Error()})
 			return task.Result{}, attempt, err
 		}
 

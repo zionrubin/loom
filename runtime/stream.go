@@ -69,7 +69,7 @@ func (e *Engine) Submit(ctx context.Context, t task.Task, done func(task.Result,
 	// lifecycle. Lineage and the constellation view depend on it, and they
 	// must not go dark just because the run is streaming.
 	e.sched.publish(observe.Event{Type: observe.TaskScheduled, RunID: t.Envelope.RunID,
-		Stage: t.Stage, TaskID: t.ID, Records: len(t.Input),
+		Stage: t.Stage, TaskID: t.ID, Records: len(t.Input), Pane: t.Pane,
 		Input: recordsJSON(t.Input), InputIDs: recordIDs(t.Input)})
 
 	// The program a task is admitted against is its run: one pipeline is one

@@ -48,6 +48,24 @@
 //	go run ./examples/watchtower -window 30s          # twice the panes, same gradings
 //	go run ./examples/watchtower -key ""              # one digest per minute instead of per service
 //
+// # Watching it
+//
+// The constellation view draws a stream job as what it is rather than as a run
+// that never finishes. The header carries the watermark instead of a progress
+// bar — event time is the only clock a stream job obeys — with the split
+// holding it back named beside it. A window stage draws one orbit per pane,
+// newest outermost, so the stars downstream of it are grouped by the window
+// that paid for them; the stage inspector lists the recent panes with what each
+// one cost. And because a job that never ends would otherwise fill a browser
+// tab, the sky holds only the recent past: the oldest settled tasks are
+// forgotten while the counters that say what the job has done are kept.
+//
+//	go run ./examples/watchtower -live -view localhost:8077
+//	# then open http://localhost:8077
+//
+// -live is the mode worth watching: -slow spaces the incidents out so the panes
+// fire while you are looking at them.
+//
 // The incidents are synthetic: services, messages and timestamps are fixtures
 // invented for this example.
 package main
@@ -60,6 +78,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -73,6 +92,7 @@ import (
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/stream"
 	"github.com/zionrubin/loom/stream/file"
+	"github.com/zionrubin/loom/viz"
 )
 
 func main() {
@@ -86,8 +106,14 @@ func main() {
 		crash    = flag.Bool("crash", false, "stop mid-stream, then resume and price the interruption")
 		stateDir = flag.String("state", "", "state directory (default: a temporary one)")
 		seed     = flag.Int64("seed", 7, "feed generator seed")
+		addr     = flag.String("view", "", "serve the constellation view on this address (e.g. localhost:8077)")
+		slow     = flag.Duration("slow", 0, "delay per model call, to watch panes fire in the view")
 	)
 	flag.Parse()
+
+	// The view is an event handler like any other, so a job that is not being
+	// watched runs exactly as it did before.
+	handle := viewer(*addr)
 
 	work, cleanup, err := workspace(*stateDir)
 	if err != nil {
@@ -108,17 +134,92 @@ func main() {
 	fmt.Printf("watchtower: %d incidents over %d minutes, %d services\n",
 		len(incidents), *minutes, len(services))
 
+	cfg := desk_{
+		size: *window, lateness: *lateness, key: *keyField,
+		slow: *slow, view: handle,
+	}
+	// A stream job's sky is worth reading after it has stopped — the panes, what
+	// each cost, where the watermark got to — so the view outlives the job.
+	if handle != nil {
+		defer holdOpen()
+	}
 	switch {
 	case *live:
-		runLive(feed, out, state, incidents, *window, *lateness, *keyField)
+		runLive(feed, out, state, incidents, cfg)
 	case *crash:
-		runCrashAndResume(feed, out, state, incidents, *window, *lateness, *keyField)
+		runCrashAndResume(feed, out, state, incidents, cfg)
 	default:
 		if err := writeFeed(feed, incidents, len(incidents)); err != nil {
 			log.Fatal(err)
 		}
-		runBackfill(feed, out, state, *window, *lateness, *keyField)
+		runBackfill(feed, out, state, cfg)
 	}
+}
+
+// desk_ bundles what every mode needs, so adding the view did not add a
+// parameter to four signatures.
+type desk_ struct {
+	size     time.Duration
+	lateness time.Duration
+	key      string
+	slow     time.Duration
+	view     func(observe.Event)
+}
+
+// options assembles the loom options every mode shares.
+func (c desk_) options(reg *model.Registry, extra ...loom.Option) []loom.Option {
+	opts := []loom.Option{
+		loom.WithRegistry(reg),
+		// The source's out-of-orderness, which is a fact about the feed rather
+		// than a preference: this generator delivers at most maxDisorder behind
+		// event time, so a watermark that allows for it never declares a window
+		// complete too early. Lower it and the report starts counting late
+		// records — which is the point of counting them.
+		loom.WithLateness(maxDisorder),
+		loom.WithWorkers(8),
+	}
+	if c.view != nil {
+		// Two observers on one bus: the terminal narration and the view.
+		opts = append(opts, loom.WithEventHandler(func(e observe.Event) {
+			panePrinterOnce(e)
+			c.view(e)
+		}))
+	} else {
+		opts = append(opts, loom.WithEventHandler(panePrinterOnce))
+	}
+	return append(opts, extra...)
+}
+
+// holdOpen keeps the process alive so the constellation view stays served after
+// the job has stopped. Ctrl-C ends it.
+func holdOpen() {
+	fmt.Println("\nthe view is still serving — the job has stopped, its sky has not.")
+	fmt.Println("press Ctrl-C to exit")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+}
+
+// viewer starts the constellation view when an address was given, and returns
+// the handler to feed it.
+func viewer(addr string) func(observe.Event) {
+	if addr == "" {
+		return nil
+	}
+	v := viz.New()
+	url, err := v.Start(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("constellation view: %s\n", url)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if v.AwaitViewer(waitCtx) {
+		time.Sleep(800 * time.Millisecond) // a beat, so the empty sky is visible first
+	} else {
+		fmt.Println("no viewer yet — running anyway (the page replays state on connect)")
+	}
+	return v.Handle
 }
 
 // --- The pipeline --------------------------------------------------------
@@ -165,15 +266,17 @@ func desk(size, lateness time.Duration, keyField string) *pipeline.Pipeline {
 // registry wires two deterministic mock tiers: a cheap one for grading and an
 // expensive one for the per-pane digest, so the report shows where a stream
 // job's money actually goes.
-func registry() (*model.Registry, *model.Mock, *model.Mock) {
+func registry(slow time.Duration) (*model.Registry, *model.Mock, *model.Mock) {
 	reg := model.NewRegistry()
 	fast, err := model.RegisterMock(reg, "mock-fast", model.TierFast,
-		model.WithHandler(grade))
+		model.WithHandler(grade), model.WithLatency(slow))
 	if err != nil {
 		log.Fatal(err)
 	}
+	// The deep tier is slower, as it would be: the per-pane digest is the
+	// expensive call, and in the view it is the one you watch hold a slot.
 	deep, err := model.RegisterMock(reg, "mock-deep", model.TierDeep,
-		model.WithHandler(digest))
+		model.WithHandler(digest), model.WithLatency(slow*3))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -214,27 +317,17 @@ func digest(req model.Request) (string, error) {
 
 // --- The three ways to run it -------------------------------------------
 
-func runBackfill(feed, out, state string, size, lateness time.Duration, keyField string) {
-	reg, fast, deep := registry()
-	src := mustSource(feed, false)
-	sink := mustSink(out)
+func runBackfill(feed, out, state string, c desk_) {
+	reg, fast, deep := registry(c.slow)
 
 	fmt.Printf("\nbackfill: reading %s to its end\n\n", feed)
-	res, err := loom.Stream(context.Background(), desk(size, lateness, keyField),
-		loom.WithRegistry(reg),
-		loom.WithSource("incidents", src),
-		loom.WithSink("digest", sink),
-		loom.WithStateDir(state),
-		loom.WithJobID("watchtower"),
-		// The source's out-of-orderness, which is a fact about the feed rather
-		// than a preference: this generator delivers at most maxDisorder behind
-		// event time, so a watermark that allows for it never declares a window
-		// complete too early. Lower it and the report starts counting late
-		// records — which is the point of counting them.
-		loom.WithLateness(maxDisorder),
-		loom.WithEventHandler(panePrinter()),
-		loom.WithWorkers(8),
-	)
+	res, err := loom.Stream(context.Background(), desk(c.size, c.lateness, c.key),
+		c.options(reg,
+			loom.WithSource("incidents", mustSource(feed, false)),
+			loom.WithSink("digest", mustSink(out)),
+			loom.WithStateDir(state),
+			loom.WithJobID("watchtower"),
+		)...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -242,7 +335,7 @@ func runBackfill(feed, out, state string, size, lateness time.Duration, keyField
 	fmt.Printf("digests written to %s\n", out)
 }
 
-func runLive(feed, out, state string, incidents []incident, size, lateness time.Duration, keyField string) {
+func runLive(feed, out, state string, incidents []incident, c desk_) {
 	// Half the feed is already on disk; the rest is appended while the job runs,
 	// which is what "following" means and what a live source looks like.
 	half := len(incidents) / 2
@@ -250,16 +343,22 @@ func runLive(feed, out, state string, incidents []incident, size, lateness time.
 		log.Fatal(err)
 	}
 
-	reg, fast, deep := registry()
-	src := mustSource(feed, true)
-	sink := mustSink(out)
+	reg, fast, deep := registry(c.slow)
+
+	// A run long enough to watch: with -slow the feed is written at a pace the
+	// panes can be seen firing against.
+	gap := 15 * time.Millisecond
+	limit := 8 * time.Second
+	if c.slow > 0 {
+		gap, limit = c.slow*2, 45*time.Second
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := half; i < len(incidents); i++ {
-			time.Sleep(15 * time.Millisecond)
+			time.Sleep(gap)
 			if err := appendFeed(feed, incidents[i]); err != nil {
 				log.Print(err)
 				return
@@ -268,21 +367,18 @@ func runLive(feed, out, state string, incidents []incident, size, lateness time.
 	}()
 
 	fmt.Printf("\nlive: following %s while a writer appends to it\n\n", feed)
-	res, err := loom.Stream(context.Background(), desk(size, lateness, keyField),
-		loom.WithRegistry(reg),
-		loom.WithSource("incidents", src),
-		loom.WithSink("digest", sink),
-		loom.WithStateDir(state),
-		loom.WithJobID("watchtower-live"),
-		loom.WithLateness(maxDisorder),
-		loom.WithCheckpointEvery(500*time.Millisecond),
-		loom.WithPolling(32, 25*time.Millisecond),
-		// A live source never ends, so something has to say when this demo
-		// does. In production this is the absent line.
-		loom.WithStreamLimit(stream.Limit{Duration: 8 * time.Second}),
-		loom.WithEventHandler(panePrinter()),
-		loom.WithWorkers(8),
-	)
+	res, err := loom.Stream(context.Background(), desk(c.size, c.lateness, c.key),
+		c.options(reg,
+			loom.WithSource("incidents", mustSource(feed, true)),
+			loom.WithSink("digest", mustSink(out)),
+			loom.WithStateDir(state),
+			loom.WithJobID("watchtower-live"),
+			loom.WithCheckpointEvery(500*time.Millisecond),
+			loom.WithPolling(32, 25*time.Millisecond),
+			// A live source never ends, so something has to say when this demo
+			// does. In production this is the absent line.
+			loom.WithStreamLimit(stream.Limit{Duration: limit}),
+		)...)
 	wg.Wait()
 	if err != nil {
 		log.Fatal(err)
@@ -293,25 +389,22 @@ func runLive(feed, out, state string, incidents []incident, size, lateness time.
 	fmt.Println("  it would be publishing a partial answer as if it were the real one.")
 }
 
-func runCrashAndResume(feed, out, state string, incidents []incident, size, lateness time.Duration, keyField string) {
+func runCrashAndResume(feed, out, state string, incidents []incident, c desk_) {
 	if err := writeFeed(feed, incidents, len(incidents)); err != nil {
 		log.Fatal(err)
 	}
-	reg, fast, deep := registry()
+	reg, fast, deep := registry(c.slow)
 
 	fmt.Printf("\nfirst start: stopped after %d incidents\n\n", len(incidents)/3)
-	first, err := loom.Stream(context.Background(), desk(size, lateness, keyField),
-		loom.WithRegistry(reg),
-		loom.WithSource("incidents", mustSource(feed, false)),
-		loom.WithSink("digest", mustSink(out)),
-		loom.WithStateDir(state), loom.WithJobID("watchtower"),
-		loom.WithLateness(maxDisorder),
-		loom.WithCheckpointEvery(20*time.Millisecond),
-		loom.WithPolling(4, 5*time.Millisecond),
-		loom.WithStreamLimit(stream.Limit{Records: int64(len(incidents) / 3)}),
-		loom.WithEventHandler(panePrinter()),
-		loom.WithWorkers(8),
-	)
+	first, err := loom.Stream(context.Background(), desk(c.size, c.lateness, c.key),
+		c.options(reg,
+			loom.WithSource("incidents", mustSource(feed, false)),
+			loom.WithSink("digest", mustSink(out)),
+			loom.WithStateDir(state), loom.WithJobID("watchtower"),
+			loom.WithCheckpointEvery(20*time.Millisecond),
+			loom.WithPolling(4, 5*time.Millisecond),
+			loom.WithStreamLimit(stream.Limit{Records: int64(len(incidents) / 3)}),
+		)...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -319,15 +412,12 @@ func runCrashAndResume(feed, out, state string, incidents []incident, size, late
 	callsBefore := fast.Calls() + deep.Calls()
 
 	fmt.Printf("\nsecond start: same job ID, same state directory\n\n")
-	second, err := loom.Stream(context.Background(), desk(size, lateness, keyField),
-		loom.WithRegistry(reg),
-		loom.WithSource("incidents", mustSource(feed, false)),
-		loom.WithSink("digest", mustSink(out)),
-		loom.WithStateDir(state), loom.WithJobID("watchtower"),
-		loom.WithLateness(maxDisorder),
-		loom.WithEventHandler(panePrinter()),
-		loom.WithWorkers(8),
-	)
+	second, err := loom.Stream(context.Background(), desk(c.size, c.lateness, c.key),
+		c.options(reg,
+			loom.WithSource("incidents", mustSource(feed, false)),
+			loom.WithSink("digest", mustSink(out)),
+			loom.WithStateDir(state), loom.WithJobID("watchtower"),
+		)...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -367,24 +457,25 @@ func mustSink(dir string) *file.Sink {
 	return sink
 }
 
-// panePrinter prints each pane as it fires, which is the thing to watch in a
-// stream job: it is the moment a set was declared complete and the moment the
+// printerMu serializes the terminal narration, which several stage goroutines
+// reach at once.
+var printerMu sync.Mutex
+
+// panePrinterOnce prints each pane as it fires, which is the thing to watch in
+// a stream job: it is the moment a set was declared complete and the moment the
 // expensive stage ran.
-func panePrinter() func(observe.Event) {
-	var mu sync.Mutex
-	return func(e observe.Event) {
-		switch e.Type {
-		case observe.PaneFired:
-			mu.Lock()
-			defer mu.Unlock()
-			fmt.Printf("  pane  %-46s %3d incidents  (%s)\n", e.Detail, e.Records, e.Note)
-		case observe.CheckpointCommitted:
-			mu.Lock()
-			defer mu.Unlock()
-			fmt.Printf("  ckpt  epoch %-3d held still for %-8s watermark %s\n",
-				e.Epoch, e.Latency.Round(time.Millisecond),
-				e.Watermark.UTC().Format("15:04:05"))
-		}
+func panePrinterOnce(e observe.Event) {
+	switch e.Type {
+	case observe.PaneFired:
+		printerMu.Lock()
+		defer printerMu.Unlock()
+		fmt.Printf("  pane  %-46s %3d incidents  (%s)\n", e.Detail, e.Records, e.Note)
+	case observe.CheckpointCommitted:
+		printerMu.Lock()
+		defer printerMu.Unlock()
+		fmt.Printf("  ckpt  epoch %-3d held still for %-8s watermark %s\n",
+			e.Epoch, e.Latency.Round(time.Millisecond),
+			e.Watermark.UTC().Format("15:04:05"))
 	}
 }
 
