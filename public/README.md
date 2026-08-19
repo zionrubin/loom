@@ -26,9 +26,21 @@ together if either is ever bumped. When it can't be fetched (offline, blocked
 CDN, no WebGL), the hero drops the object and the copy takes the full width;
 nothing else on the page depends on it.
 
-GitHub Pages serves from the repository root or `docs/`, not `public/`, so
-publishing this would need a workflow that uploads this directory as the
-Pages artifact.
+## GitHub Pages
+
+[`.github/workflows/pages.yml`](../.github/workflows/pages.yml) publishes this
+directory. When Pages builds from a branch it can only serve the repository
+root or `docs/`, and this is neither — so the workflow uploads `public/` as a
+Pages artifact from Actions instead. That requires the repository's Pages
+source to be set to **GitHub Actions** (Settings → Pages → Build and
+deployment → Source); the workflow cannot set it for you.
+
+It runs on pushes to `main` that touch `public/**`, and can be started by hand
+from the Actions tab. Once enabled the site is
+<https://zionrubin.github.io/loom/>.
+
+Every internal link on the page is relative, so it works unchanged from the
+`/loom/` subpath a project Pages site is served under.
 
 ## Provenance
 
