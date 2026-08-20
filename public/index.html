@@ -219,20 +219,15 @@ code, kbd, pre {
 .fact span { font-size: 12.5px; color: var(--ink-3); }
 
 /* The object */
-.stage-wrap { display: flex; flex-direction: column; gap: 14px; align-self: center; }
+.stage-wrap { align-self: center; }
 three-d-stage:not(:defined) { visibility: hidden; }
 three-d-stage {
   display: block;
   width: 100%;
   height: auto;          /* beats the component's own :host{height:100vh} */
-  flex: 1 1 auto;
   min-height: 460px;
   min-height: min(64svh, 560px);
   --stage-bg: transparent;
-}
-.stage-cap {
-  font-size: 12.5px; color: var(--ink-3);
-  display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline;
 }
 .hero.no-3d .stage-wrap { display: none; }
 .hero.no-3d .wrap { grid-template-columns: minmax(0, 1fr); min-height: 0; }
@@ -348,12 +343,7 @@ section > .wrap { padding-top: 84px; padding-bottom: 84px; }
 /* Footer */
 footer { border-top: 1px solid var(--line); background: var(--surface); }
 footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
-.foot {
-  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
-  gap: 40px; align-items: start;
-}
 .foot h3 { font-size: 14px; letter-spacing: -0.01em; }
-.foot p { margin-top: 10px; color: var(--ink-2); font-size: 14px; max-width: 60ch; }
 .foot ul { list-style: none; margin: 10px 0 0; padding: 0; }
 .foot li { padding: 4px 0; font-size: 14px; }
 .colophon {
@@ -361,7 +351,6 @@ footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
   font-size: 13px; color: var(--ink-3);
   display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between;
 }
-@media (max-width: 720px) { .foot { grid-template-columns: minmax(0, 1fr); gap: 28px; } }
 </style>
 </head>
 
@@ -412,13 +401,7 @@ footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
       </div>
 
       <div class="stage-wrap">
-        <three-d-stage name="woven-knot"
-                       role="img"
-                       aria-label="Woven Knot: four translucent strands braided around a torus knot, with points of light travelling along them."></three-d-stage>
-        <p class="stage-cap">
-          <span><b>Woven Knot</b> — four strands, one core, pulses in flight.</span>
-          <a href="./woven-knot.html">Open on its own&nbsp;→</a>
-        </p>
+        <three-d-stage name="woven-knot" aria-hidden="true"></three-d-stage>
       </div>
     </div>
   </div>
@@ -678,28 +661,17 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
   <div class="wrap">
     <div class="foot">
       <div>
-        <h3>About the object</h3>
-        <p>
-          The <a href="./woven-knot.html">Woven Knot</a> is four translucent strands braided
-          around a (2,3) torus knot, closed so the braid meets itself, with a single lit thread
-          down the core and pulses travelling the strands. Many strands, one path, work in
-          flight — which is roughly the shape of a fleet. Drag to orbit; it exports to OBJ or GLB
-          from its own page.
-        </p>
-      </div>
-      <div>
         <h3>Elsewhere</h3>
         <ul>
           <li><a href="https://github.com/zionrubin/loom">Repository</a></li>
           <li><a href="https://github.com/zionrubin/loom/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
           <li><a href="https://github.com/zionrubin/loom/tree/main/examples">Examples</a></li>
-          <li><a href="./woven-knot.html">Woven Knot, on its own</a></li>
         </ul>
       </div>
     </div>
     <div class="colophon">
       <span>Loom — Large-scale Orchestration Of Models.</span>
-      <span>System type, no trackers, one 3D object.</span>
+      <span>System type, no trackers.</span>
     </div>
   </div>
 </footer>
