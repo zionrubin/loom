@@ -253,3 +253,8 @@ path in [§6](docs/ARCHITECTURE.md#6-scaling-path-from-local-runtime-to-distribu
 ## Demo
 
 [▶️ Watch the demo](./assets/demo.mp4)
+
+There is also a static landing page in [`public/`](./public) — what Loom is, a
+pipeline end to end, and the docs index, with the Woven Knot as its hero. It
+publishes to GitHub Pages at <https://zionrubin.github.io/loom/>; run it
+locally with `python3 -m http.server 8099 --directory public`.

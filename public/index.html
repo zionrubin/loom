@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom — Large-scale Orchestration Of Models</title>
+<meta name="description" content="Loom is an AI-native data processing framework in Go: MapReduce rethought for pipelines whose operators are model calls, with least-privilege task envelopes, budget-aware scheduling, automatic escalation and content-addressed caching.">
+<meta name="color-scheme" content="light dark">
+
+<!-- three.js for the hero object, pinned by version and hash. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+    "three/addons/controls/OrbitControls.js": "https://unpkg.com/three@0.184.0/examples/jsm/controls/OrbitControls.js",
+    "three/addons/exporters/OBJExporter.js": "https://unpkg.com/three@0.184.0/examples/jsm/exporters/OBJExporter.js",
+    "three/addons/exporters/GLTFExporter.js": "https://unpkg.com/three@0.184.0/examples/jsm/exporters/GLTFExporter.js"
+  },
+  "integrity": {
+    "https://unpkg.com/three@0.184.0/build/three.module.js": "sha384-8FCZ1eVO6it4+pbec2aDtnTrwjWXZLJRC+MAGCIPDgsYnUrl/E0A2YlF8ioMKI/J",
+    "https://unpkg.com/three@0.184.0/build/three.core.js": "sha384-dw2ooPewaEIrAgl6oFDBmmBWCE9oW9LxRGcfwZ0hLvEprzo202wXl7vCYHRlSnOT",
+    "https://unpkg.com/three@0.184.0/examples/jsm/controls/OrbitControls.js": "sha384-4rziNxOBZKQ69i+w+f89KJ55TCYquwchVbByQwmaOeIOXdOU2PLDn3kOfXHwIJC9",
+    "https://unpkg.com/three@0.184.0/examples/jsm/exporters/OBJExporter.js": "sha384-nbwtoZENJD3Vq+ACK0CuGQdPMuDWHkamC2KJD70EV5nfg6jQjfppKOea07YJN+N3",
+    "https://unpkg.com/three@0.184.0/examples/jsm/exporters/GLTFExporter.js": "sha384-VofkvpG6HERhFCYbsUOHeNXBCqID2nfqkQqnVzE1jc/oPcz+qJ13ADdXH08hE+cQ"
+  }
+}
+</script>
+
+<style>
+/* ─────────────────────────────────────────────────────────────
+   Tokens. Light is the base; dark only redefines the values.
+   ───────────────────────────────────────────────────────────── */
+:root {
+  --bg:        #f1f3f4;
+  --surface:   #fafbfb;
+  --ink:       #10161a;
+  --ink-2:     #4d585f;
+  --ink-3:     #7f8c93;
+  --line:      rgba(16, 22, 26, 0.11);
+  --line-2:    rgba(16, 22, 26, 0.20);
+  --accent:    #06758f;
+  --accent-on: #ffffff;
+  --wash:      rgba(6, 117, 143, 0.07);
+  --code-bg:   #fbfcfc;
+  --shadow:    0 1px 2px rgba(16, 22, 26, 0.04), 0 8px 28px rgba(16, 22, 26, 0.05);
+
+  /* code tones */
+  --c-comment: #7d8a91;
+  --c-string:  #1a6f52;
+  --c-key:     #9a4a1f;
+  --c-num:     #7a4bb5;
+  --c-fn:      #06627a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #0c1012;
+    --surface:   #131a1d;
+    --ink:       #edf3f5;
+    --ink-2:     #9dabb1;
+    --ink-3:     #6b787e;
+    --line:      rgba(237, 243, 245, 0.13);
+    --line-2:    rgba(237, 243, 245, 0.24);
+    --accent:    #6fd3f2;
+    --accent-on: #06202b;
+    --wash:      rgba(111, 211, 242, 0.10);
+    --code-bg:   #10171a;
+    --shadow:    0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 34px rgba(0, 0, 0, 0.28);
+
+    --c-comment: #6d7a80;
+    --c-string:  #86d6b0;
+    --c-key:     #e8a87c;
+    --c-num:     #c4a5f0;
+    --c-fn:      #8fd8ef;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Base
+   ───────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  scroll-padding-top: 76px;
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.022em; line-height: 1.15; }
+p { margin: 0; }
+
+code, kbd, pre {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+               "Liberation Mono", monospace;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.wrap { width: 100%; max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+
+.skip {
+  position: absolute; left: -9999px; top: 0; z-index: 20;
+  background: var(--surface); color: var(--ink);
+  padding: 10px 16px; border: 1px solid var(--line-2); border-radius: 8px;
+}
+.skip:focus { left: 12px; top: 12px; }
+
+/* ─────────────────────────────────────────────────────────────
+   Header
+   ───────────────────────────────────────────────────────────── */
+.masthead {
+  position: sticky; top: 0; z-index: 10;
+  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  backdrop-filter: saturate(1.6) blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.masthead .wrap {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 24px; height: 60px;
+}
+.wordmark {
+  font-size: 17px; font-weight: 600; letter-spacing: -0.02em;
+  color: var(--ink); text-decoration: none;
+}
+.wordmark:hover { text-decoration: none; }
+
+.nav { display: flex; align-items: center; gap: 26px; font-size: 14px; }
+.nav a { color: var(--ink-2); }
+.nav a:hover { color: var(--ink); text-decoration: none; }
+@media (max-width: 720px) { .nav .opt { display: none; } }
+
+/* ─────────────────────────────────────────────────────────────
+   Hero
+   ───────────────────────────────────────────────────────────── */
+.hero .wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.24fr);
+  gap: 48px;
+  align-items: center;
+  min-height: min(760px, calc(100vh - 60px));
+  min-height: min(760px, calc(100svh - 60px));
+  padding-top: 56px;
+  padding-bottom: 56px;
+}
+
+.eyebrow {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+
+.hero h1 {
+  margin: 18px 0 0;
+  font-size: clamp(3.4rem, 8.5vw, 5.4rem);
+  letter-spacing: -0.045em;
+}
+
+.lead {
+  margin-top: 22px;
+  font-size: clamp(1.1rem, 1.9vw, 1.32rem);
+  line-height: 1.45;
+  letter-spacing: -0.012em;
+  color: var(--ink);
+  max-width: 30ch;
+}
+
+.hero .sub {
+  margin-top: 20px;
+  color: var(--ink-2);
+  font-size: 15.5px;
+  max-width: 46ch;
+}
+
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 42px; padding: 0 20px;
+  border-radius: 9px; border: 1px solid transparent;
+  font-size: 14.5px; font-weight: 500; letter-spacing: -0.005em;
+}
+.btn:hover { text-decoration: none; }
+.btn-primary { background: var(--accent); color: var(--accent-on); }
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-ghost { border-color: var(--line-2); color: var(--ink); background: transparent; }
+.btn-ghost:hover { background: var(--surface); }
+
+.facts {
+  display: flex; flex-wrap: wrap; gap: 10px 28px;
+  margin-top: 40px; padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+.fact b {
+  display: block; font-size: 21px; font-weight: 600;
+  letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
+}
+.fact span { font-size: 12.5px; color: var(--ink-3); }
+
+/* The object */
+.stage-wrap { display: flex; flex-direction: column; gap: 14px; align-self: center; }
+three-d-stage:not(:defined) { visibility: hidden; }
+three-d-stage {
+  display: block;
+  width: 100%;
+  height: auto;          /* beats the component's own :host{height:100vh} */
+  flex: 1 1 auto;
+  min-height: 460px;
+  min-height: min(64svh, 560px);
+  --stage-bg: transparent;
+}
+.stage-cap {
+  font-size: 12.5px; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline;
+}
+.hero.no-3d .stage-wrap { display: none; }
+.hero.no-3d .wrap { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+
+@media (max-width: 900px) {
+  .hero .wrap {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 36px; min-height: 0; padding-top: 40px;
+  }
+  /* Name and promise first; the object reads as the break before the
+     content sections rather than as an unexplained opener. */
+  three-d-stage { min-height: 42svh; }
+  .lead, .hero .sub { max-width: none; }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Sections
+   ───────────────────────────────────────────────────────────── */
+section { border-top: 1px solid var(--line); }
+section > .wrap { padding-top: 84px; padding-bottom: 84px; }
+@media (max-width: 720px) { section > .wrap { padding-top: 58px; padding-bottom: 58px; } }
+
+.sec-head { max-width: 62ch; }
+.sec-head h2 { font-size: clamp(1.55rem, 3.2vw, 2.1rem); letter-spacing: -0.03em; }
+.sec-head p { margin-top: 14px; color: var(--ink-2); font-size: 16.5px; }
+
+/* Why */
+.why { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; margin-top: 44px; }
+.why > div {
+  padding: 26px 28px 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.why > div:nth-child(1) { border-radius: 12px 0 0 0; }
+.why > div:nth-child(2) { border-radius: 0 12px 0 0; }
+.why > div:nth-child(3) { border-radius: 0 0 0 12px; }
+.why > div:nth-child(4) { border-radius: 0 0 12px 0; }
+.why h3 { font-size: 16px; letter-spacing: -0.015em; }
+.why p { margin-top: 10px; color: var(--ink-2); font-size: 14.5px; }
+.why .tag {
+  display: inline-block; margin-bottom: 12px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent); background: var(--wash);
+  padding: 4px 9px; border-radius: 5px;
+}
+@media (max-width: 720px) {
+  .why { grid-template-columns: minmax(0, 1fr); }
+  .why > div { border-radius: 0 !important; }
+  .why > div:first-child { border-radius: 12px 12px 0 0 !important; }
+  .why > div:last-child { border-radius: 0 0 12px 12px !important; }
+}
+
+/* Code */
+.codebox {
+  margin-top: 40px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.codebox header {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px; color: var(--ink-3);
+}
+.codebox header .file { font-family: inherit; font-weight: 500; color: var(--ink-2); }
+.codebox pre {
+  margin: 0; padding: 22px 20px;
+  overflow-x: auto;
+  font-size: 13px; line-height: 1.72;
+  tab-size: 4;
+}
+.codebox pre code { color: var(--ink); }
+.c { color: var(--c-comment); font-style: italic; }
+.s { color: var(--c-string); }
+.k { color: var(--c-key); }
+.n { color: var(--c-num); }
+.f { color: var(--c-fn); }
+
+.aside { margin-top: 18px; font-size: 14.5px; color: var(--ink-2); max-width: 68ch; }
+.aside code { font-size: 0.92em; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
+
+/* Capabilities */
+.cards {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px 28px; margin-top: 46px;
+}
+.card { padding-top: 18px; border-top: 1px solid var(--line-2); }
+.card h3 { font-size: 15.5px; letter-spacing: -0.015em; }
+.card p { margin-top: 9px; color: var(--ink-2); font-size: 14.5px; }
+.card code { font-size: 0.9em; color: var(--ink); }
+@media (max-width: 940px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .cards { grid-template-columns: minmax(0, 1fr); } }
+
+/* Docs */
+.docs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; margin-top: 40px; }
+.docs a {
+  display: flex; align-items: baseline; gap: 14px;
+  padding: 13px 0; border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+.docs a:hover { text-decoration: none; }
+.docs a:hover .name { color: var(--accent); }
+.docs .name { flex: 0 0 auto; font-size: 14.5px; font-weight: 500; letter-spacing: -0.01em; }
+.docs .what { font-size: 13.5px; color: var(--ink-3); text-align: right; margin-left: auto; }
+@media (max-width: 760px) {
+  .docs { grid-template-columns: minmax(0, 1fr); }
+  .docs .what { display: none; }
+}
+
+/* Footer */
+footer { border-top: 1px solid var(--line); background: var(--surface); }
+footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
+.foot {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 40px; align-items: start;
+}
+.foot h3 { font-size: 14px; letter-spacing: -0.01em; }
+.foot p { margin-top: 10px; color: var(--ink-2); font-size: 14px; max-width: 60ch; }
+.foot ul { list-style: none; margin: 10px 0 0; padding: 0; }
+.foot li { padding: 4px 0; font-size: 14px; }
+.colophon {
+  margin-top: 44px; padding-top: 22px; border-top: 1px solid var(--line);
+  font-size: 13px; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between;
+}
+@media (max-width: 720px) { .foot { grid-template-columns: minmax(0, 1fr); gap: 28px; } }
+</style>
+</head>
+
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="wordmark" href="./">Loom</a>
+    <nav class="nav">
+      <a class="opt" href="#why">Why</a>
+      <a class="opt" href="#pipeline">Pipeline</a>
+      <a class="opt" href="#run">Run it</a>
+      <a href="#docs">Docs</a>
+      <a href="https://github.com/zionrubin/loom">GitHub&nbsp;↗</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ── Hero ─────────────────────────────────────────────── -->
+  <div class="hero">
+    <div class="wrap">
+      <div>
+        <p class="eyebrow">Large-scale Orchestration Of Models</p>
+        <h1>Loom</h1>
+        <p class="lead">
+          MapReduce rethought for pipelines whose operators are model calls.
+        </p>
+        <p class="sub">
+          Declarative dataflow over records, where every task runs under an explicit
+          least-privilege envelope, the scheduler speaks the language of rate limits and
+          dollar budgets, invalid model output escalates to stronger models automatically,
+          and completed AI work is never paid for twice.
+        </p>
+
+        <div class="actions">
+          <a class="btn btn-primary" href="#run">Run it locally</a>
+          <a class="btn btn-ghost" href="https://github.com/zionrubin/loom/blob/main/docs/ARCHITECTURE.md">Read the architecture&nbsp;↗</a>
+        </div>
+
+        <div class="facts">
+          <div class="fact"><b>20</b><span>examples ship</span></div>
+          <div class="fact"><b>15</b><span>run fully offline</span></div>
+          <div class="fact"><b>0</b><span>keys to run the suite</span></div>
+        </div>
+      </div>
+
+      <div class="stage-wrap">
+        <three-d-stage name="woven-knot"
+                       role="img"
+                       aria-label="Woven Knot: four translucent strands braided around a torus knot, with points of light travelling along them."></three-d-stage>
+        <p class="stage-cap">
+          <span><b>Woven Knot</b> — four strands, one core, pulses in flight.</span>
+          <a href="./woven-knot.html">Open on its own&nbsp;→</a>
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Why ──────────────────────────────────────────────── -->
+  <section id="why">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Classic data frameworks assume the wrong things</h2>
+        <p>
+          They assume operators are cheap, deterministic and trusted, and that throughput is
+          bounded by cores. AI workloads violate all four. Loom makes each difference a
+          first-class concept rather than something you paper over in user code.
+        </p>
+      </div>
+
+      <div class="why">
+        <div>
+          <span class="tag">Cost</span>
+          <h3>Calls spend real money</h3>
+          <p>
+            A run-level dollar and token budget governor stops a run with graceful partial
+            results instead of a surprise invoice — and <code>loom.Explain</code> prices the
+            whole run before a single call is made.
+          </p>
+        </div>
+        <div>
+          <span class="tag">Correctness</span>
+          <h3>Output can be wrong while the call succeeds</h3>
+          <p>
+            A returned 200 is not a returned answer. <code>Validate</code> is a semantic gate,
+            and a record that fails it climbs the model escalation ladder rather than landing
+            in your results.
+          </p>
+        </div>
+        <div>
+          <span class="tag">Throughput</span>
+          <h3>The ceiling is rate limits, not cores</h3>
+          <p>
+            Per-model token-bucket admission control on both requests per minute and tokens per
+            minute, so the scheduler plans against the limit that actually binds.
+          </p>
+        </div>
+        <div>
+          <span class="tag">Trust</span>
+          <h3>Operators run model-derived behaviour</h3>
+          <p>
+            Every task carries a serializable envelope — model binding, capability grants,
+            secret references, egress allowlist, budget, sandbox profile. The planner assembles
+            the minimal one; executors enforce it at the moment of use, and audit it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Pipeline ─────────────────────────────────────────── -->
+  <section id="pipeline">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>A pipeline, end to end</h2>
+        <p>
+          Classify a queue of support tickets on a cheap model, escalate only the records whose
+          output doesn't validate, keep the urgent ones, and roll them up into one briefing.
+        </p>
+      </div>
+
+      <div class="codebox">
+        <header><span class="file">triage.go</span><span>Go</span></header>
+        <pre data-lang="go"><code>p := pipeline.New("ticket-triage")
+src := p.FromRecords("tickets", tickets)
+
+classified := src.Infer("classify", pipeline.InferSpec{
+    Binding:   model.Binding{Tier: model.TierFast,               // run cheap,
+               Escalation: []string{"claude-sonnet-5"}},         // escalate when output is invalid
+    System:    "You classify support tickets.",
+    Prompt:    "Classify this ticket: {{.subject}}",
+    ParseJSON: true,                                             // parse output into the record
+    Validate:  func(r core.Record) error { ... },                // semantic gate
+})
+
+classified.
+    Filter("urgent-only", func(r core.Record) (bool, error) {
+        b, _ := r.Data["urgent"].(bool); return b, nil
+    }).
+    ReduceAI("briefing", pipeline.ReduceAISpec{                  // hierarchical tree reduce
+        Binding: model.Binding{Model: "claude-opus-4-8"},
+        Prompt:  "Summarize {{.Count}} items:\n{{range .Items}}- {{.}}\n{{end}}",
+        FanIn:   8,
+    })
+
+res, err := loom.Run(ctx, p,
+    loom.WithRegistry(reg),
+    loom.WithRunBudget(core.Budget{MaxCostUSD: 5.00}),           // hard dollar cap
+    loom.WithStateDir("./state"),                                // cache = checkpoint = resume
+)
+fmt.Print(res.Report)                                            // cost, tokens, retries, p95</code></pre>
+      </div>
+
+      <p class="aside">
+        Branching builds DAGs, and the planner fuses adjacent pure stages. Go-function stages run
+        in-process; give one <code>pipeline.WithVersion("v1")</code> to make it cacheable, and bump
+        the version when its behaviour changes.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── Capabilities ─────────────────────────────────────── -->
+  <section id="what">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>What you get</h2>
+        <p>
+          The pieces that only exist because the operators are model calls — each of them
+          documented, tested, and runnable offline.
+        </p>
+      </div>
+
+      <div class="cards">
+        <div class="card">
+          <h3>Declarative pipelines</h3>
+          <p>
+            <code>Map</code>, <code>Filter</code>, <code>FlatMap</code> and <code>Combine</code>,
+            plus AI-native <code>Infer</code> — templated per-record inference with JSON parsing
+            and validation — and <code>ReduceAI</code> for parallel tree aggregation.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Cost before you spend it</h3>
+          <p>
+            <code>loom.Explain</code> projects a run without making one model call: per-stage
+            calls, rendered prompt sizes, prompt-cache economics, priced cost, and a ceiling that
+            rests on no assumption — the number to hand your budget.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Caching is checkpointing</h3>
+          <p>
+            Task results are keyed by op fingerprint plus input content, so reruns and crash
+            recovery replay finished AI work at zero cost — across process restarts, and across
+            the processes of a fleet.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Fleets</h3>
+          <p>
+            Any number of pipelines as one engine: one rate limiter, one budget, one cache, one
+            pool of slots. A contended slot goes to the agent whose program has been served
+            least, so a three-call summary overtakes a 10,000-record sweep.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Iteration, with a pluggable algorithm</h3>
+          <p>
+            BSP message passing, self-critique refinement and beam search all ship. A vertex is
+            keyed by its state and its inbox rather than its round number, so cost per round
+            falls as the loop converges.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Stream mode</h3>
+          <p>
+            An input that never ends: windows cut it into finite sets, watermarks say when a set
+            is complete, and one checkpoint ties window state, source positions and sink commits
+            together. Delivery at-least-once, spend exactly-once.
+          </p>
+        </div>
+        <div class="card">
+          <h3>MCP tools, under the envelope</h3>
+          <p>
+            A stage declares what it may call; the planner turns that into a grant per tool, the
+            server's host on the egress allowlist, and the digest of the descriptors it compiled
+            against. One connection per host, shared by the whole fleet.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Worker processes</h3>
+          <p>
+            A durable queue with leases, heartbeats and fencing tokens. A worker killed mid-call
+            loses its claim rather than the task, and at-least-once delivery still produces
+            exactly-once work.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Watch it happen</h3>
+          <p>
+            The constellation view draws every task and executor as a star — prompts, responses,
+            lineage, forecast against actual. Loom Studio makes the pipeline a canvas that prices
+            itself between keystrokes.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Run it ───────────────────────────────────────────── -->
+  <section id="run">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Run it</h2>
+        <p>
+          The full test suite needs no network and no API keys. Fifteen of the twenty examples run
+          offline against a deterministic mock provider — the same seam the Anthropic, OpenAI and
+          local llama.cpp adapters sit behind.
+        </p>
+      </div>
+
+      <div class="codebox">
+        <header><span class="file">shell</span><span>sh</span></header>
+        <pre data-lang="sh"><code>go test ./...              # full suite, no network or keys needed
+go run ./examples/triage   # a complete pipeline on a mock model, offline
+
+# watch a run as a sky of stars: http://localhost:8077
+go run ./examples/constellation
+
+# cache = checkpoint: the second run makes zero model calls
+LOOM_STATE=/tmp/loom go run ./examples/triage
+LOOM_STATE=/tmp/loom go run ./examples/triage
+
+# real models
+ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
+OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Docs ─────────────────────────────────────────────── -->
+  <section id="docs">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Documentation</h2>
+        <p>The design, component by component — and the honest account of what is left out.</p>
+      </div>
+
+      <div class="docs">
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/ARCHITECTURE.md"><span class="name">ARCHITECTURE</span><span class="what">The full design</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/EXAMPLES.md"><span class="name">EXAMPLES</span><span class="what">Every example, and how to run it</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/EXPLAIN.md"><span class="name">EXPLAIN</span><span class="what">Cost before the first call</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/SHARING.md"><span class="name">SHARING</span><span class="what">Broadcasts and prompt prefixes</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/VIZ.md"><span class="name">VIZ</span><span class="what">The constellation view</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/ALGORITHMS.md"><span class="name">ALGORITHMS</span><span class="what">BSP, refine, beam</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/ITERATION.md"><span class="name">ITERATION</span><span class="what">The missing dimension</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/ASYNC.md"><span class="name">ASYNC</span><span class="what">Fleets and the blackboard</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/FINDINGS.md"><span class="name">FINDINGS</span><span class="what">The research commons</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/DELTA.md"><span class="name">DELTA</span><span class="what">Stateful delta execution</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/WORKERS.md"><span class="name">WORKERS</span><span class="what">Distributing a run</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/STREAMING.md"><span class="name">STREAMING</span><span class="what">Windows, watermarks, checkpoints</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/MCP.md"><span class="name">MCP</span><span class="what">Tools under the envelope</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/INFERENCE.md"><span class="name">INFERENCE</span><span class="what">Serving, and running it yourself</span></a>
+        <a href="https://github.com/zionrubin/loom/blob/main/docs/STUDIO.md"><span class="name">STUDIO</span><span class="what">The canvas that prices itself</span></a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <h3>About the object</h3>
+        <p>
+          The <a href="./woven-knot.html">Woven Knot</a> is four translucent strands braided
+          around a (2,3) torus knot, closed so the braid meets itself, with a single lit thread
+          down the core and pulses travelling the strands. Many strands, one path, work in
+          flight — which is roughly the shape of a fleet. Drag to orbit; it exports to OBJ or GLB
+          from its own page.
+        </p>
+      </div>
+      <div>
+        <h3>Elsewhere</h3>
+        <ul>
+          <li><a href="https://github.com/zionrubin/loom">Repository</a></li>
+          <li><a href="https://github.com/zionrubin/loom/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+          <li><a href="https://github.com/zionrubin/loom/tree/main/examples">Examples</a></li>
+          <li><a href="./woven-knot.html">Woven Knot, on its own</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="colophon">
+      <span>Loom — Large-scale Orchestration Of Models.</span>
+      <span>System type, no trackers, one 3D object.</span>
+    </div>
+  </div>
+</footer>
+
+<!-- The object. Nothing below is required for the page to read. -->
+<script src="./three-d-stage.js"></script>
+<script type="module" src="./knot-model.js"></script>
+<script type="module">
+  // No WebGL, no network for three.js — drop the stage and let the copy
+  // take the full width rather than showing a loader error to a reader.
+  const stage = document.querySelector('three-d-stage');
+  stage?.ready.then(
+    () => {
+      // The stage ships an export toolbar and an orbit hint in its shadow
+      // root. Both belong on the object's own page, not in a hero.
+      stage.shadowRoot.querySelector('.toolbar')?.remove();
+      stage.shadowRoot.querySelector('.note')?.remove();
+    },
+    () => document.querySelector('.hero').classList.add('no-3d'),
+  );
+</script>
+
+<script>
+/* Syntax colouring, ~30 lines and no dependency. Blocks are plain text in
+   the markup and stay readable if this never runs. */
+(() => {
+  const GRAMMAR = {
+    go: {
+      re: /(\/\/[^\n]*)|("(?:\\.|[^"\\\n])*"|`[^`]*`)|\b(func|return|nil|true|false|range|if|else|for|var|const|struct|interface|map|chan|go|defer|type|package|import|error|string|bool|int|float64)\b|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_]\w*(?=\())/g,
+      cls: ['c', 's', 'k', 'n', 'f'],
+    },
+    sh: {
+      re: /(#[^\n]*)|("(?:\\.|[^"\\\n])*")|(\b[A-Z][A-Z0-9_]+(?==))/g,
+      cls: ['c', 's', 'f'],
+    },
+  };
+  const esc = (s) => s.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]);
+
+  for (const pre of document.querySelectorAll('pre[data-lang]')) {
+    const g = GRAMMAR[pre.dataset.lang];
+    if (!g) continue;
+    const src = pre.textContent;
+    let out = '', last = 0, m;
+    g.re.lastIndex = 0;
+    while ((m = g.re.exec(src))) {
+      if (!m[0]) { g.re.lastIndex += 1; continue; }  // never spin on a zero-width match
+      const i = m.findIndex((v, k) => k > 0 && v !== undefined);
+      out += esc(src.slice(last, m.index));
+      out += '<span class="' + g.cls[i - 1] + '">' + esc(m[0]) + '</span>';
+      last = m.index + m[0].length;
+    }
+    pre.querySelector('code').innerHTML = out + esc(src.slice(last));
+  }
+})();
+</script>
+</body>
+</html>
