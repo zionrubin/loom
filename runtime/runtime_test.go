@@ -225,6 +225,82 @@ func TestSchedulerSemanticEscalation(t *testing.T) {
 	}
 }
 
+// TestGovernorChargesTheAttemptsThatFailed: what climbing the ladder costs.
+//
+// The bottom rung answers, its answer is rejected, and the task escalates.
+// One result comes back and two calls were billed — so a governor that
+// charged only the surviving result would report this run at half its price,
+// and would report a stage that escalates on every record as costing exactly
+// what one that never escalates costs.
+func TestGovernorChargesTheAttemptsThatFailed(t *testing.T) {
+	reg, _, _ := testRegistry(t)
+	perCall := core.Usage{InputTokens: 100, OutputTokens: 20, Requests: 1, CostUSD: 0.01}
+	exec := newFakeExec(func(tk task.Task, call int) (task.Result, error) {
+		// A call that was made and answered, either way: the small model's
+		// answer is the one that fails validation, and it is billed for the
+		// tokens it produced before anything looked at them.
+		res := task.Result{TaskID: tk.ID, Seq: tk.Seq, Model: tk.ResolvedModel, Usage: perCall}
+		if tk.ResolvedModel == "small" {
+			return res, core.Semantic(errors.New("invalid output"))
+		}
+		return res, nil
+	})
+	gov := NewGovernor(core.Budget{})
+	s := &Scheduler{Workers: 1, Retry: quickRetry(), Registry: reg, Exec: exec, Governor: gov}
+	binding := model.Binding{Model: "small", Escalation: []string{"big"}}
+	results, failures, err := s.ExecuteAll(context.Background(), mkTasks(1, binding))
+	if err != nil || len(failures) != 0 || len(results) != 1 {
+		t.Fatalf("err=%v failures=%v results=%d", err, failures, len(results))
+	}
+	spent := gov.Spent()
+	if spent.Requests != 2 {
+		t.Errorf("governor charged %d requests; the rejected call and the accepted one are both calls", spent.Requests)
+	}
+	if math.Abs(spent.CostUSD-0.02) > 1e-9 {
+		t.Errorf("governor charged $%.4f, want $0.0200", spent.CostUSD)
+	}
+	if spent.TotalTokens() != 240 {
+		t.Errorf("governor charged %d tokens, want 240", spent.TotalTokens())
+	}
+}
+
+// TestFailedCallsAloneExhaustTheBudget: the ceiling has to hold against work
+// that produces nothing at all.
+//
+// Every record here is answered and every answer is rejected, so the run
+// produces no results and spends money on all of them. A budget blind to that
+// would keep admitting tasks until the input ran out — which is the one
+// direction a ceiling must never fail in.
+func TestFailedCallsAloneExhaustTheBudget(t *testing.T) {
+	reg, _, _ := testRegistry(t)
+	exec := newFakeExec(func(tk task.Task, call int) (task.Result, error) {
+		return task.Result{TaskID: tk.ID, Seq: tk.Seq, Model: tk.ResolvedModel,
+				Usage: core.Usage{Requests: 1, CostUSD: 0.01}},
+			core.Semantic(errors.New("nothing usable came back"))
+	})
+	gov := NewGovernor(core.Budget{MaxCostUSD: 0.05})
+	s := &Scheduler{Workers: 1, Retry: RetryPolicy{MaxAttempts: 1}, Registry: reg,
+		Exec: exec, Governor: gov, ContinueOnError: true}
+	results, failures, err := s.ExecuteAll(context.Background(), mkTasks(20, model.Binding{Model: "small"}))
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("a run that only ever fails must still hit its ceiling, got %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("no task produced output, yet %d results came back", len(results))
+	}
+	// Five calls at a cent each reach the ceiling; the sixth task finds the
+	// governor exhausted before it is dispatched, and the rest are drained.
+	if len(exec.calls) != 5 {
+		t.Errorf("%d of 20 tasks executed, want 5 before the budget stopped the run", len(exec.calls))
+	}
+	if math.Abs(gov.Spent().CostUSD-0.05) > 1e-9 {
+		t.Errorf("governor recorded $%.4f, want $0.0500", gov.Spent().CostUSD)
+	}
+	if len(failures) == 0 {
+		t.Error("the rejected tasks should be dead-lettered")
+	}
+}
+
 func TestSchedulerPermanentFailsFast(t *testing.T) {
 	reg, _, _ := testRegistry(t)
 	exec := newFakeExec(func(tk task.Task, call int) (task.Result, error) {

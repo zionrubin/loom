@@ -391,11 +391,18 @@ type Receipt struct {
 // immediately, instead of every remote failure degrading to the unclassified
 // default.
 type Failure struct {
-	Class    core.FailureClass `json:"class"`
-	Message  string            `json:"message"`
-	Worker   string            `json:"worker,omitempty"`
-	Delivery int               `json:"delivery,omitempty"`
-	At       time.Time         `json:"at"`
+	Class   core.FailureClass `json:"class"`
+	Message string            `json:"message"`
+	// Usage is what the failed execution spent before it failed, and it
+	// crosses the queue for the same reason the class does: it is the other
+	// thing the client cannot reconstruct. A worker that called a model and
+	// then rejected its answer has spent real money, and a failure that
+	// reported only what went wrong would leave the run's budget governor
+	// counting a distributed run cheaper than the identical local one.
+	Usage    core.Usage `json:"usage,omitzero"`
+	Worker   string     `json:"worker,omitempty"`
+	Delivery int        `json:"delivery,omitempty"`
+	At       time.Time  `json:"at"`
 }
 
 // Failed describes err as a Failure, preserving its class.

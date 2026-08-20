@@ -467,13 +467,17 @@ func testCommitIdempotent(t *testing.T, q worker.Queue) {
 
 // An error crossing a process boundary loses its Go type. Carrying the class
 // explicitly is what keeps a semantic failure escalating up the model ladder
-// instead of dead-lettering as an unclassified one.
+// instead of dead-lettering as an unclassified one — and carrying the usage is
+// what keeps the run's budget governor charging for the call that produced the
+// refused answer, which nothing on this side of the queue watched happen.
 func testAbandonClass(t *testing.T, q worker.Queue) {
 	ctx := context.Background()
 	submit(t, q, "t1")
 	a := claimOne(t, q, "w1")
 
+	spent := core.Usage{InputTokens: 90, OutputTokens: 12, Requests: 1, CostUSD: 0.0031}
 	f := worker.Failed(core.Semantic(errors.New("the model refused")), "w1")
+	f.Usage = spent
 	if _, err := q.Abandon(ctx, a.Lease, f); err != nil {
 		t.Fatalf("abandon: %v", err)
 	}
@@ -486,6 +490,9 @@ func testAbandonClass(t *testing.T, q worker.Queue) {
 	}
 	if got := core.ClassOf(s.Failure.Err()); got != core.FailSemantic {
 		t.Fatalf("rebuilt error classified %q, want semantic", got)
+	}
+	if s.Failure.Usage != spent {
+		t.Fatalf("the failure crossed the queue having spent %+v, want %+v", s.Failure.Usage, spent)
 	}
 }
 

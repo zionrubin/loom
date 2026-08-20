@@ -102,18 +102,22 @@ func TestRoutingCutsTheWastedCallsWithoutChangingTheOutput(t *testing.T) {
 		}
 	}
 
-	// Measured on the report rather than on RunResult.Spent, and the
-	// difference matters here more than anywhere else in Loom: the governor is
-	// charged from a task's result, and a task whose call failed validation
-	// returns no result, so the money spent on exactly the calls this feature
-	// eliminates is money Spent never counted. The model.called events do
-	// carry it, because they are published when the call is made.
+	// Measured on the report, which counts a call when it is answered rather
+	// than when its answer is accepted — and so counts exactly the calls this
+	// feature eliminates, which are calls whose output failed validation.
+	// RunResult.Spent agrees with it call for call; the assertion below pins
+	// that, because a router judged against a number blind to rejected calls
+	// would be judged against the one number its savings never show up in.
 	flat, routedT := flatRes.Report.Totals(), routed.Report.Totals()
 	if routedT.Requests >= flat.Requests {
 		t.Fatalf("routed made %d calls against the flat ladder's %d", routedT.Requests, flat.Requests)
 	}
 	if routedT.CostUSD >= flat.CostUSD {
 		t.Errorf("routed spent $%.6f against flat's $%.6f", routedT.CostUSD, flat.CostUSD)
+	}
+	if flatRes.Spent.Requests != flat.Requests || routed.Spent.Requests != routedT.Requests {
+		t.Errorf("Spent counts flat=%d routed=%d against the report's flat=%d routed=%d",
+			flatRes.Spent.Requests, routed.Spent.Requests, flat.Requests, routedT.Requests)
 	}
 	if routed.Routing.Moved == 0 {
 		t.Errorf("routing stats show nothing moved: %+v", routed.Routing)

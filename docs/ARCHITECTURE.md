@@ -175,7 +175,10 @@ planning or scheduling.
   across the call, so a backoff between attempts gives the slot back.
 - **Budget governor** — run-level cost/token caps enforced across all
   concurrent tasks; on exhaustion the run stops admitting work and returns
-  partial results plus the spend so far.
+  partial results plus the spend so far. Every attempt is charged, not every
+  attempt that worked: a call whose answer failed validation costs what an
+  accepted one costs, so a stage that climbs its escalation ladder pays for
+  each rung it climbed.
 - **Class-aware recovery** —
   - *transient* → exponential backoff + jitter, same model;
   - *semantic* → climb the binding's escalation ladder (e.g. Haiku → Sonnet)

@@ -431,6 +431,11 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 
 		res, err := s.Exec.Execute(ctx, t)
 		release()
+		// Charged before the outcome is read. A provider bills for the call it
+		// answered, and whether that answer then survived parsing, validation,
+		// or the rest of the stage is a fact about the result rather than about
+		// the bill.
+		s.charge(t, res)
 		if err == nil {
 			// A verdict, but only if a model produced it. A cache hit is a
 			// replay of work some earlier task paid for at some other rung;
@@ -439,14 +444,6 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			if !res.CacheHit {
 				routing.observe(t, escalation, true, !observed)
 				observed = true
-			}
-			if s.Governor != nil && res.Usage.Requests > 0 {
-				if cerr := s.Governor.Charge(res.Usage); cerr != nil {
-					// The result stands; the governor aborts *future* work.
-					s.publish(observe.Event{Type: observe.BudgetExceeded,
-						RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
-						Note: cerr.Error()})
-				}
 			}
 			s.publish(observe.Event{Type: observe.TaskCompleted, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Model: res.Model,
@@ -474,7 +471,7 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		if !retryable || attempt >= maxAttempts {
 			s.publish(observe.Event{Type: observe.TaskFailed, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt,
-				Rung: escalation, Pane: t.Pane, Err: err.Error()})
+				Rung: escalation, Pane: t.Pane, Err: err.Error(), Usage: res.Usage})
 			return task.Result{}, attempt, err
 		}
 
@@ -492,6 +489,29 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			return task.Result{}, attempt, core.Transient(ctx.Err())
 		}
 		attempt++
+	}
+}
+
+// charge records what one attempt cost against the run budget.
+//
+// Every attempt goes through here, successful or not. A call that was made
+// was paid for: an output rejected by a validator, or one that parsed into
+// nothing usable, costs exactly what a usable one costs, and the stage then
+// climbs its ladder and pays again. Charging only the attempts that produced
+// a result is what used to make that climb look free — the money left the
+// account, and RunResult.Spent never mentioned it.
+//
+// A cache hit replays work some earlier task already paid for and carries no
+// usage, so it charges nothing.
+func (s *Scheduler) charge(t task.Task, res task.Result) {
+	if s.Governor == nil || res.Usage == (core.Usage{}) {
+		return
+	}
+	if err := s.Governor.Charge(res.Usage); err != nil {
+		// What was spent stands; the governor stops *future* work.
+		s.publish(observe.Event{Type: observe.BudgetExceeded,
+			RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
+			Note: err.Error()})
 	}
 }
 
