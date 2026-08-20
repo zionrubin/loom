@@ -132,6 +132,9 @@ type scripted struct {
 	entered chan string // task IDs, as they begin
 	gate    chan struct{}
 	err     error
+	// spent is what a scripted failure cost before it failed — the shape of a
+	// model call that was answered and whose answer was then rejected.
+	spent core.Usage
 	// cancelled records tasks whose context was cancelled underneath them,
 	// which is how a fenced worker is observed to stop paying for its work.
 	cancelled map[string]bool
@@ -139,6 +142,13 @@ type scripted struct {
 
 func newScripted() *scripted {
 	return &scripted{entered: make(chan string, 64), cancelled: map[string]bool{}}
+}
+
+// fail makes every execution end in err, having spent spent.
+func (s *scripted) fail(err error, spent core.Usage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err, s.spent = err, spent
 }
 
 // hold makes every execution block until release is called.
@@ -161,7 +171,7 @@ func (s *scripted) release() {
 func (s *scripted) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	s.mu.Lock()
 	s.calls++
-	gate, err := s.gate, s.err
+	gate, err, spent := s.gate, s.err, s.spent
 	s.mu.Unlock()
 
 	select {
@@ -180,7 +190,9 @@ func (s *scripted) Execute(ctx context.Context, t task.Task) (task.Result, error
 		}
 	}
 	if err != nil {
-		return task.Result{}, err
+		// A failed execution accounts for itself: the executor contract says
+		// the result's usage is what the attempt spent before it failed.
+		return task.Result{TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Usage: spent}, err
 	}
 
 	out := make([]core.Record, 0, len(t.Input))
@@ -754,6 +766,30 @@ func TestUnservableTaskFailsWithADiagnosis(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "summarize") {
 		t.Fatalf("the failure does not name the stage nobody advertises: %v", err)
+	}
+}
+
+// A worker calls a model, rejects the answer, and fails the task. The money is
+// gone and this process never saw it leave: only the worker was there. So the
+// failure has to carry the bill across the queue the way the receipt carries it
+// on the way out — otherwise the same pipeline costs less on a fleet than it
+// does in one process, and the run budget is a ceiling with a hole under it.
+func TestRemoteFailureBringsItsCostHome(t *testing.T) {
+	f := newFleet(t)
+	exec := newScripted()
+	spent := core.Usage{InputTokens: 120, OutputTokens: 30, Requests: 1, CostUSD: 0.004}
+	exec.fail(core.Semantic(errors.New("the model's answer failed validation")), spent)
+	f.start("w1", f.q, exec)
+
+	o := await(t, f.execute(t.Context(), job("t1", "hello")), 5*time.Second)
+	if o.err == nil {
+		t.Fatal("the task should have failed")
+	}
+	if class := core.ClassOf(o.err); class != core.FailSemantic {
+		t.Errorf("the failure crossed as %s, want semantic", class)
+	}
+	if o.res.Usage != spent {
+		t.Errorf("the failure came home having spent %+v, want %+v", o.res.Usage, spent)
 	}
 }
 

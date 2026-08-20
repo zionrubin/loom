@@ -314,7 +314,7 @@ func (w *Worker) handle(ctx context.Context, a Assignment) {
 			// The two sides are not sharing storage. Nothing about this task
 			// will work on this worker, and it is not the task's fault, so it
 			// is reported as the deployment error it is rather than retried.
-			w.settleFailure(ctx, a, core.Permanent(err))
+			w.settleFailure(ctx, a, core.Permanent(err), core.Usage{})
 			return
 		}
 		t.Input = recs
@@ -363,7 +363,10 @@ func (w *Worker) handle(ctx context.Context, a Assignment) {
 			})
 			return
 		}
-		w.settleFailure(ctx, a, err)
+		// A failed execution still reports its usage: the executor hands back
+		// what the attempt spent before it failed, and this is the boundary
+		// past which only the receipt or the failure can carry it.
+		w.settleFailure(ctx, a, err, res.Usage)
 		return
 	}
 	w.settleResult(ctx, a, res, start)
@@ -388,7 +391,9 @@ func (w *Worker) settleResult(ctx context.Context, a Assignment, res task.Result
 		// already there and already correct.
 		hash, err := putRecords(w.cfg.Blobs, res.Output)
 		if err != nil {
-			w.settleFailure(ctx, a, core.Permanent(err))
+			// The work succeeded and its output could not be stored. The task
+			// fails, but the calls behind that output were still billed.
+			w.settleFailure(ctx, a, core.Permanent(err), res.Usage)
 			return
 		}
 		receipt.Output = hash
@@ -425,11 +430,14 @@ func (w *Worker) settleResult(ctx context.Context, a Assignment, res task.Result
 	})
 }
 
-// settleFailure reports a failed execution to the queue.
-func (w *Worker) settleFailure(ctx context.Context, a Assignment, err error) {
+// settleFailure reports a failed execution to the queue, along with what it
+// spent before failing — which is often not nothing, and which only this
+// process saw.
+func (w *Worker) settleFailure(ctx context.Context, a Assignment, err error, spent core.Usage) {
 	w.count(func(s *WorkerStats) { s.Failed++ })
 	f := Failed(err, w.cfg.Name)
 	f.Delivery = a.Delivery
+	f.Usage = spent
 
 	sctx, cancel := settle(ctx)
 	defer cancel()
@@ -439,7 +447,7 @@ func (w *Worker) settleFailure(ctx context.Context, a Assignment, err error) {
 		// its own: the lease expires and the task is redelivered.
 		w.publish(observe.Event{
 			Type: observe.TaskFailed, RunID: a.Task.Envelope.RunID, Stage: a.Task.Stage,
-			TaskID: a.Task.ID, Worker: w.cfg.Name, Attempt: a.Delivery,
+			TaskID: a.Task.ID, Worker: w.cfg.Name, Attempt: a.Delivery, Usage: spent,
 			Err: fmt.Sprintf("%v (and the failure could not be reported: %v)", err, aerr),
 		})
 		return
@@ -447,6 +455,7 @@ func (w *Worker) settleFailure(ctx context.Context, a Assignment, err error) {
 	w.publish(observe.Event{
 		Type: observe.TaskFailed, RunID: a.Task.Envelope.RunID, Stage: a.Task.Stage,
 		TaskID: a.Task.ID, Worker: w.cfg.Name, Attempt: a.Delivery, Err: err.Error(),
+		Usage: spent,
 	})
 }
 

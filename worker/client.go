@@ -195,7 +195,13 @@ func (c *Client) Execute(ctx context.Context, t task.Task) (task.Result, error) 
 		if status.Failure == nil {
 			return task.Result{}, core.Transient(fmt.Errorf("worker: task %s failed without a reason", t.ID))
 		}
-		return task.Result{}, status.Failure.Err()
+		// The failure carries what the remote attempt spent, and the result is
+		// how the scheduler is told: the governor charges from a result whether
+		// or not one came back, so a rejected answer costs the run the same
+		// here as it does on a local executor.
+		return task.Result{
+			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Usage: status.Failure.Usage,
+		}, status.Failure.Err()
 	case StateDone:
 		if status.Receipt == nil {
 			return task.Result{}, core.Transient(fmt.Errorf("worker: task %s done without a receipt", t.ID))

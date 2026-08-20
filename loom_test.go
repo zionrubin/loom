@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -564,6 +565,67 @@ func TestRunBudgetAbort(t *testing.T) {
 	}
 	if got := len(res.StageOutputs["classify"]); got == 0 || got >= 4 {
 		t.Errorf("expected partial classify outputs, got %d", got)
+	}
+}
+
+// TestSpentCountsTheCallsThatFailed: a rejected answer is a paid-for answer.
+//
+// Every record here is classified twice — once by a model that returns prose
+// where JSON was asked for, and once by the model above it on the ladder —
+// and only the second call produces output. The bill is for both. Spent used
+// to report only the calls whose results survived, which made a stage that
+// escalates on every record look exactly as cheap as one that never has to.
+func TestSpentCountsTheCallsThatFailed(t *testing.T) {
+	reg := model.NewRegistry()
+	small := model.NewMock("small", model.WithHandler(func(model.Request) (string, error) {
+		return "sorry, I cannot produce JSON today", nil
+	}))
+	if err := reg.Register(model.Info{ID: "small", Provider: small, Tier: model.TierFast,
+		Pricing: model.Pricing{InputPerMTok: 1, OutputPerMTok: 5}}); err != nil {
+		t.Fatal(err)
+	}
+	big := model.NewMock("big", model.WithHandler(classifyMock))
+	if err := reg.Register(model.Info{ID: "big", Provider: big, Tier: model.TierDeep,
+		Pricing: model.Pricing{InputPerMTok: 15, OutputPerMTok: 75}}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := pipeline.New("rejected")
+	p.FromRecords("in", tickets()).Infer("classify", pipeline.InferSpec{
+		Binding:   model.Binding{Model: "small", Escalation: []string{"big"}},
+		Prompt:    "Classify: {{.subject}}",
+		ParseJSON: true,
+	})
+
+	res, err := loom.Run(context.Background(), p,
+		loom.WithRegistry(reg), loom.WithRetry(quickRetry()))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(res.Output) != len(tickets()) {
+		t.Fatalf("output = %d records, want %d", len(res.Output), len(tickets()))
+	}
+	if small.Calls() == 0 || big.Calls() == 0 {
+		t.Fatalf("expected both rungs to be called, got small=%d big=%d", small.Calls(), big.Calls())
+	}
+	if calls := small.Calls() + big.Calls(); res.Spent.Requests != calls {
+		t.Errorf("Spent counts %d requests against the %d calls the providers actually served",
+			res.Spent.Requests, calls)
+	}
+	// The report is assembled from the model.called events, which are published
+	// when a call is answered rather than when its answer is accepted, so it has
+	// always counted the rejected ones. Spent now agrees with it — and the two
+	// numbers sitting side by side in a run report is where a disagreement
+	// would be read as a bug in whichever one the reader trusted less.
+	tot := res.Report.Totals()
+	if res.Spent.Requests != tot.Requests || res.Spent.TotalTokens() != tot.TotalTokens() {
+		t.Errorf("Spent = %+v, report totals = %+v", res.Spent, tot)
+	}
+	if math.Abs(res.Spent.CostUSD-tot.CostUSD) > 1e-9 {
+		t.Errorf("Spent $%.6f against the report's $%.6f", res.Spent.CostUSD, tot.CostUSD)
+	}
+	if res.Spent.CostUSD == 0 {
+		t.Error("a run that made priced calls reports spending nothing")
 	}
 }
 

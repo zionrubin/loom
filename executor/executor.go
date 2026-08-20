@@ -26,6 +26,12 @@ import (
 )
 
 // Executor executes a single task to completion (or classified failure).
+//
+// A failed execution returns both an error and a result, and the result's
+// Usage is the part that matters: it is what the attempt spent before it
+// failed. Only the usage is meaningful on that path — the output is empty,
+// because there was none — and an implementation that cannot account for a
+// failed attempt returns the zero usage rather than guessing.
 type Executor interface {
 	Execute(ctx context.Context, t task.Task) (task.Result, error)
 }
@@ -468,7 +474,15 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 
 	out, usage, modelUsed, err := runner.Run(ctx, rt, t)
 	if err != nil {
-		return task.Result{}, err
+		// The run failed, and the calls it made before failing were still
+		// billed. Handing that usage back with the error is what lets the
+		// scheduler charge for a call whose answer arrived and was then
+		// rejected — the provider does not refund an output that failed
+		// validation, and neither should the ledger.
+		return task.Result{
+			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage,
+			Usage: usage, Model: modelUsed, Latency: time.Since(start),
+		}, err
 	}
 
 	artifact := ""
