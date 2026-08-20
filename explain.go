@@ -16,6 +16,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/store"
 	"github.com/zionrubin/loom/task"
@@ -115,6 +116,51 @@ type StageProjection struct {
 	// CachePrefix reports whether the planner will enable provider prompt-
 	// prefix caching for this stage.
 	CachePrefix bool
+	// Ladder prices the stage's escalation ladder from what a router has
+	// learned, and is nil for a stage with no ladder or a run with no profile
+	// to read.
+	//
+	// It is the one part of a projection that describes work Usage and Ceiling
+	// leave out. Both of those price one call per record at the *base* model —
+	// the ceiling says "before retries" and means it — so a stage that
+	// escalates 40% of its records is under-projected by exactly the
+	// escalations, and no amount of staring at the columns above would show
+	// it. Once verdicts exist, this is what they are worth: the escalations
+	// priced, and what routing them would save.
+	Ladder *LadderProjection
+}
+
+// LadderProjection is a stage's escalation economics: what the ladder is
+// expected to cost when every record starts at the bottom, what it would cost
+// with each bucket started where the profile says, and how the calls divide
+// between the models.
+type LadderProjection struct {
+	// Rungs is one entry per model on the ladder, cheapest first, with the
+	// expected calls this stage's records make at each.
+	Rungs []RungProjection
+	// FlatUSD is the ladder's expected cost with every record entering at the
+	// bottom, and RoutedUSD its cost with the router choosing. Both cover the
+	// whole stage.
+	FlatUSD, RoutedUSD float64
+	// Samples is how many verdicts the projection rests on, and Buckets how
+	// many feature classes those verdicts fell into. A forecast on few samples
+	// is a guess with arithmetic around it; a forecast over one bucket cannot
+	// separate easy records from hard ones and will never route part of a
+	// stage.
+	Samples int
+	Buckets int
+}
+
+// Saved is what routing is expected to save this stage, in dollars.
+func (l *LadderProjection) Saved() float64 { return l.FlatUSD - l.RoutedUSD }
+
+// RungProjection is one model's share of a stage's expected calls.
+type RungProjection struct {
+	Model string
+	// FlatCalls and RoutedCalls are expected call counts, fractional because
+	// they are expectations over the stage's records rather than counts of
+	// them.
+	FlatCalls, RoutedCalls float64
 }
 
 // Projection is what a pipeline is expected to cost and how long it can least
@@ -276,6 +322,7 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 		cfg:     cfg,
 		values:  values,
 		ratio:   cfg.ExpectedOutput,
+		router:  explainRouter(cfg),
 		recs:    map[string][]core.Record{},
 		tainted: map[string]bool{},
 	}
@@ -354,6 +401,11 @@ type explainer struct {
 	cfg    Config
 	values map[string]any // broadcast name → value as a task would read it
 	ratio  float64
+	// router holds the calibration a projection prices escalations from, or
+	// nil when there is none to read. It is the same estimator the scheduler
+	// would use, so a projection and the run it describes reach for the same
+	// numbers rather than two implementations of the same idea.
+	router *route.Adaptive
 	recs   map[string][]core.Record
 	// tainted marks stages whose output records have a shape the plan could
 	// not know — a ParseJSON stage with no sample — so every stage downstream
@@ -592,6 +644,7 @@ func (e *explainer) iterate(sp *plan.StagePlan, input []core.Record, out *StageP
 	}
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	e.ladder(sp, out, prompts, shared, expected)
 	// The vertices the stage leaves behind, standing in for downstream stages.
 	// A stage that grows its graph leaves more than this, and the warning
 	// above says so.
@@ -699,6 +752,7 @@ func (e *explainer) infer(sp *plan.StagePlan, input []core.Record, out *StagePro
 	prompts := e.renderPrompts(s.ID, spec.Prompt, input, sp.Broadcasts)
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	e.ladder(sp, out, prompts, shared, expected)
 	e.recs[s.ID] = e.inferOutputs(s.ID, spec, input, expected)
 }
 
@@ -766,6 +820,7 @@ func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StagePr
 	out.CachePrefix = out.Tasks > 1 && !s.Opts.NoPrefixCache && !spec.Binding.IsZero()
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
+	e.ladder(sp, out, prompts, shared, expected)
 	e.recs[s.ID] = cur
 }
 
@@ -810,6 +865,65 @@ func admissionFloor(info model.Info, calls, tokens int) time.Duration {
 	floor = max(floor, per(calls, info.Limits.RequestsPerMinute))
 	floor = max(floor, per(tokens, info.Limits.TokensPerMinute))
 	return floor
+}
+
+// explainRouter builds the estimator a projection prices escalations with, or
+// returns nil when the run being described has no router.
+//
+// It reads the profile the run would read, from the state directory the run
+// would read it from — so `Explain` and `Run` given the same options describe
+// the same thing. A caller who supplied their own Router with WithRouter gets
+// no ladder projection: Loom cannot price a policy it did not write.
+func explainRouter(cfg Config) *route.Adaptive {
+	if cfg.Routing == nil {
+		return nil
+	}
+	c := *cfg.Routing
+	if c.Profile == nil && cfg.StateDir != "" {
+		c.Profile, _ = route.LoadProfile(cfg.StateDir)
+	}
+	if c.Profile == nil {
+		return nil
+	}
+	return route.New(c)
+}
+
+// ladder prices a stage's escalation ladder from the profile, scaling the
+// router's per-record forecast by the calls this stage will make.
+//
+// It is skipped for a stage with one rung — there is no ladder to price — and
+// for a stage the profile has never seen, where the honest projection is the
+// one already in the columns above.
+func (e *explainer) ladder(sp *plan.StagePlan, out *StageProjection, prompts []int, shared, expected int) {
+	if e.router == nil || len(sp.Candidates) < 2 || out.Calls == 0 {
+		return
+	}
+	// One representative call's shape: the shared head plus the mean rendered
+	// record. A forecast compares rungs, so the mean is enough — a per-record
+	// walk would price the same ladder to the same conclusion with more
+	// arithmetic.
+	in := shared
+	if len(prompts) > 0 {
+		var sum int
+		for _, p := range prompts {
+			sum += p
+		}
+		in += sum / len(prompts)
+	}
+	f := e.router.Forecast(sp.Stage.ID, route.PriceLadder(sp.Candidates, in, expected))
+	if f.Samples == 0 {
+		return
+	}
+	n := float64(out.Calls)
+	lp := &LadderProjection{
+		FlatUSD: n * f.FlatUSD, RoutedUSD: n * f.RoutedUSD,
+		Samples: f.Samples, Buckets: f.Buckets,
+	}
+	for _, r := range f.Rungs {
+		lp.Rungs = append(lp.Rungs, RungProjection{
+			Model: r.Model, FlatCalls: n * r.FlatCalls, RoutedCalls: n * r.RoutedCalls})
+	}
+	out.Ladder = lp
 }
 
 // renderPrefix renders a stage's shared prompt head the way ops.sharedPrefix
@@ -986,6 +1100,32 @@ func (p *Projection) String() string {
 	} else {
 		fmt.Fprintf(&b, "expected %d tokens for $%.4f; cannot exceed %d tokens / $%.4f before retries\n",
 			exp.TotalTokens(), exp.CostUSD, ceil.TotalTokens(), ceil.CostUSD)
+	}
+	// The escalations, which no column above prices. A stage with a ladder is
+	// under-projected by exactly this, and reporting it beside the flat total
+	// is the difference between a budget that covers the run and one that
+	// stops it two thirds of the way through.
+	for _, s := range p.Stages {
+		l := s.Ladder
+		if l == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s ladder (%d verdicts over %d bucket(s)): flat $%.4f",
+			s.Stage, l.Samples, l.Buckets, l.FlatUSD)
+		if saved := l.Saved(); saved > 1e-9 {
+			fmt.Fprintf(&b, " → routed $%.4f, saving $%.4f (%.0f%%)",
+				l.RoutedUSD, saved, 100*saved/l.FlatUSD)
+		} else {
+			b.WriteString(", which routing does not improve on yet")
+		}
+		b.WriteString("\n  ")
+		for i, r := range l.Rungs {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%s %.0f→%.0f calls", r.Model, r.FlatCalls, r.RoutedCalls)
+		}
+		b.WriteString("\n")
 	}
 	if p.Budget.MaxCostUSD > 0 || p.Budget.MaxTokens > 0 {
 		verdict := "covers the ceiling"

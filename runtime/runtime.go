@@ -19,6 +19,7 @@ import (
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
+	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/task"
 )
 
@@ -255,6 +256,14 @@ type Scheduler struct {
 	Exec            executor.Executor
 	Bus             *observe.Bus
 	ContinueOnError bool
+	// Router chooses where on the escalation ladder a task starts, turning the
+	// ladder from a recovery path into a policy. Nil — the default — starts
+	// every task at the bottom, which is the behaviour the ladder has always
+	// had. It changes the starting rung and nothing else: validation still
+	// runs, escalation still climbs, and the top of the ladder is still the
+	// ceiling, so a router that guesses wrong costs a call rather than an
+	// answer.
+	Router route.Router
 }
 
 // ExecuteAll runs all tasks. Results are returned in input (Seq) order.
@@ -361,15 +370,23 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		maxAttempts = t.Envelope.Budget.MaxAttempts
 	}
 
-	var candidates int
+	var ladder []model.Info
 	if !t.Envelope.Binding.IsZero() && s.Registry != nil {
 		if c, err := s.Registry.Candidates(t.Envelope.Binding); err == nil {
-			candidates = len(c)
+			ladder = c
 		}
 	}
+	candidates := len(ladder)
 
 	attempt := 1
-	escalation := 0
+	// Where this task enters the ladder. Zero — the bottom — unless a router
+	// has evidence that the bottom rung would only charge for a call this
+	// input was going to fail.
+	escalation, routing := s.route(t, ladder, worker)
+	// Whether a verdict has been reported for this task yet. The first one is
+	// at the rung it entered on, which is what tells a profile how many
+	// records a bucket holds — see route.Outcome.Start.
+	var observed bool
 	for {
 		t.Attempt = attempt
 		t.Escalation = escalation
@@ -415,6 +432,14 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		res, err := s.Exec.Execute(ctx, t)
 		release()
 		if err == nil {
+			// A verdict, but only if a model produced it. A cache hit is a
+			// replay of work some earlier task paid for at some other rung;
+			// counting it as this rung succeeding would teach the router that
+			// the cheap model handles everything the cache already holds.
+			if !res.CacheHit {
+				routing.observe(t, escalation, true, !observed)
+				observed = true
+			}
 			if s.Governor != nil && res.Usage.Requests > 0 {
 				if cerr := s.Governor.Charge(res.Usage); cerr != nil {
 					// The result stands; the governor aborts *future* work.
@@ -426,6 +451,7 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			s.publish(observe.Event{Type: observe.TaskCompleted, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt, Model: res.Model,
 				Usage: res.Usage, Latency: res.Latency, Pane: t.Pane,
+				Rung: escalation, Probe: routing.decision.Probe && !res.CacheHit,
 				Output: recordsJSON(res.Output), OutIDs: recordIDs(res.Output)})
 			return res, attempt, nil
 		}
@@ -435,11 +461,20 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		}
 
 		class := core.ClassOf(err)
+		// The output was produced and rejected: the one failure class that is
+		// evidence about the model rather than about the network or the code.
+		// It is recorded whether or not the task has attempts left, because a
+		// task that runs out of retries still learned something true about
+		// this rung.
+		if class == core.FailSemantic {
+			routing.observe(t, escalation, false, !observed)
+			observed = true
+		}
 		retryable := class == core.FailTransient || class == core.FailSemantic
 		if !retryable || attempt >= maxAttempts {
 			s.publish(observe.Event{Type: observe.TaskFailed, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID, Worker: worker, Attempt: attempt,
-				Pane: t.Pane, Err: err.Error()})
+				Rung: escalation, Pane: t.Pane, Err: err.Error()})
 			return task.Result{}, attempt, err
 		}
 
@@ -458,6 +493,78 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		}
 		attempt++
 	}
+}
+
+// route asks the router where this task should enter its ladder, and reports
+// the rung and the feature bucket the decision was made in.
+//
+// A ladder with fewer than two rungs has nothing to decide, and a task with no
+// binding calls no model at all; both skip the router entirely rather than ask
+// it a question with one answer.
+func (s *Scheduler) route(t task.Task, ladder []model.Info, worker string) (int, routing) {
+	if s.Router == nil || len(ladder) < 2 {
+		return 0, routing{}
+	}
+	// EstTokens is the planner's admission-control estimate, which reserves the
+	// *maximum* output a call may produce. That makes it far larger than a
+	// typical call and useless as an absolute price — but a router compares
+	// rungs, and inflating every rung by the same factor leaves the comparison
+	// where it was. Anything reported in dollars is measured from calls that
+	// actually happened rather than from this.
+	in, out := route.SplitTokens(t.EstTokens)
+	d := s.Router.Route(route.Request{
+		Stage:     t.Stage,
+		Key:       t.ID,
+		Rungs:     route.PriceLadder(ladder, in, out),
+		Records:   t.Input,
+		EstTokens: t.EstTokens,
+	})
+	rung := d.Rung
+	if rung < 0 {
+		rung = 0
+	}
+	if rung >= len(ladder) {
+		rung = len(ladder) - 1
+	}
+	// Only a decision that changed something is worth an event. A router that
+	// leaves every task where it was would otherwise double the event volume
+	// of a run to say nothing happened.
+	if rung > 0 || d.Probe {
+		skipped := make([]string, 0, rung)
+		for i := 0; i < rung; i++ {
+			skipped = append(skipped, ladder[i].ID)
+		}
+		s.publish(observe.Event{Type: observe.TaskRouted, RunID: t.Envelope.RunID,
+			Stage: t.Stage, TaskID: t.ID, Worker: worker, Model: ladder[rung].ID,
+			Rung: rung, Probe: d.Probe, Bucket: d.Bucket, Skipped: skipped,
+			Note: d.Reason})
+	}
+	d.Rung = rung
+	return rung, routing{router: s.Router, decision: d}
+}
+
+// routing is a task's live relationship with the router: the decision that was
+// made about it, and the router to report back to.
+//
+// Its zero value is a task the router was never asked about — a stage with no
+// ladder, or a scheduler with no router — and it swallows verdicts rather than
+// recording them. That matters more than it looks: a one-rung stage that fed
+// the profile would be recording evidence about a choice nobody made, and a
+// later edit adding an escalation to that stage would read it as though
+// somebody had.
+type routing struct {
+	router   route.Router
+	decision route.Decision
+}
+
+// observe feeds one verdict back to the router that asked for it. start marks
+// the task's first verdict, at the rung it entered the ladder on.
+func (r routing) observe(t task.Task, rung int, valid, start bool) {
+	if r.router == nil {
+		return
+	}
+	r.router.Observe(route.Outcome{Stage: t.Stage, Bucket: r.decision.Bucket,
+		Rung: rung, Valid: valid, Start: start, Probe: r.decision.Probe})
 }
 
 func (s *Scheduler) publish(e observe.Event) {

@@ -26,6 +26,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
@@ -64,8 +65,14 @@ type Config struct {
 	// Affinity is how long the queue holds a task carrying a continuation back
 	// from workers that do not hold its state (zero: no waiting, pure
 	// preference). It applies only to a run on a fleet.
-	Affinity     time.Duration
-	Topics       map[string]bool
+	Affinity time.Duration
+	Topics   map[string]bool
+	// Routing turns on adaptive model routing and configures it; Router
+	// overrides the router entirely. Both nil — the default — starts every
+	// task at the bottom of its stage's escalation ladder, which is what the
+	// ladder has always done.
+	Routing      *route.Config
+	Router       route.Router
 	Findings     *findings.Config
 	EventHandler func(observe.Event)
 	Streaming    bool
@@ -368,6 +375,68 @@ func WithFindings(cfg findings.Config) Option {
 	return func(c *Config) { c.Findings = &cfg }
 }
 
+// WithRouting turns the escalation ladder from a recovery path into a policy:
+// tasks start on the rung the router expects to answer them, rather than
+// always at the bottom.
+//
+// The saving it goes after is the call that was always going to fail. A stage
+// bound to a fast model with a stronger one behind it pays for a fast call on
+// every record, and every record the fast model cannot handle pays for that
+// call *and* the one that answers. Nothing recovers that first call — a failed
+// call leaves no result to cache — so at a 40% escalation rate the stage
+// spends 1.4 cheap calls per record to buy 1.0 answers.
+//
+// Nothing has to be trained or labelled for this, because the labels already
+// exist: an InferSpec's Validate function is an oracle that runs on every
+// record and says exactly whether the model that ran was strong enough. Loom
+// throws those verdicts away today. A router keeps them, and the third time it
+// sees a bucket of records the fast model cannot handle, it stops paying to
+// find out again.
+//
+// Three properties make it safe to leave on:
+//
+//   - It chooses a *starting* rung and nothing else. Validation still runs and
+//     escalation still climbs, so a record routed too low costs the failed call
+//     a flat ladder would have paid anyway, and one routed too high costs the
+//     price difference. Neither can produce output that would not have passed
+//     the same Validate — the router can cost you work, never an answer.
+//   - Starting at rung k walks rungs k..n, a subset of the 0..n a flat ladder
+//     walks, so routing can never exceed the ceiling loom.Explain reported or
+//     the budget set on the strength of it.
+//   - With no evidence it starts every task at the bottom, so switching it on
+//     can begin to save and cannot begin to cost.
+//
+// Given a state directory, the calibration outlives the run: what one run pays
+// to learn, the next one starts with. On a fleet the router is shared, like
+// the cache and the rate limiter, so what one agent learns about a stage
+// routes the next agent's records.
+//
+// The default featurizer buckets records by size, which is a coarse proxy for
+// difficulty. A pipeline that knows better should say so — route.ByField("tier")
+// over a field that predicts difficulty is worth more than any amount of
+// tuning elsewhere in the config.
+//
+// See package route and docs/ROUTING.md.
+func WithRouting(cfg ...route.Config) Option {
+	c := route.Config{}
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	return func(o *Config) { o.Routing = &c }
+}
+
+// WithRouter installs a specific router, for a caller who wants a policy
+// rather than a learner: a hand-written rule that reads a field, a model
+// trained elsewhere, or route.Off to keep the flat ladder while leaving the
+// option in place.
+//
+// It takes precedence over WithRouting. A router supplied this way is used as
+// given: nothing seeds it from the state directory and nothing persists what
+// it learns, because Loom does not know what it holds.
+func WithRouter(r route.Router) Option {
+	return func(c *Config) { c.Router = r }
+}
+
 // WithFleetBudget caps what a whole fleet may spend, across every agent on it.
 //
 // It is WithRunBudget under the name that says what it means on a fleet: the
@@ -523,7 +592,13 @@ type RunResult struct {
 	// per-agent owner — so a single Run's are its own only because a run is a
 	// fleet of one.
 	Findings findings.Stats
-	Spent    core.Usage
+	// Routing reports what the model router did: how many tasks it started
+	// above the bottom rung, how many it held back as probes, and how many of
+	// those probes the bottom rung answered after all. Zero when no router was
+	// configured. The per-stage detail, including what the skipped calls would
+	// have cost, is on Report.
+	Routing route.Stats
+	Spent   core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.

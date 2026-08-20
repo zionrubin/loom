@@ -464,6 +464,78 @@ each stage's live cost against it — the projection deliberately survives
 `run.started`, because it describes the pipeline and the run that follows is
 the thing it predicted.
 
+### 4.13 Routing (`route`)
+
+The escalation ladder in §4.4 is a *recovery* mechanism, and recovery is by
+definition reactive: every record enters at the bottom rung, so every record
+the cheap model cannot handle pays for the call that was always going to fail
+before paying for the one that answers. That first call is unrecoverable by
+anything else in this document — a failed call produces no result, so there is
+nothing to cache, and it asks nothing about the world, so the commons cannot
+serve it. The only way not to pay for it is not to make it.
+
+Turning the ladder into a *policy* is a supervised problem, and the reason it
+is tractable here is that the labels already exist and were being discarded.
+`InferSpec.Validate` is an oracle: written by the user, already run on every
+record, and already answering exactly the question — was the model that ran
+strong enough? A semantic failure is a labelled negative, a success a labelled
+positive. `route` keeps them.
+
+`runtime.Scheduler` consults a `route.Router` once per task, before the first
+attempt, and reports every semantic verdict back. The default `route.Adaptive`
+holds a Beta posterior per (stage, feature bucket, rung) and picks the rung
+minimising the expected cost of *reaching* a valid answer, by backward
+induction over the ladder:
+
+```
+E[last] = price(last)
+E[i]    = price(i) + (1 − p̂(i)) · E[i+1]
+```
+
+That objective is the design's one non-obvious choice, and it is not "route to
+the model most likely to succeed". A rung that fails 70% of the time is still
+the right place to start when the rung above costs a thousand times more; a
+rung that usually works is the wrong place to start when skipping it saves
+almost nothing. Only expected cost distinguishes the two.
+
+The containment story is what makes it safe to leave on. A router picks a
+**starting rung** and nothing else — validation still runs, escalation still
+climbs — so:
+
+- a wrong guess costs a call and never an answer, the same guarantee shape as
+  the delta certificate (§4.7);
+- rungs *k..n* are a subset of *0..n*, so a routed run cannot exceed the
+  ceiling `loom.Explain` already reported, and a budget set on that ceiling
+  still holds;
+- with no evidence the router returns rung 0, so a cold run is byte-for-byte
+  the run Loom does without one.
+
+Decisions are deterministic — a pure function of the profile and the request
+key, reading no clock and no global random source — so two workers holding one
+profile agree and a regenerated report says the same thing. Exploration
+therefore cannot live in the decision rule, and lives in a **probe** instead: a
+deterministic slice of would-be-routed tasks held at the bottom rung anyway.
+This is the part that is easy to leave out and shouldn't be. Once a bucket is
+routed upward the bottom rung stops being sampled, and the estimate that sent
+it there can never be contradicted — a system that quietly congratulates
+itself. The probes are the only evidence that ever contradicts a skip, which is
+what makes the reported saving a measurement rather than an assertion, and the
+run report prints the two together always.
+
+A `route.Profile` is plain serializable data, appended to the state directory
+beside the result cache and summed rather than overwritten, so several
+processes calibrating one pipeline compose. The router sits on the host beside
+the cache and the rate limiter, for the reason those do: what a stage's records
+cost to get right is a property of the work rather than of the pipeline that
+discovered it, so every agent on a fleet shares one.
+
+`loom.Explain` reads the same profile through the same estimator, which gives a
+projection the number it could not previously compute at all — its columns
+price one call per record at the *base* model, so a stage with a ladder was
+under-projected by exactly the escalations. Sharing `route.Adaptive` rather
+than reimplementing the arithmetic is what stops the forecast and the
+scheduler drifting into disagreement. [ROUTING.md](./ROUTING.md).
+
 ## 5. Failure taxonomy (summary)
 
 | Class | Detected by | Recovery |
@@ -528,11 +600,18 @@ global pool of execution slots, moving each record downstream as its own task
 completes rather than at a stage barrier (see
 [INFERENCE.md](./INFERENCE.md#asynchronous-agents-continuous-batching)). The
 barrier driver remains the default because streaming trades input ordering
-for occupancy. Still open in this phase: speculative re-execution of
-stragglers — now worth adding, since a straggler delays only its own record —
-and cost-based model routing (route records to cheaper models and escalate
-only the hard ones, the escalation ladder generalized from recovery to
-policy).
+for occupancy. Cost-based model routing — the escalation ladder generalized from recovery to
+policy — is **implemented**, and landed one step further than this line
+proposed. The obstacle it names, "route records to cheaper models and escalate
+only the hard ones", is a supervised problem with no obvious labels; what makes
+it tractable is that Loom already has the labels and was discarding them.
+`InferSpec.Validate` runs on every record and says whether the model that ran
+was strong enough, so a router needs no training set, only the verdicts a
+validated stage already produces. `route.Adaptive` (§4.13) keeps them, and
+picks the rung minimising the expected cost of *reaching* a valid answer rather
+than the rung most likely to succeed — which is a different and cheaper
+objective. Still open in this phase: speculative re-execution of stragglers —
+now worth adding, since a straggler delays only its own record.
 
 **Phase 5 — iteration (implemented).** The dimension the DAG could not express
 at all: a stage looking at its own output and deciding to run again. Deep
@@ -601,7 +680,12 @@ asynchronous stages, event-time windowing with keyed and sliding assigners and
 count/interval triggers, pane-delimited aggregates, sinks with pane-stable
 batch identity, quiesce checkpointing tying window state to source positions and
 sink commits, restart-and-resume, and file and Kafka sources and sinks — see
-[STREAMING.md](./STREAMING.md)), and the remote executor fleet
+[STREAMING.md](./STREAMING.md)), cost-based model routing (`route`: an online per-bucket, per-rung estimate over
+the validator's own verdicts, expected-cost selection of a starting rung, a
+deterministic probe holdout that keeps the saving measurable, calibration
+persisted across runs and shared across a fleet, and a ladder projection in
+`loom.Explain` computed by the same estimator the scheduler routes with),
+and the remote executor fleet
 (`worker`: a durable queue with leases, heartbeats, expiry and fencing tokens;
 capability-advertising workers; CAS-referenced inputs and outputs; idempotent
 result commit; two queue backends behind one conformance suite; and failure

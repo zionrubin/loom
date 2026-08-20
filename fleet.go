@@ -22,6 +22,7 @@ import (
 	"github.com/zionrubin/loom/ops"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
@@ -725,6 +726,17 @@ type host struct {
 	// keeps local execution the default: distribution is an adapter installed
 	// at provisioning, not a mode the scheduler knows about.
 	remote *worker.Client
+	// router decides where on its ladder each task starts, and learner is the
+	// same object when Loom built it — the one whose calibration is worth
+	// persisting. A router supplied by the caller sets router alone.
+	//
+	// It sits on the host beside the cache and the limiter because it is the
+	// same kind of thing: what a stage's records cost to get right is a
+	// property of the work, not of the pipeline that happened to discover it.
+	// Every agent on this host shares one, so what the first agent pays to
+	// learn about a stage routes the records of the agents that follow.
+	router  route.Router
+	learner *route.Adaptive
 	// state materializes the evolving contexts task envelopes reference, and
 	// keeps what it has rendered so the next revision costs the change rather
 	// than the context.
@@ -811,6 +823,9 @@ func newHost(cfg Config) (*host, error) {
 	}
 	h.cas, h.cache = cas, cache
 	h.shared = store.NewBroadcasts(cas)
+	if err := h.initRouter(); err != nil {
+		return nil, err
+	}
 	h.state, err = delta.NewStore(cas, delta.Options{
 		Renderer: cfg.DeltaRenderer, Policy: cfg.DeltaPolicy,
 		MaxBytes: cfg.DeltaBytes, Bus: h.bus,
@@ -992,6 +1007,59 @@ func (h *host) closeMCP() error {
 	return h.mcp.Close()
 }
 
+// initRouter provisions the host's model router.
+//
+// A router supplied with WithRouter is installed as given and nothing is
+// seeded into it or read out of it: Loom does not know what a caller's policy
+// holds, and guessing would be worse than leaving it alone. A router Loom
+// builds is seeded from the state directory, so a pipeline run twice starts
+// the second run knowing what the first one paid to find out.
+//
+// A profile that cannot be read is not an error. It is a cache of decisions,
+// and the worst a lost one costs is a run that learns again from the bottom
+// rung — which is the behaviour of every run today. Failing to start over it
+// would trade a large failure for a small saving, and the case is close to
+// unreachable anyway: the result cache lives in the same directory and was
+// opened a few lines above, so a state directory this cannot read is one the
+// run has already failed on.
+func (h *host) initRouter() error {
+	switch {
+	case h.cfg.Router != nil:
+		h.router = h.cfg.Router
+		return nil
+	case h.cfg.Routing == nil:
+		return nil
+	}
+	cfg := *h.cfg.Routing
+	if cfg.Profile == nil && h.cfg.StateDir != "" {
+		prof, _ := route.LoadProfile(h.cfg.StateDir)
+		cfg.Profile = prof
+	}
+	h.learner = route.New(cfg)
+	h.router = h.learner
+	return nil
+}
+
+// saveRouting appends what this host learned to the state directory, as a
+// contribution rather than a total — see route.SaveProfile.
+func (h *host) saveRouting() error {
+	if h.learner == nil || h.cfg.StateDir == "" {
+		return nil
+	}
+	return route.SaveProfile(h.cfg.StateDir, h.learner.Learned())
+}
+
+// routingStats reports what the router did, or the zero value when none was
+// configured. Like the findings stats it is host-wide: a router calibrated by
+// one agent routes the next one's records, so the learning has no per-agent
+// owner.
+func (h *host) routingStats() route.Stats {
+	if h.learner == nil {
+		return route.Stats{}
+	}
+	return h.learner.Stats()
+}
+
 // findingsStats reports what the shared research layer did, or the zero value
 // when none was configured.
 //
@@ -1025,7 +1093,7 @@ func (h *host) close() error {
 		// happened, and a retraction that cannot find them under-reports.
 		shared = h.commons.Close()
 	}
-	err := errors.Join(h.closeMCP(), h.cache.Close(), ledger, shared)
+	err := errors.Join(h.closeMCP(), h.cache.Close(), ledger, shared, h.saveRouting())
 	h.bus.Close()
 	return err
 }
@@ -1104,7 +1172,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	sched := runtime.Scheduler{
 		Workers: cfg.Workers, Retry: cfg.Retry, Limiter: h.limiter,
 		Governor: h.gov, Registry: cfg.Registry, Exec: exec, Bus: h.bus,
-		ContinueOnError: cfg.ContinueOnError,
+		ContinueOnError: cfg.ContinueOnError, Router: h.router,
 	}
 
 	driverName := "barrier"
@@ -1168,6 +1236,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		Broadcasts:   snapshot,
 		MCP:          h.mcpStats(),
 		Findings:     h.findingsStats(),
+		Routing:      h.routingStats(),
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {

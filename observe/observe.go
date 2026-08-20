@@ -110,6 +110,22 @@ const (
 	// reason is the only thing that distinguishes them.
 	StageConverged EventType = "stage.converged"
 
+	// TaskRouted reports a task entering its stage's escalation ladder above
+	// the bottom rung, or being deliberately held at the bottom as a probe.
+	//
+	// It is published only when the router changed something. A decision to
+	// leave a task where it would have started anyway is the default, and an
+	// event per task saying the default happened would double a run's event
+	// volume to say nothing.
+	//
+	// Rung is where the task started and Bucket the feature class the decision
+	// was made in; Saved prices the calls the skipped rungs did not make, and
+	// Note carries the router's reason. Probe marks the held-back tasks whose
+	// verdicts are the only evidence that ever contradicts the estimate doing
+	// the skipping — so a viewer can show what the measurement cost beside
+	// what the routing saved.
+	TaskRouted EventType = "task.routed"
+
 	// DeltaSpliced is a context materialized from state this process already
 	// held, plus the change: Retained bytes were reused under a certificate and
 	// Repaired bytes re-rendered.
@@ -235,6 +251,23 @@ type Event struct {
 	Messages int           `json:"messages,omitempty"`
 	Usage    core.Usage    `json:"usage,omitempty"`
 	Latency  time.Duration `json:"latency,omitempty"`
+	// Rung is where a task entered its escalation ladder and Bucket the
+	// feature class the router decided in (task.routed). Probe marks a task
+	// held at the bottom rung against the router's own estimate, to keep that
+	// estimate honest. Skipped names the models whose calls the start above
+	// the bottom did not make.
+	//
+	// Skipped carries model names rather than a dollar figure deliberately.
+	// The scheduler holds only the planner's admission-control estimate, which
+	// reserves each call's *maximum* output and so overstates a real call
+	// several times over; pricing a saving from it would put a number in the
+	// report that the run's own totals contradict. A consumer prices these
+	// against the calls that actually ran on those models — which is what
+	// Collector does.
+	Rung    int      `json:"rung,omitempty"`
+	Bucket  string   `json:"bucket,omitempty"`
+	Probe   bool     `json:"probe,omitempty"`
+	Skipped []string `json:"skipped,omitempty"`
 	// Saved is what this model call's prompt-prefix cache activity was worth
 	// in dollars against paying the full input rate (model.called). Negative
 	// while a freshly written entry is still unamortized.
@@ -370,6 +403,24 @@ type StageStats struct {
 	Splices       int
 	Rebuilds      int
 	RetainedBytes int64
+	// Routed counts this stage's tasks that entered the escalation ladder
+	// above its bottom rung, and RungsSkipped the calls those starts did not
+	// make. SkippedUSD prices those calls at the models they would have run
+	// on: the *gross* saving.
+	//
+	// Probes and ProbeHits are the correction, and the reason the gross figure
+	// is reported rather than a net one. A probe is a task the router wanted to
+	// move and started at the bottom anyway; a probe hit is one the bottom rung
+	// then answered — a skip that would have been wrong. Read together they say
+	// what the routing saved and how often it was mistaken, which is the whole
+	// claim. Reported separately rather than folded into one number because
+	// the correction rests on a sample and the gross figure does not, and a
+	// single net dollar amount would hide which half is which.
+	Routed       int
+	RungsSkipped int
+	SkippedUSD   float64
+	Probes       int
+	ProbeHits    int
 	// ToolCalls counts MCP tool calls the stage's tasks made, and ToolTime the
 	// wall-clock they took. They buy nothing in tokens and can dominate a
 	// stage's duration, so a report that only totalled cost would explain a
@@ -380,6 +431,18 @@ type StageStats struct {
 	Finished  time.Time
 
 	latencies []time.Duration
+	// byModel is what a call on each model actually cost this stage, and
+	// skipped how many calls the router did not make on each. SkippedUSD is
+	// the product of the two, computed at report time because a skip is
+	// recorded before the calls that establish what one would have cost.
+	byModel map[string]modelCost
+	skipped map[string]int
+}
+
+// modelCost is one model's measured call cost within a stage.
+type modelCost struct {
+	calls   int
+	costUSD float64
 }
 
 // Duration is wall time from stage start to finish.
@@ -444,6 +507,21 @@ func (r RunReport) ToolCalls() (int, time.Duration) {
 	return calls, dur
 }
 
+// Routing sums what the router did across the run: tasks started above the
+// bottom rung, the calls those starts skipped, what those calls would have
+// cost, and the probes — with their hit count — that measure how often the
+// skip was wrong.
+func (r RunReport) Routing() (routed, skipped int, savedUSD float64, probes, hits int) {
+	for _, s := range r.Stages {
+		routed += s.Routed
+		skipped += s.RungsSkipped
+		savedUSD += s.SkippedUSD
+		probes += s.Probes
+		hits += s.ProbeHits
+	}
+	return
+}
+
 // Duration is total run wall time.
 func (r RunReport) Duration() time.Duration {
 	if r.Started.IsZero() || r.Finished.IsZero() {
@@ -485,6 +563,22 @@ func (r RunReport) String() string {
 		fmt.Fprintf(&b, "mcp: %d tool call(s), %s spent in them (no tokens, no cost)\n",
 			calls, dur.Round(time.Millisecond))
 	}
+	// The gross saving and its correction on one line, never the first
+	// without the second. "Skipped 412 calls" is a claim about calls that were
+	// never made; the probes are the only thing that turns it into a
+	// measurement, so they are not an optional detail to be reported
+	// elsewhere.
+	if routed, skipped, saved, probes, hits := r.Routing(); routed > 0 || probes > 0 {
+		fmt.Fprintf(&b, "routing: %d task(s) started above the bottom rung, skipping %d call(s) worth $%.4f",
+			routed, skipped, saved)
+		switch {
+		case probes == 0:
+			b.WriteString("; no probes yet, so that saving is an estimate\n")
+		default:
+			fmt.Fprintf(&b, "; %d probe(s) held back, %d answered at the bottom (%.0f%% of skips would have been wrong)\n",
+				probes, hits, 100*float64(hits)/float64(probes))
+		}
+	}
 	return b.String()
 }
 
@@ -503,10 +597,31 @@ func NewCollector() *Collector {
 	return &Collector{stages: map[string]*StageStats{}}
 }
 
+// priceSkips fills SkippedUSD from what calls on the skipped models actually
+// cost this stage.
+//
+// Measured rather than estimated, and the distinction is the whole point of
+// reporting it: this feature's claim is about money, so a number derived from
+// the planner's max-output reservation — several times a real call — would be
+// a claim the run's own cost column contradicts. A model that was skipped
+// every time and therefore never ran contributes nothing, which is honest:
+// nothing here knows what a call that never happened would have cost.
+func (s *StageStats) priceSkips() {
+	s.SkippedUSD = 0
+	for id, n := range s.skipped {
+		m, ok := s.byModel[id]
+		if !ok || m.calls == 0 {
+			continue
+		}
+		s.SkippedUSD += float64(n) * m.costUSD / float64(m.calls)
+	}
+}
+
 func (c *Collector) stage(name string) *StageStats {
 	s, ok := c.stages[name]
 	if !ok {
-		s = &StageStats{Stage: name}
+		s = &StageStats{Stage: name,
+			byModel: map[string]modelCost{}, skipped: map[string]int{}}
 		c.stages[name] = s
 		c.order = append(c.order, name)
 	}
@@ -532,7 +647,22 @@ func (c *Collector) Handle(e Event) {
 			c.stage(e.Stage).Tasks++
 		}
 	case TaskCompleted:
-		c.stage(e.Stage).Completed++
+		st := c.stage(e.Stage)
+		st.Completed++
+		if e.Probe && e.Rung == 0 {
+			st.ProbeHits++
+		}
+	case TaskRouted:
+		st := c.stage(e.Stage)
+		if e.Probe {
+			st.Probes++
+			break
+		}
+		st.Routed++
+		st.RungsSkipped += len(e.Skipped)
+		for _, id := range e.Skipped {
+			st.skipped[id]++
+		}
 	case TaskFailed:
 		c.stage(e.Stage).Failed++
 	case TaskRetried:
@@ -557,6 +687,12 @@ func (c *Collector) Handle(e Event) {
 		s.Usage.Add(e.Usage)
 		s.PrefixSavedUSD += e.Saved
 		s.latencies = append(s.latencies, e.Latency)
+		if e.Model != "" {
+			m := s.byModel[e.Model]
+			m.calls++
+			m.costUSD += e.Usage.CostUSD
+			s.byModel[e.Model] = m
+		}
 	}
 }
 
@@ -569,6 +705,7 @@ func (c *Collector) Report() RunReport {
 		s := c.stages[name]
 		cp := *s
 		cp.latencies = append([]time.Duration(nil), s.latencies...)
+		cp.priceSkips()
 		rep.Stages = append(rep.Stages, &cp)
 	}
 	return rep

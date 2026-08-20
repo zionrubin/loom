@@ -382,7 +382,7 @@ func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Confi
 	sched := runtime.Scheduler{
 		Workers: cfg.Workers, Retry: cfg.Retry, Limiter: h.limiter,
 		Governor: h.gov, Registry: cfg.Registry, Exec: exec, Bus: h.bus,
-		ContinueOnError: cfg.ContinueOnError,
+		ContinueOnError: cfg.ContinueOnError, Router: h.router,
 	}
 
 	store, err := checkpointStore(cfg)
