@@ -290,3 +290,39 @@ func (alwaysTop) Route(r route.Request) route.Decision {
 	return route.Decision{Rung: len(r.Rungs) - 1, Reason: "policy: always the strongest model"}
 }
 func (alwaysTop) Observe(route.Outcome) {}
+
+// TestRoutingDoesNotDisturbTheCache: a task's cache key is its op fingerprint
+// and its input, and the rung it ran on is no part of either. So a routed run
+// must replay a flat run's results, and vice versa — routing is a decision
+// about how to produce an answer, not about what the answer is.
+//
+// This is worth a test rather than an argument because it would be easy to
+// break: folding the resolved model into the key would look like a
+// correctness improvement and would in fact halve the cache's hit rate on
+// every stage with a ladder.
+func TestRoutingDoesNotDisturbTheCache(t *testing.T) {
+	dir := t.TempDir()
+
+	flat := runRouted(t, 40, loom.WithStateDir(dir))
+	if flat.Report.Totals().Requests == 0 {
+		t.Fatal("first run made no calls")
+	}
+
+	// The same pipeline again, routed, against the cache the flat run wrote.
+	replay := runRouted(t, 40, loom.WithStateDir(dir), loom.WithRouting(route.Config{
+		Features: route.ByField("kind"), MinSamples: 5}))
+	if n := replay.Report.Totals().Requests; n != 0 {
+		t.Fatalf("routed replay made %d model calls against a warm cache", n)
+	}
+	for i := range flat.Output {
+		if a, b := flat.Output[i].String("summary"), replay.Output[i].String("summary"); a != b {
+			t.Fatalf("record %d: %q replayed as %q", i, a, b)
+		}
+	}
+	// And a cache hit teaches the router nothing: no model produced it, so it
+	// is not evidence about any rung.
+	if replay.Routing.Observations != 0 {
+		t.Errorf("%d verdicts recorded from a run that made no calls",
+			replay.Routing.Observations)
+	}
+}

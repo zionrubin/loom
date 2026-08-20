@@ -165,6 +165,18 @@ that actually ran on the skipped models. The scheduler holds only the planner's
 and so overstates a real call several times over; pricing a saving from it
 would put a number in the report that the run's own cost column contradicts.
 
+### Routing and the result cache
+
+A task's cache key is its op fingerprint and its input content. The rung it ran
+on is no part of either, so a routed run replays a flat run's results and vice
+versa — routing decides how to produce an answer, not what the answer is.
+
+This is already true of escalation today (a record that escalates caches the
+stronger model's output under the same key), and routing inherits it rather
+than adding a new case. It is worth stating because the obvious "improvement" —
+folding the resolved model into the key — would look like a correctness fix and
+would in fact halve the cache's hit rate on every stage with a ladder.
+
 ## 6. Buckets are the whole game
 
 A bucket is the unit of generalization: records in one bucket are assumed alike
