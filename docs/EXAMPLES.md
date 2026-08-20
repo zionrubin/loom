@@ -10,6 +10,7 @@ to a real provider say so.
 | [`constellation`](../examples/constellation) | The live view, and the projection→run loop | — |
 | [`research`](../examples/research) | The view at scale: ~205 tasks, every visual state | — |
 | [`multi-hop`](../examples/multi-hop) | Iteration: a research question answered by walking a graph | — |
+| [`router`](../examples/router) | Model routing: the same 300 records, 500 calls flat against 326 routed | — |
 | [`newsroom`](../examples/newsroom) | A fleet: six agents, one engine, a blackboard | — |
 | [`game-forge`](../examples/game-forge) | Three runs, one universe — a playable game at the end | — |
 | [`agent-forge`](../examples/agent-forge) | Reads a chat corpus and designs the agents to build | — |

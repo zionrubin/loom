@@ -83,10 +83,10 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty examples ship — fleets, streaming, MCP, local inference, worker
-processes, iteration, the studio — and all but five run offline against a
-deterministic mock provider. [docs/EXAMPLES.md](docs/EXAMPLES.md) is the
-catalog.
+Twenty-one examples ship — fleets, streaming, MCP, local inference, worker
+processes, iteration, routing, the studio — and all but five run offline
+against a deterministic mock provider. [docs/EXAMPLES.md](docs/EXAMPLES.md) is
+the catalog.
 
 ## What you get
 
@@ -110,6 +110,20 @@ catalog.
   counts are exact rather than extrapolated, and every stage reports a
   **ceiling** that rests on no assumption — the number to hand `WithRunBudget`.
   [docs/EXPLAIN.md](docs/EXPLAIN.md)
+- **A ladder that learns — routing, not just recovery** — an escalation ladder
+  is reactive: every record enters at the bottom, so every record the cheap
+  model cannot handle pays for the call that was always going to fail *and* the
+  one that answers, and nothing caches a call that produced no result. But the
+  labels already exist — `Validate` is an oracle that already runs on every
+  record — so `loom.WithRouting()` keeps those verdicts and starts each record
+  on the rung expected to answer it. It picks a *starting* rung and nothing
+  else, so **a wrong guess costs a call and never an answer**, and rungs
+  *k..n* being a subset of *0..n* means it can never exceed the ceiling
+  `Explain` already reported. A deterministic slice of would-be-routed tasks is
+  held at the bottom anyway, because a saving nobody tests is a claim rather
+  than a measurement — the report never prints one without the other. With a
+  state dir the calibration outlives the run.
+  [docs/ROUTING.md](docs/ROUTING.md)
 - **Content-addressed caching = checkpointing** — task results are keyed by op
   fingerprint + input content. Reruns and crash recovery replay completed AI
   work with zero model calls and zero cost, across process restarts with a state
@@ -191,6 +205,7 @@ catalog.
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The full design, component by component, plus the scaling path and design notes |
 | [EXAMPLES.md](docs/EXAMPLES.md) | Every example, what it demonstrates, and how to run it |
 | [EXPLAIN.md](docs/EXPLAIN.md) | Knowing what a run will cost before making a call |
+| [ROUTING.md](docs/ROUTING.md) | The escalation ladder as policy: not paying for the call that was going to fail |
 | [SHARING.md](docs/SHARING.md) | Broadcasts and shared prompt prefixes |
 | [VIZ.md](docs/VIZ.md) | The constellation view and the universe of runs |
 | [ALGORITHMS.md](docs/ALGORITHMS.md) | The algorithm seam: BSP, refine, beam |
@@ -216,6 +231,7 @@ catalog.
 | `executor` | Executor seam, capability-scoped runtime, model client, tools |
 | `ops` | Operation runners (infer, reduce, fused transforms) |
 | `model` | Provider abstraction, registry, tiers, escalation bindings, mock |
+| `route` | Where on a stage's ladder a task starts: an online estimator over the validator's own verdicts, a probe that keeps the saving measurable, and a profile that outlives the run |
 | `mcp` | MCP client: server descriptors, stdio/HTTP transports, the host-owned connection catalog, tool adapters |
 | `mcp/mcptest` | A scriptable in-process MCP server for tests and offline examples |
 | `providers/anthropic` | Official-SDK Anthropic adapter, broker-resolved keys |

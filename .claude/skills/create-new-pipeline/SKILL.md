@@ -67,6 +67,15 @@ ladder is tried only on **semantic** failures — output that failed `ParseJSON`
 or `Validate` — because retrying a bad answer on the same model usually
 reproduces it. Transient failures (429, 5xx, timeout) retry in place instead.
 
+On a stage where a good fraction of records escalate, add
+`loom.WithRouting(route.Config{Features: route.ByField("<field>")})` to the run.
+Each record then starts on the rung expected to answer it instead of always at
+the bottom, so the ladder stops charging for the cheap call that was going to
+fail. It learns from the `Validate` verdicts the stage already produces —
+nothing to train — and it picks a *starting* rung only, so a wrong guess costs
+a call and never an answer. Name a field that predicts difficulty; the default
+featurizer can only guess from size. See `docs/ROUTING.md`.
+
 **4. Put what never varies in `Prefix`, not `Prompt`.** `Prefix` is rendered
 once per task and sent as the same leading bytes on every call, so the
 provider's prompt cache serves it. `Prompt` is rendered per record. Rubrics,
@@ -165,7 +174,13 @@ tests you write are the only check there is.
 - **`ReduceAI` reads `ItemField`** (default `"output"`) from each record, not
   the whole record. Point it at the field you actually want aggregated.
 - **`Validate` failures are semantic**, so they escalate. Use
-  `core.Permanent(err)` from a `Map` when retrying genuinely cannot help.
+  `core.Permanent(err)` from a `Map` when retrying genuinely cannot help. A
+  good `Validate` is worth writing twice over: it is the semantic gate *and*
+  the only training signal `loom.WithRouting` has.
+- **A run's `Spent` excludes failed calls.** The governor is charged from a
+  task's result, and a task whose call failed validation returns none. Report
+  `res.Report.Totals().CostUSD` when you want what the run actually spent, and
+  `res.Spent` when you want what the governor counted against the budget.
 
 ## Reference files
 
