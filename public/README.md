@@ -45,27 +45,33 @@ actually produces. It is a React piece, unlike everything else here.
 
 Three things keep it from taking over the page it sits on.
 
+**It has no chrome and no copy.** No heading, no paragraph, no poster art,
+no play control, no captions, no transport. The section is the run and
+nothing else; the sections either side of it already say what a pipeline is
+and what it gets you. A hairline holds the frame's edges, because the camera
+pans and things do get cut off at the canvas bounds — without it they read as
+text bleeding off the page rather than a view onto something larger.
+
 **It loads when a reader arrives at it.** React, ReactDOM and Babel are
 ~1.5 MB from `unpkg.com`, and the JSX is transpiled in the browser. None of it
 is fetched while the section is somewhere further down the page: an
-`IntersectionObserver` mounts the frame 400px before it comes into view, and
-the poster holds the box until the composition is really on screen, so the
-second or two it takes is a still figure rather than an empty well.
+`IntersectionObserver` builds the frame 400px before it comes into view, and
+the run fades in over an empty ruled box.
 
-Nothing mounts itself for a reader who has asked for less motion, and nothing
-mounts without JavaScript. In both cases the poster stays what it already is:
-a link to the animation on its own page.
+The poster is a fallback rather than a cover, and stays hidden whenever
+something is going to mount on its own. It appears — a plain link to the
+animation's own page — for a reader without JavaScript, one who has asked for
+less motion (a 65-second loop starting by itself is what that setting is for),
+and one whose browser never reached the CDN, in which case the frame is taken
+back out so there is a way through rather than a box that stays empty.
 
 **It runs in an `<iframe>`.** The host page is a full-page document — its
 `<helmet>` sets a `<title>` and `html, body` rules, and the runtime replaces
 the document body with a React root. An iframe is what stops any of that from
-reaching `index.html`, and it keeps React out of the page's own scope.
-
-**It is a figure, not an appliance.** Framed from `index.html` (`?embed`) the
-composition follows the page's colour scheme — both palettes are this page's
-own tokens — and carries neither captions nor transport. What lands in the
-card is the canvas and nothing else. Opened on its own the transport stays,
-controls and all.
+reaching `index.html`, and it keeps React out of the page's own scope. Framed
+from `index.html` (`?embed`) the composition follows the page's colour scheme,
+so the canvas and the page around it are literally the same ground. Opened on
+its own it is a full-viewport player with a transport.
 
 ### The 44px
 
