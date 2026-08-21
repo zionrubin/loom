@@ -43,6 +43,29 @@ jobs:
           test -f public/woven-knot.html
           test -f public/knot-model.js
           test -f public/three-d-stage.js
+          test -f public/survey/survey-animation.dc.html
+          test -f public/survey/support.js
+          test -f public/survey/animations-v3.jsx
+          test -f public/survey/tweaks-panel.jsx
+          test -f public/survey/loom-survey-scene.jsx
+
+      # The player mounts LoomSurveyEmbed, and the scene list the composition
+      # is cued against lives in the host page. Both are easy to lose in a
+      # re-copy from the design, and both fail at runtime rather than here.
+      - name: Check the survey player is wired to its scenes
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          src = open('public/survey/survey-animation.dc.html').read()
+          assert 'component-from-global-scope="LoomSurveyEmbed"' in src, 'host page does not mount LoomSurveyEmbed'
+          scenes = json.loads(re.search(r"window\.OM_SCENES = '(.+?)';", src, re.S).group(1))
+          assert len(scenes) == 12, f'expected 12 scenes, found {len(scenes)}'
+          total = sum(s['dur'] for s in scenes)
+          assert abs(total - 65.5) < 1e-9, f'expected a 65.5s composition, found {total}s'
+          cued = set(re.findall(r'C\.(\w+)', open('public/survey/loom-survey-scene.jsx').read()))
+          missing = cued - {s['name'] for s in scenes}
+          assert not missing, f'choreography cues sections the scene list does not name: {sorted(missing)}'
+          PY
 
       - uses: actions/configure-pages@v5
 
