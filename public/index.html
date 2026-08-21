@@ -312,6 +312,58 @@ section > .wrap { padding-top: 84px; padding-bottom: 84px; }
 .aside { margin-top: 18px; font-size: 14.5px; color: var(--ink-2); max-width: 68ch; }
 .aside code { font-size: 0.92em; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 
+/* ─────────────────────────────────────────────────────────────
+   The player. The animation paints its own near-black surround
+   and a dark transport in both of its palettes, so this stays a
+   dark panel in either page theme rather than becoming a light
+   canvas sitting in dark chrome. Its colours are the dark tokens
+   above, written out because they must not follow the page.
+   ───────────────────────────────────────────────────────────── */
+.player {
+  margin-top: 40px;
+  background: #0c1012;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* A 1920×1080 canvas, plus the 44px transport the stage stacks under it.
+   Padding percentages resolve against the width, so the canvas lands at
+   exactly the card's width and the transport sits below it, unclipped. */
+.player .frame { position: relative; height: 0; padding-top: calc(56.25% + 44px); }
+.player .frame > * { position: absolute; inset: 0; width: 100%; height: 100%; }
+.player iframe { display: block; border: 0; background: #0c1012; }
+
+.poster {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; padding: 24px;
+  color: #edf3f5; text-align: center;
+  background: radial-gradient(58% 56% at 50% 46%, rgba(111, 211, 242, 0.09), rgba(111, 211, 242, 0) 72%);
+}
+.poster:hover { text-decoration: none; }
+.poster .play {
+  display: grid; place-items: center;
+  width: 62px; height: 62px; border-radius: 50%;
+  color: #6fd3f2;
+  background: rgba(111, 211, 242, 0.10);
+  border: 1px solid rgba(111, 211, 242, 0.42);
+  transition: transform 160ms ease, background-color 160ms ease;
+}
+.poster:hover .play { transform: scale(1.06); background: rgba(111, 211, 242, 0.18); }
+@media (prefers-reduced-motion: reduce) { .poster .play { transition: none; } }
+.poster b { display: block; font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
+.poster small {
+  display: block; margin-top: 7px; max-width: 52ch;
+  font-size: 13.5px; line-height: 1.5; color: #9dabb1;
+}
+@media (max-width: 560px) {
+  .poster { gap: 14px; }
+  .poster .play { width: 50px; height: 50px; }
+  .poster b { font-size: 15px; }
+  .poster small { font-size: 12.5px; }
+}
+
 /* Capabilities */
 .cards {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -363,6 +415,7 @@ footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
     <nav class="nav">
       <a class="opt" href="#why">Why</a>
       <a class="opt" href="#pipeline">Pipeline</a>
+      <a class="opt" href="#survey">Watch</a>
       <a class="opt" href="#run">Run it</a>
       <a href="#docs">Docs</a>
       <a href="https://github.com/zionrubin/loom">GitHub&nbsp;↗</a>
@@ -505,6 +558,49 @@ fmt.Print(res.Report)                                            // cost, tokens
         Branching builds DAGs, and the planner fuses adjacent pure stages. Go-function stages run
         in-process; give one <code>pipeline.WithVersion("v1")</code> to make it cacheable, and bump
         the version when its behaviour changes.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── Watch a run ──────────────────────────────────────── -->
+  <section id="survey">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Watch one run</h2>
+        <p>
+          <code>examples/research</code> is the largest offline demo: a systematic literature
+          survey over fifty papers and roughly two hundred tasks, on a DAG that forks in two.
+          Everything it draws is the real thing — the broadcasts registered once by hash, the
+          escalation ladder, the dead letter the run survives, both <code>ReduceAI</code> trees,
+          and the rerun that replays the whole sky from cache.
+        </p>
+      </div>
+
+      <div class="player">
+        <div class="frame">
+          <a class="poster" href="./survey/survey-animation.dc.html">
+            <span class="play" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+                <path d="M7 4.4v13.2L18 11z" fill="currentColor"/>
+              </svg>
+            </span>
+            <span>
+              <b>Play the run</b>
+              <small>
+                65 seconds, on a loop — twenty-four questions through the findings gate,
+                then fifty papers down to one abstract.
+              </small>
+            </span>
+          </a>
+        </div>
+      </div>
+
+      <p class="aside">
+        The animation is a React composition, so playing it fetches React and Babel from
+        <code>unpkg.com</code> — which is why it waits to be asked rather than loading with the
+        page. It also has <a href="./survey/survey-animation.dc.html">a page of its own</a>. The
+        run it draws is <code>go run ./examples/research</code>: no keys, no network, and a
+        constellation view of the same tasks at <code>localhost:8077</code>.
       </p>
     </div>
   </section>
@@ -692,6 +788,27 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
     },
     () => document.querySelector('.hero').classList.add('no-3d'),
   );
+</script>
+
+<script>
+/* The player. The animation is a React composition behind about 1.5 MB of
+   runtime, so none of it is fetched until a reader asks — the page itself
+   stays what it claims to be. With this script the poster swaps in place for
+   the animation; without it, it is an ordinary link to the animation's own
+   page, which is the whole fallback. */
+(() => {
+  const poster = document.querySelector('#survey .poster');
+  if (!poster) return;
+  poster.addEventListener('click', (e) => {
+    // Let a modified click open the standalone page in a new tab, as a link should.
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    const frame = document.createElement('iframe');
+    frame.src = poster.getAttribute('href');
+    frame.title = 'Loom — a 50-paper survey, running';
+    poster.replaceWith(frame);
+  });
+})();
 </script>
 
 <script>

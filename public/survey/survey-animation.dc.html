@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* The same rule the helmet below declares, hoisted so it paints before the
+     runtime boots. Without it the document is white for as long as React,
+     Babel and the JSX take to arrive, which reads as a broken embed. */
+  html, body { margin: 0; height: 100%; background: #0c1012; }
+
+  /* The transport's last button asks the Claude Design host to encode the
+     composition to video. There is no host on this side of the fence — the
+     message goes nowhere and the click does nothing — so the button goes,
+     the same way index.html drops the 3D stage's export toolbar. Everything
+     else on the bar (play, return to start, scrub) works here. */
+  button[title="Export video"] { display: none !important; }
+</style>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom — a 50-paper survey, running</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c1012; }
+  a { color: #6fd3f2; text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
+</style>
+<script>window.OM_SCENES = '[{"name":"Ask","dur":4.5,"desc":"Twenty-four research questions from four desks about six subjects line up in front of the findings gate — the same six subjects in four house phrasings, which a byte-keyed result cache would read as twenty-four different questions"},{"name":"Reuse","dur":5.5,"desc":"The gate resolves all twenty-four: six miss and reach the public source, six concurrent duplicates coalesce onto those flights behind the single-flight lease, twelve are served from the ledger by subject class, and the efficiency card totals 24 questions to 6 external calls with 18 reused"},{"name":"Corpus","dur":4.5,"desc":"Fifty synthetic paper records materialise; the camera pushes in on a few titles and the caption states that this is a scripted offline run"},{"name":"Broadcast","dur":5.5,"desc":"The three run-level broadcasts appear above the DAG — venue tiers into normalize, inclusion criteria into screen, evidence rubric into grade-evidence — each registered once by content hash and wired down into the stage that actually reads it"},{"name":"Normalize","dur":5,"desc":"All fifty records flow through the plain-code normalize stage, which tags the venue tier and marks each paper screenable; the two abstract-less position papers fail the filter and leave before any model call, 50 → 48"},{"name":"Screen","dur":7,"desc":"Forty-eight screening calls run eight workers deep: a rate limit retries, garbled output escalates to the deep model, one retracted paper dead-letters, one straggler grows an activity ring"},{"name":"Relevant","dur":3.5,"desc":"Six out-of-scope papers and the dead letter are filtered out and forty-one pass the gate"},{"name":"Findings","dur":5,"desc":"Findings are extracted per paper and the camera pulls back to reveal the DAG forking in two"},{"name":"Grade","dur":5.5,"desc":"Evidence is graded against the shared rubric, an out-of-range grade escalates, and the strong-evidence filter keeps grade 3 and up"},{"name":"Synthesis","dur":6.5,"desc":"The ReduceAI tree folds the twenty-eight strong findings four at a time until one node remains, then the deep model writes the executive abstract"},{"name":"Questions","dur":7,"desc":"The other branch fans out into ninety-eight claims from all forty-one papers and a second tree, fan-in 6, distils them into the open questions; the camera then widens onto both terminal artifacts, which the pipeline never joins"},{"name":"Ledger","dur":6,"desc":"The camera pulls back over the whole DAG for the run report, then the rerun replays every task from cache with zero model calls"}]';</script>
+<script>window.OM_PLAYBACK = '{"mode":"loop"}';</script>
+<script>window.TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "motionEditor": false,
+  "captions": false,
+  "theme": "light"
+}/*EDITMODE-END*/;</script>
+</helmet>
+<x-import component-from-global-scope="LoomSurveyEmbed" from="./animations-v3.jsx ./tweaks-panel.jsx ./loom-survey-scene.jsx" hint-size="100%,100%"></x-import>
+</x-dc>
+</body>
+</html>
