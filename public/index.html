@@ -313,18 +313,19 @@ section > .wrap { padding-top: 84px; padding-bottom: 84px; }
 .aside code { font-size: 0.92em; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 
 /* ─────────────────────────────────────────────────────────────
-   The player. A figure, not an appliance: the composition follows
-   this page's colour scheme and carries no captions and no
-   transport, so what lands here is the canvas and nothing else.
+   The player. The composition follows this page's colour scheme and
+   carries no captions, no transport and no poster art, so the run is
+   simply drawn on the page — a hairline holds its edges, because the
+   camera pans and things do get cut off at the canvas bounds.
    ───────────────────────────────────────────────────────────── */
 .player {
-  margin-top: 40px;
-  /* The composition's own ground in both palettes, so the resting state and
-     the canvas that replaces it are the same tone and the swap is invisible. */
+  /* Nothing above it inside the section — the run is the whole of it. */
+  margin-top: 0;
+  /* The composition's own ground in both palettes, so an empty player is a
+     piece of the page and the canvas that arrives is the same tone. */
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 12px;
-  box-shadow: var(--shadow);
   overflow: hidden;
 }
 
@@ -347,35 +348,26 @@ section > .wrap { padding-top: 84px; padding-bottom: 84px; }
   .player .frame iframe { transition: none; }
 }
 
-/* The resting state, and the whole of the page without JavaScript: a link
-   to the animation on its own. */
+/* The poster is the fallback, not a cover: a link to the animation on its
+   own page, for a reader without JavaScript, one who has asked for less
+   motion, and one whose browser could not reach the CDN. When the frame is
+   going to mount by itself there is nothing to offer and nothing to wait
+   through, so the script hides it — an empty player is just a ruled piece
+   of the page until the run fades in over it.
+
+   Hidden until the script asks for it; the <noscript> beside it in the
+   markup is what puts it back when there is no script to ask. */
 .poster {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 16px; padding: 24px;
+  visibility: hidden;
+  display: grid; place-items: center; padding: 24px;
   text-align: center;
 }
+.player.is-idle .poster { visibility: visible; }
 .poster:hover { text-decoration: none; }
 .poster .label {
   font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
                "Liberation Mono", monospace;
   font-size: 13px; color: var(--ink-3);
-}
-.player.is-loading .poster .label { animation: player-wait 1.9s ease-in-out infinite; }
-@keyframes player-wait { 50% { opacity: 0.42; } }
-
-/* Nothing mounts itself when a reader has asked for less motion, so there
-   the poster keeps an affordance and stays the link it already is. */
-.poster .play { display: none; }
-@media (prefers-reduced-motion: reduce) {
-  .player.is-loading .poster .label { animation: none; }
-  .poster .play {
-    display: grid; place-items: center;
-    width: 56px; height: 56px; border-radius: 50%;
-    color: var(--accent);
-    background: var(--wash);
-    border: 1px solid var(--line-2);
-  }
-  .poster:hover .play { background: color-mix(in srgb, var(--accent) 16%, transparent); }
 }
 
 /* Capabilities */
@@ -429,7 +421,6 @@ footer > .wrap { padding-top: 56px; padding-bottom: 56px; }
     <nav class="nav">
       <a class="opt" href="#why">Why</a>
       <a class="opt" href="#pipeline">Pipeline</a>
-      <a class="opt" href="#survey">Watch</a>
       <a class="opt" href="#run">Run it</a>
       <a href="#docs">Docs</a>
       <a href="https://github.com/zionrubin/loom">GitHub&nbsp;↗</a>
@@ -576,30 +567,17 @@ fmt.Print(res.Report)                                            // cost, tokens
     </div>
   </section>
 
-  <!-- ── Watch a run ──────────────────────────────────────── -->
+  <!-- ── A run ────────────────────────────────────────────── -->
+  <!-- No heading and no copy: the run draws itself, and the sections either
+       side of it already say what a pipeline is and what it gets you. -->
   <section id="survey">
     <div class="wrap">
-      <div class="sec-head">
-        <h2>Watch one run</h2>
-        <p>
-          <code>examples/research</code> is the largest offline demo: a systematic literature
-          survey over fifty papers and roughly two hundred tasks, on a DAG that forks in two.
-          Everything it draws is the real thing — the broadcasts registered once by hash, the
-          escalation ladder, the dead letter the run survives, both <code>ReduceAI</code> trees,
-          and the rerun that replays the whole sky from cache.
-        </p>
-      </div>
-
       <div class="player">
         <div class="frame">
           <a class="poster" href="./survey/survey-animation.dc.html">
-            <span class="play" aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 22 22" fill="none">
-                <path d="M7 4.4v13.2L18 11z" fill="currentColor"/>
-              </svg>
-            </span>
             <span class="label">go run ./examples/research</span>
           </a>
+          <noscript><style>#survey .poster { visibility: visible; }</style></noscript>
         </div>
       </div>
     </div>
@@ -793,13 +771,13 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
 <script>
 /* The player. The animation is a React composition behind about 1.5 MB of
    runtime, so none of it is fetched while the section is somewhere down the
-   page; it mounts when a reader comes to it and takes the second or two it
-   takes. The poster holds the frame until the composition is actually on
-   screen, so the wait is a still figure rather than an empty box.
+   page: the frame is built 400px before it comes into view and the run fades
+   in over an empty ruled box, with nothing to press and nothing to read.
 
-   Without JavaScript, and for a reader who has asked for less motion,
-   nothing mounts on its own and the poster is what it looks like: a link to
-   the animation on its own page. */
+   The poster is only a fallback. It appears when nothing is going to mount
+   on its own — no JavaScript, a reader who has asked for less motion, or a
+   CDN that never answered — and is a plain link to the animation on its own
+   page. */
 (() => {
   const player = document.querySelector('#survey .player');
   const poster = player && player.querySelector('.poster');
@@ -811,7 +789,7 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
   const mount = () => {
     if (started) return;
     started = true;
-    player.classList.add('is-loading');
+    player.classList.remove('is-idle');
 
     const frame = document.createElement('iframe');
     // ?embed is what tells the host page to drop the transport.
@@ -822,9 +800,9 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
     // The load event fires before the runtime has fetched, transpiled and
     // mounted the composition, so wait for the stage itself to exist — same
     // origin, so we can just look. If it never does — offline, blocked CDN —
-    // take the frame back out and leave the poster, which is a link to the
-    // animation, rather than an empty well. The hero does the same with the
-    // 3D object.
+    // take the frame back out and put the poster up, so there is a way to
+    // the animation rather than a box that stays empty. The hero does the
+    // same with the 3D object.
     const startedAt = Date.now();
     const poll = () => {
       let stage = null;
@@ -833,12 +811,11 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
           frame.contentDocument.querySelector('[data-om-exportable-video-with-duration-secs]');
       } catch { /* cross-document read failed; nothing to do but keep waiting */ }
       if (stage) {
-        player.classList.remove('is-loading');
         player.classList.add('is-ready');
         setTimeout(() => poster.remove(), 500);
       } else if (Date.now() - startedAt > 20000) {
-        player.classList.remove('is-loading');
         frame.remove();
+        player.classList.add('is-idle');
         started = false;
       } else {
         setTimeout(poll, 120);
@@ -854,7 +831,13 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
     mount();
   });
 
-  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  // Nothing mounts itself for a reader who has asked for less motion — a
+  // 65-second loop starting on its own is the thing that setting is for.
+  // The poster comes up instead, and clicking it still plays.
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    player.classList.add('is-idle');
+    return;
+  }
   if (!('IntersectionObserver' in window)) { mount(); return; }
 
   // A margin wide enough that the runtime has usually finished booting by the
