@@ -90,3 +90,25 @@ jobs:
           assert 'calc(100% + 44px)' in page, 'index.html no longer sizes the iframe to canvas + 44px'
           assert 'height: 44px;' in host, 'the hidden transport is no longer pinned to 44px'
           PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      # Checking files and stopping is a green run. That is exactly what this
+      # workflow did between #23 and #24: the three publishing steps above had
+      # been dropped, every run reported success, and the site stayed on the
+      # build before them. A Pages run that publishes nothing must be red.
+      - name: Confirm something was actually published
+        run: |
+          url="${{ steps.deployment.outputs.page_url }}"
+          if [ -z "$url" ]; then
+            echo "::error::deploy-pages produced no page_url — nothing was published."
+            exit 1
+          fi
+          echo "Published to $url"
