@@ -313,30 +313,34 @@ section > .wrap { padding-top: 84px; padding-bottom: 84px; }
 .aside code { font-size: 0.92em; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 
 /* ─────────────────────────────────────────────────────────────
-   The player. The composition follows this page's colour scheme and
-   carries no captions, no transport and no poster art, so the run is
-   simply drawn on the page — a hairline holds its edges, because the
-   camera pans and things do get cut off at the canvas bounds.
+   The player. Full bleed, last thing before the footer: no wrap, no
+   padding, no border and no radius — the section rule above it and the
+   footer rule below are the only edges it needs. The composition follows
+   this page's colour scheme and carries no captions, no transport and no
+   poster art, so the run is simply drawn across the page.
    ───────────────────────────────────────────────────────────── */
 .player {
-  /* Nothing above it inside the section — the run is the whole of it. */
-  margin-top: 0;
   /* The composition's own ground in both palettes, so an empty player is a
-     piece of the page and the canvas that arrives is the same tone. */
+     piece of the page, the canvas that arrives is the same tone, and the
+     margins past the cap below are invisible rather than letterboxing. */
   background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 12px;
   overflow: hidden;
 }
 
-/* Exactly 16:9 — the shape of the 1920×1080 canvas. Padding percentages
-   resolve against the width, so this tracks the card at any size.
+/* Exactly 16:9 — the shape of the 1920×1080 canvas — and the full width of
+   the viewport up to the cap. The cap is a width rather than a height so the
+   ratio is never broken: past ~1960px the run would be more than 1100px tall
+   and become a screen to scroll through rather than a thing to watch.
    The iframe is 44px taller than the box, and that overflow is clipped:
    the stage always subtracts 44px for its transport when it scales the
    canvas to fit, so handing it those pixels is what makes the canvas come
-   out at exactly the card's width. The strip they occupy is hidden inside
-   the frame and never drawn. */
-.player .frame { position: relative; height: 0; padding-top: 56.25%; overflow: hidden; }
+   out at exactly the frame's width. The strip they occupy is never drawn. */
+.player .frame {
+  position: relative;
+  width: 100%; max-width: 1960px; margin-inline: auto;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+}
 .player .frame > * { position: absolute; inset: 0; width: 100%; height: 100%; }
 .player .frame iframe {
   display: block; border: 0; background: transparent;
@@ -567,22 +571,6 @@ fmt.Print(res.Report)                                            // cost, tokens
     </div>
   </section>
 
-  <!-- ── A run ────────────────────────────────────────────── -->
-  <!-- No heading and no copy: the run draws itself, and the sections either
-       side of it already say what a pipeline is and what it gets you. -->
-  <section id="survey">
-    <div class="wrap">
-      <div class="player">
-        <div class="frame">
-          <a class="poster" href="./survey/survey-animation.dc.html">
-            <span class="label">go run ./examples/research</span>
-          </a>
-          <noscript><style>#survey .poster { visibility: visible; }</style></noscript>
-        </div>
-      </div>
-    </div>
-  </section>
-
   <!-- ── Capabilities ─────────────────────────────────────── -->
   <section id="what">
     <div class="wrap">
@@ -726,6 +714,20 @@ OPENAI_API_KEY=sk-...    go run ./examples/openai-review</code></pre>
         <a href="https://github.com/zionrubin/loom/blob/main/docs/MCP.md"><span class="name">MCP</span><span class="what">Tools under the envelope</span></a>
         <a href="https://github.com/zionrubin/loom/blob/main/docs/INFERENCE.md"><span class="name">INFERENCE</span><span class="what">Serving, and running it yourself</span></a>
         <a href="https://github.com/zionrubin/loom/blob/main/docs/STUDIO.md"><span class="name">STUDIO</span><span class="what">The canvas that prices itself</span></a>
+      </div>
+    </div>
+  </section>
+  <!-- ── A run ────────────────────────────────────────────── -->
+  <!-- Last thing on the page and the full width of it. No heading and no
+       copy: the run draws itself, and everything above has already said
+       what a pipeline is, what it gets you and how to start one. -->
+  <section id="survey">
+    <div class="player">
+      <div class="frame">
+        <a class="poster" href="./survey/survey-animation.dc.html">
+          <span class="label">go run ./examples/research</span>
+        </a>
+        <noscript><style>#survey .poster { visibility: visible; }</style></noscript>
       </div>
     </div>
   </section>

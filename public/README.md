@@ -43,14 +43,22 @@ actually produces. It is a React piece, unlike everything else here.
 | `survey/tweaks-panel.jsx` | The design tool's control panel. Vendored verbatim; loaded because the scene file imports it, never opened here. |
 | `survey/support.js` | `dc-runtime`: parses the host page, loads React and Babel, transpiles and mounts the JSX. Vendored verbatim. |
 
-Three things keep it from taking over the page it sits on.
+Four things keep it from taking over the page it closes.
 
 **It has no chrome and no copy.** No heading, no paragraph, no poster art,
 no play control, no captions, no transport. The section is the run and
-nothing else; the sections either side of it already say what a pipeline is
-and what it gets you. A hairline holds the frame's edges, because the camera
-pans and things do get cut off at the canvas bounds — without it they read as
-text bleeding off the page rather than a view onto something larger.
+nothing else — it is the last thing on the page, after the docs index and
+before the footer, by which point everything above has said what a pipeline
+is, what it gets you and how to start one.
+
+**It is the full width of the viewport.** No `.wrap`, no padding, no border
+and no radius: the section rule above it and the footer rule below are the
+only edges it needs, and the run is drawn across the page rather than into a
+column. The cap is a `max-width` of 1960px rather than a height, so the 16:9
+never breaks; past that the run would be more than 1100px tall and become a
+screen to scroll through rather than a thing to watch. Beyond the cap the
+frame centres, and because the composition's ground is this page's `--bg` in
+both palettes, the margins either side are invisible rather than letterboxing.
 
 **It loads when a reader arrives at it.** React, ReactDOM and Babel are
 ~1.5 MB from `unpkg.com`, and the JSX is transpiled in the browser. None of it
@@ -80,7 +88,7 @@ fit its box, whether or not the transport is visible. Two things follow, and
 they have to agree or the canvas stops being flush:
 
 - the iframe is 44px taller than the frame, and `.frame` clips the difference.
-  Hand the stage those pixels and the canvas comes out at exactly the card's
+  Hand the stage those pixels and the canvas comes out at exactly the frame's
   width; withhold them and it shrinks to fit the height instead, with gutters
   down both sides;
 - the hidden transport is pinned to `height: 44px`. Left alone it draws 37,
