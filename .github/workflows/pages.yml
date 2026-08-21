@@ -48,30 +48,45 @@ jobs:
           test -f public/survey/animations-v3.jsx
           test -f public/survey/tweaks-panel.jsx
           test -f public/survey/loom-survey-scene.jsx
+          test -f public/survey/page-embed.jsx
 
-      # The player mounts LoomSurveyEmbed, and the scene list the composition
-      # is cued against lives in the host page. Both are easy to lose in a
-      # re-copy from the design, and both fail at runtime rather than here.
+      # The player mounts the page wrapper, the composition is cued against a
+      # scene list that lives in the host page, and the frame's geometry is
+      # built around the 44px the stage reserves for its transport. All three
+      # are easy to lose in a re-copy from the design, and all three fail at
+      # runtime rather than here.
       - name: Check the survey player is wired to its scenes
         run: |
           python3 - <<'PY'
-          import json, re, sys
-          src = open('public/survey/survey-animation.dc.html').read()
-          assert 'component-from-global-scope="LoomSurveyEmbed"' in src, 'host page does not mount LoomSurveyEmbed'
-          scenes = json.loads(re.search(r"window\.OM_SCENES = '(.+?)';", src, re.S).group(1))
+          import json, re
+          host = open('public/survey/survey-animation.dc.html').read()
+          scene = open('public/survey/loom-survey-scene.jsx').read()
+          engine = open('public/survey/animations-v3.jsx').read()
+          page = open('public/index.html').read()
+
+          assert 'component-from-global-scope="LoomSurveyPageEmbed"' in host, \
+              'host page does not mount LoomSurveyPageEmbed'
+          assert './page-embed.jsx' in host, 'host page does not import the wrapper'
+          assert 'window.LoomSurveyEmbed' in open('public/survey/page-embed.jsx').read(), \
+              'the wrapper no longer renders LoomSurveyEmbed'
+          assert 'window.LoomSurveyEmbed = LoomSurveyEmbed' in scene, \
+              'the scene file no longer exports LoomSurveyEmbed'
+
+          scenes = json.loads(re.search(r"window\.OM_SCENES = '(.+?)';", host, re.S).group(1))
           assert len(scenes) == 12, f'expected 12 scenes, found {len(scenes)}'
           total = sum(s['dur'] for s in scenes)
           assert abs(total - 65.5) < 1e-9, f'expected a 65.5s composition, found {total}s'
-          cued = set(re.findall(r'C\.(\w+)', open('public/survey/loom-survey-scene.jsx').read()))
+
+          cued = set(re.findall(r'C\.(\w+)', scene))
           missing = cued - {s['name'] for s in scenes}
           assert not missing, f'choreography cues sections the scene list does not name: {sorted(missing)}'
+
+          # The frame clips the transport away, and the hidden bar is pinned to
+          # the same figure. If the engine ever reserves something other than
+          # 44px, both go wrong together and silently.
+          bar = re.search(r'const barH = (\d+);', engine)
+          assert bar and bar.group(1) == '44', \
+              f'the stage reserves {bar.group(1) if bar else "?"}px for its transport, not the 44 the frame is built around'
+          assert 'calc(100% + 44px)' in page, 'index.html no longer sizes the iframe to canvas + 44px'
+          assert 'height: 44px;' in host, 'the hidden transport is no longer pinned to 44px'
           PY
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-      - id: deployment
-        uses: actions/deploy-pages@v4
