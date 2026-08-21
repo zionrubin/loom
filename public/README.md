@@ -36,7 +36,8 @@ actually produces. It is a React piece, unlike everything else here.
 
 | File | |
 |---|---|
-| `survey/survey-animation.dc.html` | The host page. Mounts the composition; opens on its own as a full-viewport player. |
+| `survey/survey-animation.dc.html` | The host page. Mounts the composition; opens on its own as a full-viewport player with a transport. |
+| `survey/page-embed.jsx` | The wrapper `index.html` frames: picks the palette, turns the captions off. No animation content. |
 | `survey/loom-survey-scene.jsx` | The composition — corpus, DAG, camera, captions. Vendored verbatim. |
 | `survey/animations-v3.jsx` | The animation engine: authored-time axis, cue table, stage, transport. Vendored verbatim. |
 | `survey/tweaks-panel.jsx` | The design tool's control panel. Vendored verbatim; loaded because the scene file imports it, never opened here. |
@@ -44,25 +45,45 @@ actually produces. It is a React piece, unlike everything else here.
 
 Three things keep it from taking over the page it sits on.
 
-**It waits to be asked.** React, ReactDOM and Babel are ~1.5 MB from
-`unpkg.com`, and the JSX is transpiled in the browser. None of that is fetched
-until a reader clicks the poster, so the landing page still costs what it
-claims to. Without JavaScript the poster is an ordinary link to the animation's
-own page, which is the whole fallback.
+**It loads when a reader arrives at it.** React, ReactDOM and Babel are
+~1.5 MB from `unpkg.com`, and the JSX is transpiled in the browser. None of it
+is fetched while the section is somewhere further down the page: an
+`IntersectionObserver` mounts the frame 400px before it comes into view, and
+the poster holds the box until the composition is really on screen, so the
+second or two it takes is a still figure rather than an empty well.
+
+Nothing mounts itself for a reader who has asked for less motion, and nothing
+mounts without JavaScript. In both cases the poster stays what it already is:
+a link to the animation on its own page.
 
 **It runs in an `<iframe>`.** The host page is a full-page document — its
 `<helmet>` sets a `<title>` and `html, body` rules, and the runtime replaces
 the document body with a React root. An iframe is what stops any of that from
-reaching `index.html`, and it keeps React out of the page's own scope. The
-frame is sized `calc(56.25% + 44px)` tall: 16:9 for the 1920×1080 canvas, plus
-the 44px the stage reserves for its transport, so the canvas lands at exactly
-the card's width with the transport below it rather than letterboxed or clipped.
+reaching `index.html`, and it keeps React out of the page's own scope.
 
-**It stays dark in both page themes.** The composition ships light and dark
-palettes — the same tokens as this page — but the stage paints its own
-near-black surround and a dark transport either way. A light canvas inside that
-chrome reads as a mistake, so the player is a dark panel on a light page, the
-way a video is.
+**It is a figure, not an appliance.** Framed from `index.html` (`?embed`) the
+composition follows the page's colour scheme — both palettes are this page's
+own tokens — and carries neither captions nor transport. What lands in the
+card is the canvas and nothing else. Opened on its own the transport stays,
+controls and all.
+
+### The 44px
+
+The stage always subtracts 44px for its transport when it scales the canvas to
+fit its box, whether or not the transport is visible. Two things follow, and
+they have to agree or the canvas stops being flush:
+
+- the iframe is 44px taller than the frame, and `.frame` clips the difference.
+  Hand the stage those pixels and the canvas comes out at exactly the card's
+  width; withhold them and it shrinks to fit the height instead, with gutters
+  down both sides;
+- the hidden transport is pinned to `height: 44px`. Left alone it draws 37,
+  which is not what the scale was computed against — the canvas centres 3.5px
+  down and loses 3.5px off the bottom of the frame.
+
+`.github/workflows/pages.yml` checks that `animations-v3.jsx` still reserves
+44, since a re-copy from the design could change it and nothing else would say
+so.
 
 ## GitHub Pages
 
@@ -101,25 +122,37 @@ imports are byte-identical to the design's copies; the composition — scenes,
 choreography, camera, captions, palettes — is untouched.
 
 `survey-animation.dc.html` is that design's host page with the same helmet
-(title, `OM_SCENES`, `OM_PLAYBACK`, `TWEAK_DEFAULTS`) and three changes, all of
+(title, `OM_SCENES`, `OM_PLAYBACK`, `TWEAK_DEFAULTS`) and four changes, all of
 them about being on the open web rather than in a design tool:
 
-- it mounts `LoomSurveyEmbed` rather than `LoomSurvey` — both are exports of the
-  unmodified scene file. `LoomSurvey` is the authoring entry point: it wires up
-  the tweaks panel, which only ever opens when the Claude Design host asks it
-  to. `LoomSurveyEmbed` is the composition and nothing else;
+- it mounts `LoomSurveyPageEmbed` from `page-embed.jsx` rather than
+  `LoomSurvey`. That wrapper renders `LoomSurveyEmbed` — an export of the
+  unmodified scene file — with a palette that follows the reader and
+  `captions={false}`. Both are needed from a wrapper rather than from the tag:
+  an `<x-import>` attribute is always a string, and `LoomSurveyEmbed` turns
+  captions off only for the literal boolean `false`. `LoomSurvey`, the
+  design's own entry, wires up the tweaks panel, which opens only when the
+  Claude Design host asks it to;
 - the helmet's `background` rule is repeated in a plain `<style>` in the
   `<head>`, so it paints before the runtime boots instead of after — otherwise
-  the frame is white for as long as React and Babel take to arrive;
+  the frame is white for as long as React and Babel take to arrive. It carries
+  both palettes, since the composition now follows the colour scheme;
 - the transport's video-export button is hidden. It posts
   `omelette:request-video-export` to a host that isn't there, so it is a control
-  that does nothing — the same reason the hero drops the 3D stage's toolbar.
+  that does nothing — the same reason the hero drops the 3D stage's toolbar;
+- under `?embed` the whole transport is hidden. In a page it is chrome on a
+  figure, and its scrub track previews on hover — a cursor crossing the bar
+  drags the composition to whatever frame it passed over, and a cursor that
+  leaves the frame without crossing back out of the track leaves it stuck
+  there.
 
 When re-copying from the design, the thing to check by hand is that
-`loom-survey-scene.jsx` still exports `LoomSurveyEmbed` and still reads
-`window.OM_SCENES`. `.github/workflows/pages.yml` checks the rest: that the host
-page mounts it, and that every section the choreography cues is one the scene
-list actually names.
+`loom-survey-scene.jsx` still exports `LoomSurveyEmbed`, still reads
+`window.OM_SCENES`, and still takes `theme` and `captions`.
+`.github/workflows/pages.yml` checks the rest: that the host page mounts the
+wrapper, that the 44px the layout is built around is still what the stage
+reserves, and that every section the choreography cues is one the scene list
+actually names.
 
 ## Notes
 
@@ -131,7 +164,7 @@ list actually names.
   the vendored starter and the design's model code. They are warnings, not
   errors, and are left as-is rather than forking upstream code.
 - The animation is the one part of the page that is not dependency-free, and it
-  is quarantined behind a click and an iframe for exactly that reason. React,
+  is quarantined behind an iframe and a scroll for exactly that reason. React,
   ReactDOM and Babel are pinned by version **and** SRI hash inside
   `survey/support.js`, the same arrangement as three.js in the import maps —
   the two must stay together if either is ever bumped.

@@ -4,17 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* The same rule the helmet below declares, hoisted so it paints before the
-     runtime boots. Without it the document is white for as long as React,
-     Babel and the JSX take to arrive, which reads as a broken embed. */
-  html, body { margin: 0; height: 100%; background: #0c1012; }
+  /* What the helmet below declares, hoisted so it paints before the runtime
+     boots — otherwise the document is white for as long as React, Babel and
+     the JSX take to arrive. Both palettes, because the composition follows
+     the reader's colour scheme and a dark frame around a light canvas is the
+     thing this is here to avoid. */
+  html, body { margin: 0; height: 100%; background: #f1f3f4; }
+  @media (prefers-color-scheme: dark) { html, body { background: #0c1012; } }
 
   /* The transport's last button asks the Claude Design host to encode the
      composition to video. There is no host on this side of the fence — the
      message goes nowhere and the click does nothing — so the button goes,
-     the same way index.html drops the 3D stage's export toolbar. Everything
-     else on the bar (play, return to start, scrub) works here. */
+     the same way index.html drops the 3D stage's export toolbar. */
   button[title="Export video"] { display: none !important; }
+
+  /* Framed by index.html (?embed), the whole transport goes: the piece is a
+     figure in a page there, not something to operate, and the hover-preview
+     on the scrub track means a cursor crossing the bar drags the composition
+     to whatever frame it passed over.
+
+     visibility rather than display, so the bar still occupies a strip in the
+     column: the stage always subtracts 44px for it when it scales the canvas
+     to fit, and only if the strip really is 44px does the canvas come out
+     flush in both directions. Left alone the bar draws 37px, which centres
+     the canvas 3.5px down and costs 3.5px off the bottom of the frame — so
+     it is pinned to the figure the scale is computed against. index.html
+     makes its frame exactly 16:9 and clips the strip away.
+
+     Opened on its own the bar stays, controls and all. */
+  html[data-embed] [data-omelette-chrome] {
+    visibility: hidden;
+    box-sizing: border-box;
+    height: 44px;
+  }
 </style>
 <script src="./support.js"></script>
 </head>
@@ -36,7 +58,7 @@
   "theme": "light"
 }/*EDITMODE-END*/;</script>
 </helmet>
-<x-import component-from-global-scope="LoomSurveyEmbed" from="./animations-v3.jsx ./tweaks-panel.jsx ./loom-survey-scene.jsx" hint-size="100%,100%"></x-import>
+<x-import component-from-global-scope="LoomSurveyPageEmbed" from="./animations-v3.jsx ./tweaks-panel.jsx ./loom-survey-scene.jsx ./page-embed.jsx" hint-size="100%,100%"></x-import>
 </x-dc>
 </body>
 </html>
