@@ -19,6 +19,7 @@ to a real provider say so.
 | [`worker-fleet`](../examples/worker-fleet) | One pipeline across worker processes, one SIGKILLed | — |
 | [`delta-session`](../examples/delta-session) | A growing context across processes, its holder killed | — |
 | [`watchtower`](../examples/watchtower) | Stream mode: windows, watermarks, a priced interruption | — |
+| [`switchboard`](../examples/switchboard) | The serving layer: conversations in, a maintained context, questions against it | — |
 | [`commons`](../examples/commons) | The findings gate: four desks, one question each | — |
 | [`commons-shared`](../examples/commons-shared) | The same commons across four executor *processes* | — |
 | [`studio`](../examples/studio) | Loom Studio on an invented archive | — (`-openai` optional) |
@@ -141,6 +142,21 @@ go run ./examples/watchtower
 go run ./examples/watchtower -live       # tail the feed as a writer appends
 go run ./examples/watchtower -crash      # price the interruption
 go run ./examples/watchtower -window 30s # twice the panes, the same gradings
+```
+
+### Serving
+
+```sh
+# the other end of a stream: a support desk that reads conversations as they
+# arrive and can be asked about them at any moment. The reading is the bill and
+# it is paid once, on ingest; a question is one call against a couple of
+# kilobytes, and the same question against an unchanged context is a cache hit
+# with no call at all. -budget makes the context outgrow its allowance, so the
+# oldest entries are folded into a standing brief while the newest stay verbatim
+go run ./examples/switchboard
+go run ./examples/switchboard -live         # ask it something mid-stream, and see how far behind the answer is
+go run ./examples/switchboard -budget 1200  # a context that has to fold to fit
+go run ./examples/switchboard -serve :8099  # keep it live, with a console to talk to it in
 ```
 
 ### Tools, local models, and the canvas

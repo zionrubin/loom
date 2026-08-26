@@ -71,6 +71,9 @@ empty.
 go test ./...              # full suite, no network or keys needed
 go run ./examples/triage   # a complete pipeline on a mock model, offline
 
+# a desk that reads conversations as they arrive and answers questions about them
+go run ./examples/switchboard
+
 # watch a run as a sky of stars: http://localhost:8077
 go run ./examples/constellation
 
@@ -83,8 +86,8 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty-one examples ship — fleets, streaming, MCP, local inference, worker
-processes, iteration, routing, the studio — and all but five run offline
+Twenty-two examples ship — fleets, streaming, serving, MCP, local inference,
+worker processes, iteration, routing, the studio — and all but five run offline
 against a deterministic mock provider. [docs/EXAMPLES.md](docs/EXAMPLES.md) is
 the catalog.
 
@@ -172,6 +175,17 @@ the catalog.
   617 kB session) and an executor holding an earlier revision **splices** rather
   than re-renders — under a guarantee ladder that makes a failed fast path cost
   work and never an answer. [docs/DELTA.md](docs/DELTA.md)
+- **A serving layer over a feed that never stops** — `recall.Desk` turns an
+  endless stream of conversations into a **context that is maintained rather
+  than retrieved**: every message is understood as it arrives, each slice of a
+  conversation becomes one line of a `delta` chain, and a question is one model
+  call against a couple of kilobytes — the same one call whether the desk has
+  read ten messages or ten million. The two sides meet at an immutable published
+  revision, so ingestion never blocks a read and the pool's fairness lets a
+  question overtake an hour-old ingest job. The revision joins the query's
+  fingerprint, so **the same question against an unchanged context costs
+  nothing**, and moves the moment a conversation lands.
+  [docs/RECALL.md](docs/RECALL.md)
 - **A commons for external research** — `loom.WithFindings` gates the tools that
   reach public sources, keying on the *question* rather than the bytes: one
   question in three wordings, asked by agents that started at the same instant,
@@ -215,6 +229,7 @@ the catalog.
 | [DELTA.md](docs/DELTA.md) | Stateful delta execution, and proving a splice was safe |
 | [WORKERS.md](docs/WORKERS.md) | Distributing a run across worker processes |
 | [STREAMING.md](docs/STREAMING.md) | Stream mode: windows, watermarks, checkpoints |
+| [RECALL.md](docs/RECALL.md) | The serving layer: a context maintained rather than retrieved |
 | [MCP.md](docs/MCP.md) | Tools under the envelope |
 | [INFERENCE.md](docs/INFERENCE.md) | Loom as an inference engine, and running the model yourself |
 | [STUDIO.md](docs/STUDIO.md) | The pipeline as a canvas that prices itself |
@@ -239,6 +254,7 @@ the catalog.
 | `providers/llamacpp` | Local inference against a llama.cpp server: loopback egress, no credential, KV cache as prompt cache |
 | `providers/llamacpp/llamacpptest` | A scriptable in-process llama.cpp server on a real loopback socket |
 | `findings` | The commons: a gate agents pass before reaching a public source. `pgstore` / `filestore` share it between processes |
+| `recall` | The serving layer: conversation ingestion, a continuously maintained context, and an agent-like query interface over it |
 | `stream` | Sources with resumable positions, watermarks, the windower, sinks, checkpoints — plain data, no model in sight |
 | `stream/file` | A directory of JSONL as a stream: a file is a split, a byte offset a position |
 | `stream/kafka` | Topics as streams, with Loom's checkpoint as the source of truth for offsets |

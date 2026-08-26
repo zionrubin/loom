@@ -219,6 +219,22 @@ The beats arrive last and finish first, at 99% slot occupancy. `service` is what
 each agent was given and `jct` is what a caller waited — printing both is what
 makes the trade legible rather than asserted.
 
+### The agent that never finishes
+
+`Fleet.Stream` puts a stream job on the same pool. That is a harder case for the
+policy than any of the rows above, and a better test of it: a program with no
+end is a program whose attained service only ever grows, so it loses every
+contended slot to anything newer. Which is exactly right when the newer thing is
+a person waiting for an answer.
+
+It is what makes a fleet usable as a **serving layer** — an ingest job on one
+side, questions on the other, one engine underneath, and the read path not
+queuing behind the write path. [RECALL.md](./RECALL.md) builds that.
+
+The alternative — a stream job with a private pool — would be worse in both
+directions: a ceiling of its own to occupy forever, and a program the fairness
+policy cannot see when it decides who gets a slot.
+
 ---
 
 ## The blackboard

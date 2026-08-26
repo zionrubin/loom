@@ -2,6 +2,7 @@ package loom_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,10 +12,12 @@ import (
 
 	loom "github.com/zionrubin/loom"
 	"github.com/zionrubin/loom/core"
+	"github.com/zionrubin/loom/delta"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/security"
+	"github.com/zionrubin/loom/stream"
 )
 
 // notePipeline is a minimal one-call-per-record agent: n records, one infer
@@ -789,5 +792,232 @@ func TestFleetClosed(t *testing.T) {
 	}
 	if _, err := f.Post("t", 1); err == nil {
 		t.Error("a closed fleet accepted a post")
+	}
+}
+
+// --- stream jobs on a fleet ----------------------------------------------
+
+// tickerSource is a stream source that produces n records and then ends, with
+// event times spaced far enough apart to close a window per record.
+type tickerSource struct {
+	n    int
+	sent atomic.Int64
+}
+
+func (s *tickerSource) Splits(context.Context) ([]stream.Split, error) {
+	return []stream.Split{{ID: "only"}}, nil
+}
+
+func (s *tickerSource) Open(context.Context, stream.Split, stream.Position) (stream.Reader, error) {
+	return &tickerReader{src: s}, nil
+}
+
+func (s *tickerSource) Close() error { return nil }
+
+type tickerReader struct{ src *tickerSource }
+
+func (r *tickerReader) Read(_ context.Context, max int, _ time.Duration) ([]stream.Event, error) {
+	i := r.src.sent.Add(1)
+	if i > int64(r.src.n) {
+		return nil, stream.ErrSplitDone
+	}
+	return []stream.Event{{
+		Record: core.NewRecord(fmt.Sprintf("tick-%d", i),
+			map[string]any{"text": fmt.Sprintf("tick %d", i)}),
+		Time: time.Unix(1770000000, 0).Add(time.Duration(i) * time.Minute),
+		Pos:  stream.Position{Offset: i},
+	}}, nil
+}
+
+func (r *tickerReader) Commit(context.Context, stream.Position) error { return nil }
+func (r *tickerReader) Close() error                                  { return nil }
+
+// tickPipeline reads a stream, infers per record, and windows into panes.
+func tickPipeline(name string) *pipeline.Pipeline {
+	p := pipeline.New(name)
+	p.FromStream("ticks").
+		Infer("note", pipeline.InferSpec{
+			Binding: model.Binding{Tier: model.TierFast},
+			Prompt:  "Note: {{.text}}",
+		}).
+		Window("per-minute", stream.WindowSpec{
+			Assigner: stream.Tumbling(time.Minute),
+			Time:     stream.EventTime("at"),
+		}).
+		ReduceAI("digest", pipeline.ReduceAISpec{
+			Binding: model.Binding{Tier: model.TierFast},
+			Prompt:  "Note: {{.Count}} items",
+			FanIn:   8,
+		})
+	return p
+}
+
+// A stream job on a fleet draws on the fleet's slots rather than its own, and
+// is reported as an agent — which is what lets an endless job be scheduled
+// against the finite ones beside it instead of beside them.
+func TestFleetStreamSharesTheFleet(t *testing.T) {
+	reg, mock := fleetRegistry(t, 0)
+	f, err := loom.NewFleet(loom.WithRegistry(reg), loom.WithWorkers(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := &tickerSource{n: 6}
+	var panes atomic.Int64
+	job := f.Stream(ctx, tickPipeline("ticker"),
+		loom.WithSource("ticks", src),
+		loom.WithJobID("ticker-job"),
+		loom.WithSink("digest", stream.SinkFunc(func(context.Context, stream.Batch) error {
+			panes.Add(1)
+			return nil
+		})),
+	)
+	if job.JobID != "ticker-job" {
+		t.Errorf("job ID is %q, want the one it was given", job.JobID)
+	}
+
+	// A batch agent runs on the same fleet while the job does.
+	if _, err := f.Run(ctx, notePipeline("beside", 3, "beside")); err != nil {
+		t.Fatalf("agent beside a stream job: %v", err)
+	}
+
+	res, err := job.Wait()
+	if err != nil {
+		t.Fatalf("stream job: %v", err)
+	}
+	if res.Stream.Records != int64(src.n) {
+		t.Errorf("job read %d records, want %d", res.Stream.Records, src.n)
+	}
+	if panes.Load() == 0 {
+		t.Error("no pane reached the sink")
+	}
+
+	// One governor covers both: the job's calls and the agent's are on the same
+	// bill, which is the point of putting them on one fleet.
+	if spent := f.Spent(); spent.Requests != mock.Calls() {
+		t.Errorf("fleet accounted for %d requests, the model served %d",
+			spent.Requests, mock.Calls())
+	}
+
+	rep := f.Report()
+	var streamRows, batchRows int
+	for _, a := range rep.Agents {
+		if a.Stream {
+			streamRows++
+			if a.RunID != "ticker-job" {
+				t.Errorf("stream row names run %q, want the job ID", a.RunID)
+			}
+			if a.Tasks == 0 {
+				t.Error("the stream row reports no tasks")
+			}
+		} else {
+			batchRows++
+		}
+	}
+	if streamRows != 1 || batchRows != 1 {
+		t.Errorf("report holds %d stream and %d batch agents, want one of each",
+			streamRows, batchRows)
+	}
+	// Fleet.Wait covers the finite agents and does not block on the endless
+	// one, which has already stopped here — the point being that it returns.
+	if err := f.Wait(); err != nil {
+		t.Errorf("fleet wait: %v", err)
+	}
+}
+
+// Cancelling a stream job's context stops it without disturbing the fleet.
+func TestFleetStreamStopsOnCancellation(t *testing.T) {
+	reg, _ := fleetRegistry(t, 0)
+	f, err := loom.NewFleet(loom.WithRegistry(reg), loom.WithWorkers(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	job := f.Stream(ctx, tickPipeline("endless"),
+		loom.WithSource("ticks", &tickerSource{n: 1 << 30}),
+		loom.WithJobID("endless-job"))
+
+	// Let it get going, then stop it the way a deploy would.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	res, err := job.Wait()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled job reported %v", err)
+	}
+	if res != nil && res.Stream.StopReason == "" {
+		t.Error("the job did not say why it stopped")
+	}
+
+	// The fleet is still usable afterwards.
+	if _, err := f.Run(context.Background(), notePipeline("after", 2, "after")); err != nil {
+		t.Errorf("fleet unusable after a cancelled stream job: %v", err)
+	}
+}
+
+// Fleet.Chain is the writer's half of WithContinuation: a context written
+// through it is readable by every agent on the fleet, by hash.
+func TestFleetChainIsReadableByItsAgents(t *testing.T) {
+	reg := model.NewRegistry()
+	// The mock answers with what reached it, so the test can tell whether the
+	// context travelled rather than assuming it did.
+	if _, err := model.RegisterMock(reg, "mock-fast", model.TierFast,
+		model.WithHandler(func(req model.Request) (string, error) {
+			return fmt.Sprintf("saw %d segments", strings.Count(req.Prefix, "<turn>")), nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+	f, err := loom.NewFleet(loom.WithRegistry(reg), loom.WithWorkers(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	chain, err := f.Chain("session/one")
+	if err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	ref, err := chain.Root(delta.Segment{Name: "turn", Body: "the first thing said"})
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	ref, err = chain.Append(ref, delta.Segment{Name: "turn", Body: "the second thing said"})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	ask := func(at delta.Ref) *loom.RunResult {
+		t.Helper()
+		p := pipeline.New("reader")
+		p.FromRecords("q", []core.Record{core.NewRecord("q", map[string]any{"text": "go"})}).
+			Infer("answer", pipeline.InferSpec{
+				Binding: model.Binding{Tier: model.TierFast},
+				Prompt:  "Note: {{.text}}",
+			}, pipeline.WithContinuation("session/one"))
+		res, err := f.Run(context.Background(), p, loom.WithContinuation("session/one", at))
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return res
+	}
+
+	if got := ask(ref).Output[0].String("output"); got != "saw 2 segments" {
+		t.Errorf("the chain did not reach the agent: %q", got)
+	}
+
+	// A third turn is a different revision, so the same pipeline is a different
+	// computation — the cache cannot serve the earlier answer for it.
+	ref, err = chain.Append(ref, delta.Segment{Name: "turn", Body: "the third thing said"})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if got := ask(ref).Output[0].String("output"); got != "saw 3 segments" {
+		t.Errorf("a later revision answered from an earlier one: %q", got)
 	}
 }
