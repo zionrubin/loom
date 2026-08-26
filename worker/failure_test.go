@@ -138,6 +138,10 @@ type scripted struct {
 	// cancelled records tasks whose context was cancelled underneath them,
 	// which is how a fenced worker is observed to stop paying for its work.
 	cancelled map[string]bool
+	// coalesced makes every execution report the outcome a worker's result
+	// cache produces when two identical tasks land on it at once: an answer,
+	// no usage, and the note that it was waited for rather than found.
+	coalesced bool
 }
 
 func newScripted() *scripted {
@@ -168,10 +172,17 @@ func (s *scripted) release() {
 	}
 }
 
+// coalesce makes every execution report a coalesced cache hit.
+func (s *scripted) coalesce() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coalesced = true
+}
+
 func (s *scripted) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	s.mu.Lock()
 	s.calls++
-	gate, err, spent := s.gate, s.err, s.spent
+	gate, err, spent, coalesced := s.gate, s.err, s.spent, s.coalesced
 	s.mu.Unlock()
 
 	select {
@@ -200,6 +211,12 @@ func (s *scripted) Execute(ctx context.Context, t task.Task) (task.Result, error
 		c := r.Clone()
 		c.Data["summary"] = strings.ToUpper(r.String("text"))
 		out = append(out, c)
+	}
+	if coalesced {
+		return task.Result{
+			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: out,
+			CacheHit: true, Coalesced: true, Latency: 7 * time.Millisecond,
+		}, nil
 	}
 	return task.Result{
 		TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: out,

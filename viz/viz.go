@@ -1025,13 +1025,22 @@ func (s *Server) Handle(e observe.Event) {
 		}
 		d.Task = n
 
-	case observe.CacheHit:
+	case observe.CacheHit, observe.CacheCoalesced:
 		n := r.nodeLocked(e.TaskID, e.Stage)
 		if !n.CacheHit {
 			n.CacheHit = true
 			r.cacheHits++
 		}
-		logf(n, now, "cache hit — result replayed, zero model calls")
+		// Both are the same saving — a result served without a model call —
+		// and the view counts them together. The log line is where they part,
+		// because "replayed" and "waited for the task next to me" are very
+		// different things to see happening in a run.
+		if e.Type == observe.CacheCoalesced {
+			logf(n, now, "coalesced — waited %s on an identical task, zero model calls",
+				e.Latency.Round(time.Millisecond))
+		} else {
+			logf(n, now, "cache hit — result replayed, zero model calls")
+		}
 		d.Task = n
 
 	case observe.TaskRetried:

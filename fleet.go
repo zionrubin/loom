@@ -1133,6 +1133,7 @@ func (h *host) executorFor(runners map[string]executor.OpRunner) executor.Execut
 		Runners: runners, Client: h.client, Tools: h.tools,
 		Broadcasts: h.shared, State: h.state,
 		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
+		Coalesce: h.cfg.CoalesceWait,
 	}
 }
 

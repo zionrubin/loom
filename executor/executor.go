@@ -394,6 +394,11 @@ type Local struct {
 	Cache      *store.Cache
 	Lineage    *store.Lineage
 	Bus        *observe.Bus
+	// Coalesce bounds how long a task waits for an identical task already in
+	// flight before running the work itself (zero: store.DefaultCoalesceWait,
+	// negative: no waiting at all). It has no effect without a Cache, because
+	// the lease is what the cache hands out and the wait is for its entry.
+	Coalesce time.Duration
 	// State materializes the evolving contexts task envelopes reference. Nil
 	// unless the deployment enabled them, in which case a task carrying a chain
 	// fails rather than running with no context — the same treatment a
@@ -401,6 +406,25 @@ type Local struct {
 	// executing without the context it was planned with is a wrong answer
 	// wearing a plausible one.
 	State *delta.Store
+}
+
+// coalesceWait is how long this task may wait for an identical one already in
+// flight.
+//
+// It is the configured bound, capped by the task's own budgeted duration: a
+// task allowed five seconds to run must not spend thirty waiting for another
+// task to save it the trouble. The cap is applied here rather than by the
+// deadline the runner gets, because that deadline exists to bound a model call
+// and starting it before the call would charge the wait to the provider.
+func (l *Local) coalesceWait(t task.Task) time.Duration {
+	wait := l.Coalesce
+	if wait <= 0 {
+		wait = store.DefaultCoalesceWait
+	}
+	if d := t.Envelope.Budget.MaxDuration; d > 0 && d < wait {
+		wait = d
+	}
+	return wait
 }
 
 // Execute implements Executor.
@@ -413,19 +437,46 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	}
 
 	// Cache short-circuit: identical op + identical inputs → replay.
+	//
+	// Claim rather than Get, so the two ways a task can be spared its call are
+	// both taken here: an entry that already exists, and an entry another task
+	// is in the middle of writing. The second is the one a cache cannot do
+	// alone — tasks admitted together all miss a cold key at the same instant
+	// — and it costs the follower a bounded wait instead of a model call.
+	//
+	// The lease is released when Execute returns, which is after the result is
+	// stored: a follower woken by it finds the entry rather than the gap this
+	// task was standing in. A task that failed releases too, and its followers
+	// wake to a miss and compute — which is what they would have been doing
+	// all along.
+	var claim store.Claim
 	if t.CacheKey != "" && l.Cache != nil {
-		if recs, ok := l.Cache.Get(t.CacheKey); ok {
-			if l.Bus != nil {
-				l.Bus.Publish(observe.Event{
-					Type: observe.CacheHit, RunID: t.Envelope.RunID,
-					Stage: t.Stage, TaskID: t.ID,
-				})
+		if l.Coalesce < 0 {
+			// Coalescing off: the plain lookup, and identical tasks admitted
+			// together each pay for their own call.
+			if recs, ok := l.Cache.Get(t.CacheKey); ok {
+				claim = store.Claim{Records: recs, Hit: true}
 			}
-			return task.Result{
-				TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: recs,
-				CacheHit: true, Latency: time.Since(start),
-			}, nil
+		} else {
+			claim = l.Cache.Claim(ctx, t.CacheKey, l.coalesceWait(t))
+			defer claim.Release()
 		}
+	}
+	if claim.Hit {
+		if l.Bus != nil {
+			ev := observe.Event{
+				Type: observe.CacheHit, RunID: t.Envelope.RunID,
+				Stage: t.Stage, TaskID: t.ID,
+			}
+			if claim.Coalesced {
+				ev.Type, ev.Latency = observe.CacheCoalesced, claim.Waited
+			}
+			l.Bus.Publish(ev)
+		}
+		return task.Result{
+			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: claim.Records,
+			CacheHit: true, Coalesced: claim.Coalesced, Latency: time.Since(start),
+		}, nil
 	}
 
 	runner, ok := l.Runners[t.Stage]

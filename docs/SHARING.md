@@ -110,8 +110,9 @@ going in — and research does not arrive as identical bytes:
 - **One question, three wordings.** Two desks wanting the same company's revenue
   write two query strings. Same subject, two cache keys.
 - **Same instant, no prior.** Agents launched together all miss a cold key at
-  once, all call out, and all write the same entry. Concurrency is precisely
-  what defeats a write-then-read cache.
+  once. The cache's own single-flight lease collapses the ones that agree on a
+  key, but agreeing on a key is exactly what two wordings of one question do
+  not do, so the desks above still call out four times.
 - **Enough, not identical.** A finding gathered for one purpose often carries
   four of the five fields another agent needs — worth zero to an all-or-nothing
   cache.

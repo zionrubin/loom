@@ -378,8 +378,9 @@ func (w *Worker) settleResult(ctx context.Context, a Assignment, res task.Result
 	receipt := Receipt{
 		TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Worker: w.cfg.Name,
 		Token: l.Token, Records: len(res.Output), Usage: res.Usage,
-		Model: res.Model, CacheHit: res.CacheHit, Artifact: res.Artifact,
-		Latency: res.Latency, Delivery: a.Delivery, At: time.Now(),
+		Model: res.Model, CacheHit: res.CacheHit, Coalesced: res.Coalesced,
+		Artifact: res.Artifact, Latency: res.Latency, Delivery: a.Delivery,
+		At: time.Now(),
 	}
 	if receipt.Latency == 0 {
 		receipt.Latency = time.Since(start)

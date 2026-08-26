@@ -98,6 +98,7 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 		Runners: runners, Client: h.client, Tools: h.tools,
 		Broadcasts: h.shared, State: h.state,
 		Audit: h.audit, Cache: h.cache, Lineage: h.lineage, Bus: h.bus,
+		Coalesce: cfg.CoalesceWait,
 	}
 	caps := worker.CapabilitiesFor(local, cfg.Registry, cfg.Workers)
 	if cfg.WorkerName != "" {

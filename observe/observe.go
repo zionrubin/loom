@@ -19,17 +19,29 @@ import (
 type EventType string
 
 const (
-	RunStarted     EventType = "run.started"
-	RunFinished    EventType = "run.finished"
-	StageStarted   EventType = "stage.started"
-	StageFinished  EventType = "stage.finished"
-	TaskScheduled  EventType = "task.scheduled"
-	TaskStarted    EventType = "task.started"
-	TaskCompleted  EventType = "task.completed"
-	TaskRetried    EventType = "task.retried"
-	TaskFailed     EventType = "task.failed"
-	ModelCalled    EventType = "model.called"
-	CacheHit       EventType = "cache.hit"
+	RunStarted    EventType = "run.started"
+	RunFinished   EventType = "run.finished"
+	StageStarted  EventType = "stage.started"
+	StageFinished EventType = "stage.finished"
+	TaskScheduled EventType = "task.scheduled"
+	TaskStarted   EventType = "task.started"
+	TaskCompleted EventType = "task.completed"
+	TaskRetried   EventType = "task.retried"
+	TaskFailed    EventType = "task.failed"
+	ModelCalled   EventType = "model.called"
+	CacheHit      EventType = "cache.hit"
+	// CacheCoalesced is a task served by the result cache that the cache alone
+	// could not have served: its key was cold when the task was admitted, and
+	// it waited for the identical task already computing the answer instead of
+	// making the same paid call beside it. Latency is how long that wait took.
+	//
+	// It is published *instead of* CacheHit, not beside it, so a run's events
+	// never double-count one task — consumers that want the total add the two.
+	// The distinction is worth carrying because the two numbers answer
+	// different questions: hits say what an earlier run or an earlier task
+	// already paid for, coalesced serves say what this run's own concurrency
+	// would have paid for twice.
+	CacheCoalesced EventType = "cache.coalesced"
 	BudgetExceeded EventType = "budget.exceeded"
 	// BroadcastRegistered announces one run-level shared value, once, before
 	// any task reads it.
@@ -378,12 +390,17 @@ func (b *Bus) Close() {
 
 // StageStats aggregates one stage's execution.
 type StageStats struct {
-	Stage      string
-	Tasks      int
-	Completed  int
-	Failed     int
-	Retries    int
-	CacheHits  int
+	Stage     string
+	Tasks     int
+	Completed int
+	Failed    int
+	Retries   int
+	CacheHits int
+	// Coalesced counts the CacheHits that were served by waiting on an
+	// identical task rather than by finding an entry already stored — the
+	// share of this stage's replays that only exist because the result cache
+	// hands out a single-flight lease.
+	Coalesced  int
 	ModelCalls int
 	Usage      core.Usage
 	// PrefixSavedUSD is what this stage's shared prompt prefix was worth:
@@ -522,6 +539,32 @@ func (r RunReport) Routing() (routed, skipped int, savedUSD float64, probes, hit
 	return
 }
 
+// CacheHits sums the run's replays: results served without a model call,
+// whether from an entry an earlier task stored or by waiting on one being
+// stored right now.
+func (r RunReport) CacheHits() int {
+	n := 0
+	for _, s := range r.Stages {
+		n += s.CacheHits
+	}
+	return n
+}
+
+// Coalesced sums the cache hits the cache could not have served on its own:
+// tasks whose key was cold when they were admitted and which waited for the
+// identical task already computing it instead of making the same call.
+//
+// It is the single-flight lease's whole receipt. A run with duplicates in
+// flight reports them here; a run whose tasks are all distinct reports zero
+// and pays nothing for the mechanism.
+func (r RunReport) Coalesced() int {
+	n := 0
+	for _, s := range r.Stages {
+		n += s.Coalesced
+	}
+	return n
+}
+
 // Duration is total run wall time.
 func (r RunReport) Duration() time.Duration {
 	if r.Started.IsZero() || r.Finished.IsZero() {
@@ -553,6 +596,13 @@ func (r RunReport) String() string {
 	if t.CacheReadTokens > 0 || t.CacheWriteTokens > 0 {
 		fmt.Fprintf(&b, "prefix cache: %d tokens served from shared prefixes, $%.4f saved\n",
 			t.CacheReadTokens, r.PrefixSavedUSD())
+	}
+	// Broken out of the cache column rather than folded into it, because these
+	// are the replays that would not have happened at all without the lease:
+	// the entry did not exist when the task was admitted.
+	if n := r.Coalesced(); n > 0 {
+		fmt.Fprintf(&b, "coalesced: %d of %d cache hits waited on an identical task "+
+			"rather than repeating its call\n", n, r.CacheHits())
 	}
 	for _, s := range r.Stages {
 		if s.Rounds > 0 {
@@ -669,6 +719,10 @@ func (c *Collector) Handle(e Event) {
 		c.stage(e.Stage).Retries++
 	case CacheHit:
 		c.stage(e.Stage).CacheHits++
+	case CacheCoalesced:
+		st := c.stage(e.Stage)
+		st.CacheHits++
+		st.Coalesced++
 	case RoundFinished:
 		c.stage(e.Stage).Rounds++
 	case DeltaSpliced:

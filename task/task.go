@@ -143,6 +143,13 @@ type Result struct {
 	Usage    core.Usage    `json:"usage"`
 	Model    string        `json:"model,omitempty"`
 	CacheHit bool          `json:"cache_hit,omitempty"`
-	Artifact string        `json:"artifact,omitempty"`
-	Latency  time.Duration `json:"latency,omitempty"`
+	// Coalesced narrows CacheHit to the hits the cache could not have served
+	// on its own: the entry did not exist when this task was admitted, and it
+	// waited for the identical task that was already computing it instead of
+	// making the same call a second time. Every coalesced result is also a
+	// cache hit, so a consumer counting hits needs no change to keep counting
+	// them; one asking what the single-flight lease was worth reads this.
+	Coalesced bool          `json:"coalesced,omitempty"`
+	Artifact  string        `json:"artifact,omitempty"`
+	Latency   time.Duration `json:"latency,omitempty"`
 }
