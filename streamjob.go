@@ -78,7 +78,7 @@ func Stream(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (*StreamR
 		return nil, err
 	}
 	defer h.close()
-	return h.launchStream(ctx, p, h.cfg)
+	return h.launchStream(ctx, p, h.cfg, nil)
 }
 
 // StreamResult is the outcome of a stream job.
@@ -356,8 +356,24 @@ type windowStage struct {
 	w  *stream.Windower
 }
 
+// engineOn builds the job's execution engine: on the fleet's shared pool when
+// there is one, on a private pool of n slots when the job runs alone.
+func engineOn(pool *runtime.Pool, sched *runtime.Scheduler, n int) *runtime.Engine {
+	if pool != nil {
+		return runtime.NewEngineOn(pool, sched)
+	}
+	return runtime.NewEngine(sched, n)
+}
+
 // launchStream provisions and runs a stream job on this host.
-func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Config) (*StreamResult, error) {
+//
+// pool is the fleet's shared slot pool, or nil for a job that runs alone. On a
+// fleet the distinction matters more here than anywhere else: a stream job is
+// the one agent that never finishes, so a private pool would give it a private
+// ceiling to occupy forever, and every other agent on the fleet would be
+// competing with a program the fairness policy could not see.
+func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Config,
+	pool *runtime.Pool) (*StreamResult, error) {
 	jobID := cfg.JobID
 	if jobID == "" {
 		jobID = core.NewID("job")
@@ -403,7 +419,7 @@ func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Confi
 			plan: pl, runID: jobID, cfg: cfg, sched: sched, bus: h.bus,
 			outputs: map[string][]core.Record{},
 		},
-		engine:            runtime.NewEngine(&sched, workers),
+		engine:            engineOn(pool, &sched, workers),
 		pipes:             map[string]*runtime.Pipe{},
 		store:             store,
 		gate:              newIngestGate(),

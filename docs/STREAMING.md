@@ -426,6 +426,13 @@ asynchronous stages, pane-delimited aggregates, sinks, quiesce checkpointing,
 restart; `stream/kafka` source and sink over franz-go. Marks on the existing
 runtime pipe, so one implementation serves both drivers.
 
+`Fleet.Stream` runs a job on a fleet's shared slot pool rather than a private
+one, which is what lets an endless job coexist with the agents around it: a
+stream job is the one program that never finishes, so a pool of its own would be
+a ceiling it occupied forever and a program the fairness policy could not see.
+[RECALL.md](./RECALL.md) is what that makes possible — a serving layer whose
+read path does not queue behind its write path.
+
 ### Phase 3 — semantics hardening
 
 - **Transactional sinks.** A two-phase `Write`/`Commit` contract already exists;
@@ -445,7 +452,15 @@ runtime pipe, so one implementation serves both drivers.
 - **Session windows.** A merging assigner: assign `[t, t+gap)`, merge
   overlapping windows on arrival. The `Assigner` interface is already shaped to
   take a `Merging` sibling. Sessions are the natural window for conversation
-  streams, and pair with `delta` continuations.
+  streams, and pair with `delta` continuations — `recall.Desk` cuts per
+  conversation with a tumbling window and a count trigger precisely because the
+  merging assigner it wants does not exist yet.
+- **Idle-source watermark advancement.** A window closes when event time passes
+  its end, and event time advances because records arrive — so the last window
+  of a feed that has gone quiet stays open indefinitely. `recall.Feed` works
+  around it by emitting a heartbeat event that the pipeline drops, which is a
+  workaround rather than a mechanism: the job itself should be able to advance
+  event time to processing time for splits a live source declares idle.
 - **Side outputs for late records.** `LatePolicy` currently drops or fails;
   routing them to a named stage or a dead-letter sink is the third option.
 - **Dead-letter routing for undecodable input.** The count exists; the topic

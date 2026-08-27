@@ -74,6 +74,7 @@ type Fleet struct {
 	board   map[string][]Post
 	topics  []string
 	agents  []*Agent
+	streams []*StreamAgent
 	started time.Time
 	closed  bool
 }
@@ -222,6 +223,94 @@ func (f *Fleet) Run(ctx context.Context, p *pipeline.Pipeline, opts ...Option) (
 	return f.Go(ctx, p, opts...).Wait()
 }
 
+// StreamAgent is a stream job running on a fleet: the same handle an Agent is,
+// for a program that has no natural end.
+type StreamAgent struct {
+	// Name is the pipeline's name and JobID the identity a restart resumes
+	// under, both set before Stream returns.
+	Name  string
+	JobID string
+
+	done chan struct{}
+	res  *StreamResult
+	err  error
+}
+
+// Wait blocks until the job stops — which, for an unbounded source, means
+// until its context is cancelled or a stream limit is reached — and returns
+// its result.
+func (a *StreamAgent) Wait() (*StreamResult, error) {
+	<-a.done
+	return a.res, a.err
+}
+
+// Done is closed when the job stops.
+func (a *StreamAgent) Done() <-chan struct{} { return a.done }
+
+// Stream starts p as a stream job on the fleet and returns immediately.
+//
+// It is loom.Stream with the fleet's engine underneath, and the difference is
+// the whole reason it exists: a job that never ends holds slots forever, so it
+// has to hold the *fleet's* slots rather than a private set the fairness policy
+// cannot see. Sharing them makes the pool's attained-service admission mean
+// what it claims — a three-call agent launched now has been served nothing and
+// wins the next contended slot from an ingest job that has been running for an
+// hour. That is what lets a fleet be a serving layer: the read path does not
+// queue behind the write path.
+//
+// The per-agent options are an agent's, as with Go, plus the stream-mode ones
+// (WithSource, WithSink, WithJobID, WithCheckpointEvery, WithLateness,
+// WithIdleTimeout, WithStreamLimit, WithPolling, WithDrainOnStop), which
+// describe this job rather than the fleet.
+//
+// Fleet.Wait does not wait on stream jobs. A program with no end has no
+// completion for Wait to mean, so a stream agent is waited on through its own
+// handle and stopped by cancelling its context.
+func (f *Fleet) Stream(ctx context.Context, p *pipeline.Pipeline, opts ...Option) *StreamAgent {
+	a := &StreamAgent{Name: p.Name, done: make(chan struct{})}
+
+	cfg, err := f.agentConfig(opts)
+	if err != nil {
+		a.err = err
+		close(a.done)
+		return a
+	}
+	if cfg.JobID == "" {
+		cfg.JobID = core.NewID("job")
+	}
+	a.JobID = cfg.JobID
+
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		a.err = fmt.Errorf("fleet: closed")
+		close(a.done)
+		return a
+	}
+	f.streams = append(f.streams, a)
+	f.mu.Unlock()
+
+	go func() {
+		defer close(a.done)
+		a.res, a.err = f.host.launchStream(ctx, p, cfg, f.pool)
+	}()
+	return a
+}
+
+// Chain opens an evolving context on the fleet's content-addressed store.
+//
+// It is the writer's half of WithContinuation. A chain opened here is written
+// by whoever holds it and readable by every agent on the fleet — and by every
+// worker process sharing the state directory — because a revision is named by
+// its hash, and a hash is a name any process with the same store can resolve.
+// That is what makes a context maintained by one program and read by another a
+// reference rather than a copy.
+//
+// The renderer is the fleet's (loom.WithDeltaRenderer, default delta.Tags), so
+// chains opened here and the states materialized for tasks are the same
+// version by construction.
+func (f *Fleet) Chain(key string) (*delta.Chain, error) { return f.host.state.Chain(key) }
+
 // Wait blocks until every agent has finished and returns the first error any
 // of them reported. It walks the roster by index rather than snapshotting it,
 // so an agent launched while Wait is blocked is waited on too.
@@ -275,6 +364,11 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 
 	cfg := f.cfg
 	cfg.EgressAllow = slices.Clone(cfg.EgressAllow)
+	// Cloned because WithContinuation writes into the map rather than replacing
+	// it: an agent naming its own revision must not move the fleet's, or two
+	// agents reading two contexts would be one agent reading whichever wrote
+	// last.
+	cfg.Continuations = maps.Clone(cfg.Continuations)
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -498,6 +592,9 @@ type AgentReport struct {
 	MaxWait time.Duration
 	Tasks   int
 	Err     error
+	// Stream marks an agent whose input never ends, and whose JCT is therefore
+	// how long it has been running rather than how long it took.
+	Stream bool
 }
 
 // FleetReport is the aggregate view of a fleet: every agent, the pool they
@@ -548,6 +645,7 @@ func (r FleetReport) Occupancy() float64 {
 func (f *Fleet) Report() FleetReport {
 	f.mu.Lock()
 	agents := slices.Clone(f.agents)
+	streams := slices.Clone(f.streams)
 	topics, posts := len(f.topics), 0
 	for _, ps := range f.board {
 		posts += len(ps)
@@ -591,6 +689,30 @@ func (f *Fleet) Report() FleetReport {
 		ar.Service, ar.Wait, ar.MaxWait = ps.Service, ps.Wait, ps.MaxWait
 		rep.Agents = append(rep.Agents, ar)
 	}
+	// Stream jobs are agents too, and on a fleet that serves queries while it
+	// ingests they are the row that explains the others: the slot-time in this
+	// line is the slot-time the query agents were competing for.
+	for _, a := range streams {
+		ar := AgentReport{Name: a.Name, RunID: a.JobID, Stream: true}
+		select {
+		case <-a.done:
+			ar.Err = a.err
+		default:
+		}
+		if tr := f.host.trace(a.JobID); tr != nil {
+			ar.Report = tr.collector.Report()
+			ar.JCT = ar.Report.Duration()
+			for _, st := range ar.Report.Stages {
+				ar.Tasks += st.Tasks
+				if st.Finished.After(rep.Finished) {
+					rep.Finished = st.Finished
+				}
+			}
+		}
+		ps := byProgram[a.JobID]
+		ar.Service, ar.Wait, ar.MaxWait = ps.Service, ps.Wait, ps.MaxWait
+		rep.Agents = append(rep.Agents, ar)
+	}
 	if rep.Finished.IsZero() {
 		rep.Finished = time.Now()
 	}
@@ -611,8 +733,15 @@ func (r FleetReport) String() string {
 	var totService, totWait time.Duration
 	for _, a := range r.Agents {
 		u := a.Report.Totals()
+		name := a.Name
+		if a.Stream {
+			// Marked rather than sorted apart: a stream job's row belongs next
+			// to the agents it shared slots with, and what it needs is for its
+			// jct to be read as elapsed rather than as finished.
+			name += " ~"
+		}
 		fmt.Fprintf(&b, "%-20s %-14s %6d %6d %8d %10.4f %9s %9s %9s\n",
-			clip(a.Name, 20), clip(a.RunID, 14), len(a.Report.Stages), a.Tasks,
+			clip(name, 20), clip(a.RunID, 14), len(a.Report.Stages), a.Tasks,
 			u.TotalTokens(), u.CostUSD,
 			a.Service.Round(time.Millisecond), a.Wait.Round(time.Millisecond),
 			a.JCT.Round(time.Millisecond))

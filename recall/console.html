@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom · recall</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0a10'/%3E%3Cpath d='M3 4h10M3 8h10M3 12h6' stroke='%232ab5a6' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --surface: #0a0a10;
+    --panel: #14141c;
+    --hairline: rgba(255,255,255,.10);
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --ink-3: #898781;
+    --accent: #2ab5a6;
+    --live: #3987e5;
+    --warn: #fab219;
+    --cached: #9085e9;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: radial-gradient(120% 90% at 50% 0%, #10101a 0%, var(--surface) 55%, #07070c 100%);
+    color: var(--ink-2);
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--hairline);
+  }
+  .brand { font-size: 14px; letter-spacing: .22em; color: var(--ink); font-weight: 600; }
+  .brand small { letter-spacing: .08em; color: var(--ink-3); font-weight: 400; margin-left: 8px; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
+  .stat b { display: block; font-size: 14px; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 9.5px; letter-spacing: .12em; color: var(--ink-3); text-transform: uppercase; }
+  .stat.behind b { color: var(--warn); }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) minmax(320px, 34%); min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } #contextPane { display: none; } }
+
+  #thread { overflow-y: auto; padding: 20px 24px 8px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 62ch; line-height: 1.55; font-size: 14px; }
+  .msg.q { align-self: flex-end; background: rgba(57,135,229,.12); border: 1px solid rgba(57,135,229,.32);
+           border-radius: 12px 12px 2px 12px; padding: 9px 13px; color: var(--ink); white-space: pre-wrap; }
+  .msg.a { align-self: flex-start; white-space: pre-wrap; }
+  .prov { font-size: 11px; color: var(--ink-3); margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { border: 1px solid var(--hairline); border-radius: 999px; padding: 1px 8px; }
+  .chip.cached { color: var(--cached); border-color: rgba(144,133,233,.4); }
+  .chip.behind { color: var(--warn); border-color: rgba(250,178,25,.4); }
+  .chip.empty  { color: var(--ink-3); }
+  .hint { color: var(--ink-3); font-size: 13px; line-height: 1.6; max-width: 60ch; }
+  .hint code { color: var(--accent); }
+
+  form { display: flex; gap: 10px; padding: 14px 24px 20px; border-top: 1px solid var(--hairline); }
+  input[type=text] {
+    flex: 1; background: var(--panel); border: 1px solid var(--hairline); border-radius: 8px;
+    padding: 10px 13px; color: var(--ink); font: inherit; font-size: 14px;
+  }
+  input[type=text]:focus { outline: none; border-color: rgba(42,181,166,.5); }
+  button {
+    background: rgba(42,181,166,.14); border: 1px solid rgba(42,181,166,.4); color: var(--accent);
+    border-radius: 8px; padding: 0 18px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+
+  #contextPane { border-left: 1px solid var(--hairline); display: flex; flex-direction: column; min-height: 0; }
+  #contextHead {
+    padding: 12px 18px; border-bottom: 1px solid var(--hairline);
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  }
+  #contextHead em { font-style: normal; color: var(--accent); letter-spacing: 0; text-transform: none; font-size: 12px; }
+  #context {
+    flex: 1; overflow: auto; margin: 0; padding: 14px 18px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    line-height: 1.6; color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
+  }
+  .flash { animation: flash 1.1s ease-out; }
+  @keyframes flash { from { background: rgba(42,181,166,.16); } to { background: transparent; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">LOOM <small>recall · <span id="deskName">desk</span></small></div>
+  <div class="stats">
+    <div class="stat"><b id="sVersion">0</b><span>version</span></div>
+    <div class="stat"><b id="sEntries">0</b><span>entries</span></div>
+    <div class="stat"><b id="sBytes">0</b><span>context</span></div>
+    <div class="stat"><b id="sPosted">0</b><span>messages</span></div>
+    <div class="stat behind"><b id="sBehind">0</b><span>behind</span></div>
+    <div class="stat"><b id="sCost">$0.0000</b><span>spent</span></div>
+  </div>
+</header>
+
+<main>
+  <section style="display:flex;flex-direction:column;min-height:0">
+    <div id="thread">
+      <p class="hint">This desk answers from a context it maintains continuously. Ingest
+        conversations with <code>POST /ingest</code>; the context on the right is what a
+        model sees when you ask something. Nothing here reads the conversations at query
+        time — the reading already happened.</p>
+    </div>
+    <form id="ask">
+      <input id="q" type="text" autocomplete="off" placeholder="Ask the desk something…" autofocus>
+      <button id="send" type="submit">Ask</button>
+    </form>
+  </section>
+
+  <aside id="contextPane">
+    <div id="contextHead"><span>living context</span><em id="ctxMeta">—</em></div>
+    <pre id="context">(empty)</pre>
+  </aside>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const session = "console-" + Math.random().toString(36).slice(2, 8);
+let version = -1;
+
+function bytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1048576).toFixed(1) + " MiB";
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+async function refreshStats() {
+  try {
+    const s = await (await fetch("stats")).json();
+    $("deskName").textContent = s.name;
+    $("sVersion").textContent = s.view.version;
+    $("sEntries").textContent = s.view.entries + (s.view.brief ? "+brief" : "");
+    $("sBytes").textContent = bytes(s.view.bytes);
+    $("sPosted").textContent = s.posted;
+    $("sBehind").textContent = Math.max(0, s.posted - s.view.messages);
+    $("sCost").textContent = "$" + (s.spent.cost_usd || 0).toFixed(4);
+  } catch (e) { /* the desk may be starting or gone; the next tick retries */ }
+}
+
+// Long-poll rather than time-poll: the request returns when ingestion publishes
+// a revision past the one already shown, so a quiet desk costs one idle
+// connection instead of a request a second.
+async function follow() {
+  for (;;) {
+    try {
+      const v = await (await fetch("updates?version=" + version + "&wait=25s")).json();
+      if (v.version !== version) {
+        version = v.version;
+        const pre = $("context");
+        pre.textContent = v.text || "(empty)";
+        pre.classList.remove("flash");
+        void pre.offsetWidth;
+        pre.classList.add("flash");
+        $("ctxMeta").textContent = "v" + v.version + " · " + v.entries + " entries · " + bytes(v.bytes);
+        refreshStats();
+      }
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+$("ask").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const text = $("q").value.trim();
+  if (!text) return;
+  $("q").value = "";
+  $("send").disabled = true;
+
+  const thread = $("thread");
+  thread.appendChild(el("div", "msg q", text));
+  const answer = el("div", "msg a", "…");
+  thread.appendChild(answer);
+  thread.scrollTop = thread.scrollHeight;
+
+  try {
+    const res = await fetch("ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, text }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const a = await res.json();
+    answer.textContent = a.text;
+
+    const prov = el("div", "prov");
+    prov.appendChild(el("span", "chip", "v" + a.version));
+    prov.appendChild(el("span", "chip", a.entries + " entries"));
+    prov.appendChild(el("span", "chip", (a.latency / 1e6).toFixed(0) + " ms"));
+    if (a.cached) prov.appendChild(el("span", "chip cached", "cached"));
+    if (a.empty) prov.appendChild(el("span", "chip empty", "nothing ingested"));
+    if (a.behind > 0) prov.appendChild(el("span", "chip behind", a.behind + " behind"));
+    answer.appendChild(prov);
+  } catch (err) {
+    answer.textContent = "the desk could not answer: " + err.message;
+  } finally {
+    $("send").disabled = false;
+    $("q").focus();
+    thread.scrollTop = thread.scrollHeight;
+    refreshStats();
+  }
+});
+
+refreshStats();
+setInterval(refreshStats, 3000);
+follow();
+</script>
+</body>
+</html>
