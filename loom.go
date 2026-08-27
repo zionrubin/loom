@@ -37,13 +37,19 @@ import (
 
 // Config controls a run. Build it with Options passed to Run.
 type Config struct {
-	Workers         int
-	Retry           runtime.RetryPolicy
-	RunBudget       core.Budget
-	Registry        *model.Registry
-	Secrets         map[security.SecretRef]string
-	EgressAllow     []string
-	StateDir        string
+	Workers     int
+	Retry       runtime.RetryPolicy
+	RunBudget   core.Budget
+	Registry    *model.Registry
+	Secrets     map[security.SecretRef]string
+	EgressAllow []string
+	StateDir    string
+	// CoalesceWait bounds how long a task waits for an identical task already
+	// running before it makes the same call itself. Zero is
+	// store.DefaultCoalesceWait; a negative value turns the result cache's
+	// single-flight lease off, which WithoutCoalescing is the readable way to
+	// say.
+	CoalesceWait    time.Duration
 	ContinueOnError bool
 	Tools           []executor.Tool
 	MCPServers      []mcp.Server
@@ -158,6 +164,28 @@ func WithEgress(hosts ...string) Option {
 // artifact store and result cache survive process restarts, making reruns
 // resume completed AI work instead of re-spending tokens.
 func WithStateDir(dir string) Option { return func(c *Config) { c.StateDir = dir } }
+
+// WithCoalesceWait bounds how long a task waits for an identical task already
+// in flight before it runs the work itself (default 30s).
+//
+// The wait is a bound on a saving, never on an answer: a task that reaches it
+// computes exactly what it would have computed without the lease. Raise it for
+// a slow stage whose duplicates are expensive, lower it when occupancy matters
+// more than the duplicate call it would have avoided.
+func WithCoalesceWait(d time.Duration) Option {
+	return func(c *Config) { c.CoalesceWait = d }
+}
+
+// WithoutCoalescing turns off the result cache's single-flight lease, so
+// concurrent tasks with identical keys each run their own call.
+//
+// The lease never changes an answer — the key is a deterministic fingerprint
+// of the op and its inputs, so the tasks it collapses are the same computation
+// — but it does change *when* a task runs, and a measurement that wants N
+// identical tasks to make N calls needs to be able to say so.
+func WithoutCoalescing() Option {
+	return func(c *Config) { c.CoalesceWait = -1 }
+}
 
 // WithContinueOnError dead-letters failing tasks and continues instead of
 // aborting the run on first failure.

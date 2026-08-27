@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/zionrubin/loom/core"
 	"github.com/zionrubin/loom/executor"
 	"github.com/zionrubin/loom/model"
+	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
@@ -683,4 +685,145 @@ func TestEgressDenied(t *testing.T) {
 	if denials[1].Action != "egress" || denials[1].Subject != "exfil.example" {
 		t.Errorf("second denial should be the egress block: %+v", denials[1])
 	}
+}
+
+// TestConcurrentIdenticalTasksCoalesce is the result cache's single-flight
+// lease, stated as the only thing that makes it worth having: four tasks that
+// are the same computation, admitted together against a cold cache, make one
+// paid call between them instead of four.
+//
+// The control run is the same pipeline one option apart. Without the lease all
+// four call the model — which is what says the four really were concurrent,
+// and therefore what makes the number above a measurement rather than an
+// accident of scheduling.
+func TestConcurrentIdenticalTasksCoalesce(t *testing.T) {
+	const identical = 4
+
+	// Four copies of one record: same ID, same data, so the planner's
+	// fingerprint of (op, input) is the same key four times over.
+	records := make([]core.Record, identical)
+	for i := range records {
+		records[i] = core.NewRecord("dup", map[string]any{"subject": "one question"})
+	}
+
+	build := func() *pipeline.Pipeline {
+		p := pipeline.New("duplicates")
+		p.FromRecords("asked", records).
+			Infer("answer", pipeline.InferSpec{
+				Binding: model.Binding{Tier: model.TierFast},
+				Prompt:  "Answer: {{.subject}}",
+			})
+		return p
+	}
+
+	var hits, coalescedEvents atomic.Int64
+	run := func(t *testing.T, extra ...loom.Option) (*loom.RunResult, int) {
+		t.Helper()
+		hits.Store(0)
+		coalescedEvents.Store(0)
+		release := make(chan struct{})
+		reg := model.NewRegistry()
+		fast, err := model.RegisterMock(reg, "mock-fast", model.TierFast,
+			model.WithHandler(func(model.Request) (string, error) {
+				// Every call is held until the run has admitted all four tasks,
+				// so a task that was going to duplicate this one has provably
+				// arrived before this one finishes. Otherwise the first task
+				// could finish first and the rest would be ordinary cache
+				// hits, which is a different (and already tested) property.
+				<-release
+				return "answered", nil
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var started atomic.Int64
+		var once sync.Once
+		opts := append([]loom.Option{
+			loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
+			loom.WithWorkers(identical),
+			loom.WithEventHandler(func(e observe.Event) {
+				// The handler an existing consumer already wrote: it knows
+				// about cache.hit and nothing else. A coalesced serve has to
+				// reach it, or adding the lease would quietly subtract from
+				// every cache-hit counter in the wild.
+				if e.Type == observe.CacheHit {
+					hits.Add(1)
+					if e.Coalesced {
+						coalescedEvents.Add(1)
+					}
+				}
+				if e.Type != observe.TaskStarted || e.Stage != "answer" {
+					return
+				}
+				if started.Add(1) < identical {
+					return
+				}
+				once.Do(func() {
+					// Started is published immediately before the executor is
+					// entered; the grace is for the few instructions between
+					// that and the followers reaching the lease.
+					time.Sleep(100 * time.Millisecond)
+					close(release)
+				})
+			}),
+		}, extra...)
+
+		res, err := loom.Run(context.Background(), build(), opts...)
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return res, fast.Calls()
+	}
+
+	t.Run("with the lease", func(t *testing.T) {
+		res, calls := run(t)
+		if calls != 1 {
+			t.Errorf("model calls = %d, want 1: identical tasks must share one call", calls)
+		}
+		if n := res.Report.Coalesced(); n != identical-1 {
+			t.Errorf("coalesced = %d, want %d", n, identical-1)
+		}
+		if n := res.Report.CacheHits(); n != identical-1 {
+			t.Errorf("cache hits = %d, want %d: every coalesced serve is a hit too",
+				n, identical-1)
+		}
+		// The saving must not cost an answer: the tasks that waited come away
+		// with the same records the task that called came away with.
+		if len(res.Output) != identical {
+			t.Fatalf("output = %d records, want %d", len(res.Output), identical)
+		}
+		for i, r := range res.Output {
+			if got := r.String("output"); got != "answered" {
+				t.Errorf("record %d = %q, want the leader's answer", i, got)
+			}
+		}
+		if res.Spent.Requests != 1 {
+			t.Errorf("governor charged %d requests, want 1", res.Spent.Requests)
+		}
+		// Compatibility: a coalesced serve is a cache.hit carrying an
+		// attribute, not an event type of its own, so a handler that only
+		// knows about cache.hit still sees all three.
+		if n := hits.Load(); n != identical-1 {
+			t.Errorf("cache.hit events = %d, want %d: an existing handler must not "+
+				"silently undercount", n, identical-1)
+		}
+		if n := coalescedEvents.Load(); n != identical-1 {
+			t.Errorf("coalesced hits = %d, want %d", n, identical-1)
+		}
+	})
+
+	t.Run("without the lease", func(t *testing.T) {
+		res, calls := run(t, loom.WithoutCoalescing())
+		if calls != identical {
+			t.Errorf("model calls = %d, want %d: with coalescing off every task pays",
+				calls, identical)
+		}
+		if n := res.Report.Coalesced(); n != 0 {
+			t.Errorf("coalesced = %d, want 0", n)
+		}
+		if n := coalescedEvents.Load(); n != 0 {
+			t.Errorf("coalesced hits = %d, want 0 with the lease off", n)
+		}
+	})
 }

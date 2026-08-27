@@ -328,6 +328,8 @@ func compare(plain, shared *outcome) string {
 		fmt.Sprintf("$%.4f", float64(shared.calls)*sourceCostUSD))
 	fmt.Fprintf(&b, "%-22s %14d %14d\n", "result-cache hits",
 		cacheHits(plain.report), cacheHits(shared.report))
+	fmt.Fprintf(&b, "%-22s %14d %14d\n", "  of those, coalesced",
+		coalesced(plain.report), coalesced(shared.report))
 	fmt.Fprintf(&b, "%-22s %14s %14s\n", "spent on models",
 		fmt.Sprintf("$%.4f", plain.report.Spent.CostUSD),
 		fmt.Sprintf("$%.4f", shared.report.Spent.CostUSD))
@@ -338,18 +340,32 @@ func compare(plain, shared *outcome) string {
 		s.Reused(), s.Asked)
 	fmt.Fprintf(&b, "  once per subject rather than once per desk.\n")
 
+	// What the result cache's single-flight lease did, in both columns.
+	// Removing the source's latency makes the desks arrive at the note stage
+	// together, which is precisely when a cache alone serves nobody: the entry
+	// does not exist yet. These are the hits that only exist because a task
+	// waited for the identical task already computing them.
+	if n := coalesced(plain.report) + coalesced(shared.report); n > 0 {
+		fmt.Fprintf(&b, "\n  %d of the result-cache hits above were coalesced: the entry did not exist\n", n)
+		fmt.Fprintf(&b, "  when the task was admitted, so it waited for the identical task already\n")
+		fmt.Fprintf(&b, "  computing it instead of making the same call beside it. That is the same\n")
+		fmt.Fprintf(&b, "  herd the gate regulates at the source, regulated one level down — pass\n")
+		fmt.Fprintf(&b, "  loom.WithoutCoalescing() to watch them become duplicate model calls.\n")
+	}
+
 	// An honest reading of the model column, which does not move the way the
 	// source column does — and sometimes moves the wrong way.
 	if shared.report.Spent.CostUSD >= plain.report.Spent.CostUSD {
 		fmt.Fprintf(&b, "\n  note the model column: spend is *not* lower with the commons, and here it\n")
-		fmt.Fprintf(&b, "  is slightly higher. The layer removes duplicate calls to the source, not\n")
-		fmt.Fprintf(&b, "  duplicate model calls — and by removing the source's latency it makes the\n")
-		fmt.Fprintf(&b, "  desks arrive at the note stage together, so more identical note tasks are\n")
-		fmt.Fprintf(&b, "  in flight at once and the result cache (%d hits, against %d without) serves\n",
+		fmt.Fprintf(&b, "  is slightly higher — for a reason worth naming exactly, because it is no\n")
+		fmt.Fprintf(&b, "  longer the herd. The commons stamps each brief with how it was obtained,\n")
+		fmt.Fprintf(&b, "  and that field rides into the note task's input: four desks whose answers\n")
+		fmt.Fprintf(&b, "  arrived four different ways are four different tasks, so the result cache\n")
+		fmt.Fprintf(&b, "  serves %d of them against %d without. A cache keyed on input content is right\n",
 			cacheHits(shared.report), cacheHits(plain.report))
-		fmt.Fprintf(&b, "  fewer of them. That is the same thundering herd, one level up: the result\n")
-		fmt.Fprintf(&b, "  cache has no single-flight lease, so concurrent identical tasks both run.\n")
-		fmt.Fprintf(&b, "  Worth knowing, and worth fixing there rather than pretending here.\n")
+		fmt.Fprintf(&b, "  to treat them as different; drop the provenance from the record and both\n")
+		fmt.Fprintf(&b, "  columns replay identically. The saving lands at the source, where the\n")
+		fmt.Fprintf(&b, "  money is, and the model column is the price of being told why.\n")
 	}
 
 	// The overhead claim, stated as a ratio rather than as an adjective.
@@ -416,6 +432,17 @@ func cacheHits(r loom.FleetReport) int {
 		for _, st := range a.Report.Stages {
 			n += st.CacheHits
 		}
+	}
+	return n
+}
+
+// coalesced totals the replays that were served by waiting on an identical
+// task rather than by finding one already stored — the share of the hits
+// above that a cache without a single-flight lease would not have produced.
+func coalesced(r loom.FleetReport) int {
+	n := 0
+	for _, a := range r.Agents {
+		n += a.Report.Coalesced()
 	}
 	return n
 }

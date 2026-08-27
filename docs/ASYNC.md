@@ -352,12 +352,18 @@ merely wrong for a long-lived worker fleet and is now wrong for a long-lived
 *fleet*, which is a thing that exists. An LRU over content-addressed blocks
 remains the obvious answer, and it now applies to the findings ledger too.
 
-**No single-flight on the result cache.** The findings gate has a lease, so
-concurrent askers of one question become one call. The result cache does not, so
-concurrent *identical tasks* both run and both write. This was invisible while
-stage latency spread tasks out; `examples/commons` makes it visible by removing
-the latency that was hiding it, and reports the regression rather than only the
-column that improved.
+**Single-flight on the result cache — landed, in one process.** The findings
+gate has a lease, so concurrent askers of one question become one call; the
+result cache did not, so concurrent *identical tasks* both ran and both wrote.
+This was invisible while stage latency spread tasks out, and `examples/commons`
+made it visible by removing the latency that was hiding it — which is what a
+comparison that reports the column that got worse is for. `store.Cache` now
+hands out a lease with the lookup: one task computes, the rest wait on it under
+a bound, and a serve that had to wait is reported apart from an ordinary replay.
+What is still open is the scope. The lease lives in the process that holds the
+cache, so a fleet spanning hosts still runs a duplicate per host — the same
+shape as the admission control two rows up, and the same fix: a claim taken
+beside the shared index rather than beside each client.
 
 ---
 

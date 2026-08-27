@@ -127,7 +127,15 @@ the catalog.
 - **Content-addressed caching = checkpointing** — task results are keyed by op
   fingerprint + input content. Reruns and crash recovery replay completed AI
   work with zero model calls and zero cost, across process restarts with a state
-  dir, and across the *processes of a fleet* with a shared one.
+  dir, and across the *processes of a fleet* with a shared one. A cache serves
+  the second asker only after the first has finished, so the lookup also hands
+  out a **single-flight lease**: identical tasks admitted together collapse onto
+  one call instead of each paying for the same answer. The lease bounds a saving
+  and never an answer — the wait lives inside the task's own budgeted duration
+  rather than beside it, and a task that reaches the ceiling simply computes.
+  A task settled without a model call also hands its rate-limit admission back,
+  so a run that mostly replays stops throttling itself against a quota it never
+  spent.
 - **Iteration, with a pluggable algorithm** — `pipeline.Iterate` runs a model
   operation over a record set repeatedly, and `algo.Algorithm` decides what
   "repeatedly" means. Three ship: `BSP` (Pregel message passing), `Refine` (a

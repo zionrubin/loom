@@ -94,26 +94,84 @@ func (b *bucket) refill(now time.Time) {
 // returned release is never nil and must be called exactly once when the
 // request finishes, successfully or not.
 //
+// The release takes whether the request was actually *issued*. Admission is
+// paid before the executor is entered, and an executor can settle a task
+// without reaching the provider at all — a replayed cache hit, or one
+// coalesced onto an identical task already in flight. Those give their
+// rate-bucket draw back, because the bucket models what the provider saw and
+// the provider saw nothing. Without that, a run whose second half replays from
+// cache would throttle itself against a quota it never spent.
+//
+// The in-flight slot is returned either way: it is held for the duration of
+// whatever the executor did, which is what it is for.
+//
 // The rate buckets are drawn on before the in-flight slot, not after. A
 // request that holds a scarce device slot while waiting on a per-minute
 // quota idles the device; a bucket drawn slightly ahead of issuance only
 // makes the limiter conservative, which is the safe direction for a ceiling.
-func (l *RateLimiter) Acquire(ctx context.Context, modelID string, lim model.Limits, estTokens int) (func(), error) {
+func (l *RateLimiter) Acquire(ctx context.Context, modelID string, lim model.Limits, estTokens int) (func(issued bool), error) {
 	if err := l.acquireRate(ctx, modelID, lim, estTokens); err != nil {
 		return noRelease, err
 	}
-	return l.acquireSlot(ctx, modelID, lim)
+	slot, err := l.acquireSlot(ctx, modelID, lim)
+	if err != nil {
+		// The rate draw is already paid and the request will never be issued,
+		// so it goes back before the error does.
+		l.refund(modelID, lim, estTokens)
+		return noRelease, err
+	}
+	return func(issued bool) {
+		slot()
+		if !issued {
+			l.refund(modelID, lim, estTokens)
+		}
+	}, nil
+}
+
+// refund returns the draw acquireRate took for a request that was never
+// issued. It mirrors acquireRate's arithmetic exactly — including the clamp
+// for a single oversized request — because a refund that does not match its
+// draw is a leak in one direction or a licence to overrun in the other.
+func (l *RateLimiter) refund(modelID string, lim model.Limits, estTokens int) {
+	if lim.RequestsPerMinute <= 0 && lim.TokensPerMinute <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[modelID]
+	if !ok {
+		return
+	}
+	b.refill(time.Now())
+	if lim.RequestsPerMinute > 0 {
+		b.req = min(b.reqCap, b.req+1)
+	}
+	if lim.TokensPerMinute > 0 {
+		b.tok = min(b.tokCap, b.tok+drawFor(estTokens, b.tokCap))
+	}
+}
+
+// drawFor is how many tokens one request of estTokens draws from a bucket of
+// this capacity: its estimate, or the whole bucket when the estimate exceeds
+// it, so a single oversized request is admitted at a full bucket rather than
+// never.
+func drawFor(estTokens int, capacity float64) float64 {
+	need := float64(estTokens)
+	if capacity > 0 && need > capacity {
+		return capacity
+	}
+	return need
 }
 
 // noRelease is the release returned by an admission that holds nothing.
-func noRelease() {}
+func noRelease(bool) {}
 
 // acquireSlot takes one of modelID's in-flight slots, blocking until one is
 // free. This is the ceiling a local backend imposes: a fixed number of
 // sequences decoded at once, which no amount of waiting per minute expresses.
 func (l *RateLimiter) acquireSlot(ctx context.Context, modelID string, lim model.Limits) (func(), error) {
 	if lim.MaxConcurrent <= 0 {
-		return noRelease, nil
+		return func() {}, nil
 	}
 	l.mu.Lock()
 	sem, ok := l.slots[modelID]
@@ -128,7 +186,7 @@ func (l *RateLimiter) acquireSlot(ctx context.Context, modelID string, lim model
 		var once sync.Once
 		return func() { once.Do(func() { <-sem }) }, nil
 	case <-ctx.Done():
-		return noRelease, core.Transient(ctx.Err())
+		return func() {}, core.Transient(ctx.Err())
 	}
 }
 
@@ -153,9 +211,10 @@ func (l *RateLimiter) acquireRate(ctx context.Context, modelID string, lim model
 		now := time.Now()
 		b.refill(now)
 
+		// drawFor is the same rule the refund runs backwards.
 		needTok := float64(estTokens)
-		if lim.TokensPerMinute > 0 && needTok > b.tokCap {
-			needTok = b.tokCap // single oversized request: admit at full bucket
+		if lim.TokensPerMinute > 0 {
+			needTok = drawFor(estTokens, b.tokCap)
 		}
 		reqOK := lim.RequestsPerMinute <= 0 || b.req >= 1
 		tokOK := lim.TokensPerMinute <= 0 || b.tok >= needTok
@@ -417,11 +476,11 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 		}
 
 		if s.Governor != nil && s.Governor.Exhausted() {
-			release()
+			release(false)
 			return task.Result{}, attempt, core.BudgetExceeded(ErrBudgetExhausted)
 		}
 		if ctx.Err() != nil {
-			release()
+			release(false)
 			return task.Result{}, attempt, core.Transient(ctx.Err())
 		}
 
@@ -430,7 +489,13 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 			Model: t.ResolvedModel, Pane: t.Pane})
 
 		res, err := s.Exec.Execute(ctx, t)
-		release()
+		// A cache hit — replayed or coalesced onto an identical task in flight
+		// — reached no provider, so the admission it was granted goes back
+		// rather than throttling the calls that still have to be made. A
+		// failure is charged: an attempt that errored may well have been
+		// answered and rejected, and guessing the other way would let a run
+		// that fails repeatedly outrun the quota it is spending.
+		release(!res.CacheHit)
 		// Charged before the outcome is read. A provider bills for the call it
 		// answered, and whether that answer then survived parsing, validation,
 		// or the rest of the stage is a fact about the result rather than about

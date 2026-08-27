@@ -350,7 +350,7 @@ func (c *Client) result(t task.Task, r Receipt) (task.Result, error) {
 	res := task.Result{
 		TaskID: r.TaskID, Seq: r.Seq, Stage: r.Stage,
 		Usage: r.Usage, Model: r.Model, CacheHit: r.CacheHit,
-		Artifact: r.Artifact, Latency: r.Latency,
+		Coalesced: r.Coalesced, Artifact: r.Artifact, Latency: r.Latency,
 	}
 	if res.TaskID == "" {
 		res.TaskID, res.Seq, res.Stage = t.ID, t.Seq, t.Stage
@@ -386,10 +386,17 @@ func (c *Client) account(t task.Task, s Status, r Receipt) {
 		return
 	}
 	if r.CacheHit {
-		// A cache hit costs nothing and is reported as one wherever it happens.
-		c.cfg.Bus.Publish(observe.Event{
+		// A cache hit costs nothing and is reported as one wherever it happens
+		// — including which kind it was, so a fleet's report distinguishes an
+		// entry that was already there from one a worker waited for exactly as
+		// a local run does.
+		ev := observe.Event{
 			Type: observe.CacheHit, RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
-		})
+		}
+		if r.Coalesced {
+			ev.Coalesced, ev.Latency = true, r.Latency
+		}
+		c.cfg.Bus.Publish(ev)
 	} else if r.Usage.Requests > 0 {
 		c.cfg.Bus.Publish(observe.Event{
 			Type: observe.ModelCalled, RunID: t.Envelope.RunID, Stage: t.Stage,

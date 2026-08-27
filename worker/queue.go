@@ -371,15 +371,21 @@ type Receipt struct {
 	// it to its own lease learns whether its execution was the one that counted.
 	Token int64 `json:"token"`
 	// Output is the content hash of the output records.
-	Output   string        `json:"output,omitempty"`
-	Records  int           `json:"records"`
-	Usage    core.Usage    `json:"usage"`
-	Model    string        `json:"model,omitempty"`
-	CacheHit bool          `json:"cache_hit,omitempty"`
-	Artifact string        `json:"artifact,omitempty"`
-	Latency  time.Duration `json:"latency,omitempty"`
-	Delivery int           `json:"delivery,omitempty"`
-	At       time.Time     `json:"at"`
+	Output   string     `json:"output,omitempty"`
+	Records  int        `json:"records"`
+	Usage    core.Usage `json:"usage"`
+	Model    string     `json:"model,omitempty"`
+	CacheHit bool       `json:"cache_hit,omitempty"`
+	// Coalesced narrows CacheHit the way task.Result.Coalesced does: the
+	// worker did not find this task's key stored, it waited for an identical
+	// task that was already computing it. It rides home because a fleet's
+	// report should say the same thing a single process's does about work it
+	// did not have to do twice.
+	Coalesced bool          `json:"coalesced,omitempty"`
+	Artifact  string        `json:"artifact,omitempty"`
+	Latency   time.Duration `json:"latency,omitempty"`
+	Delivery  int           `json:"delivery,omitempty"`
+	At        time.Time     `json:"at"`
 }
 
 // Failure is an execution that ended badly, carried across the process

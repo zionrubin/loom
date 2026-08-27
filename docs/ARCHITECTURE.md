@@ -172,7 +172,15 @@ planning or scheduling.
   resource is a device that decodes some fixed number of sequences at once and
   oversubscription queues invisibly inside the server instead of failing. An
   admission returns the release for what it holds, and the scheduler holds it
-  across the call, so a backoff between attempts gives the slot back.
+  across the call, so a backoff between attempts gives the slot back. The
+  release takes whether the request was actually *issued*: admission is paid
+  before the executor is entered, and an executor can settle a task without
+  reaching the provider at all — a replayed cache hit, or one coalesced onto an
+  identical task in flight. Those give the bucket draw back, because the bucket
+  models what the provider saw and the provider saw nothing. A failure keeps
+  its draw: an attempt that errored may well have been answered and rejected,
+  and guessing the other way would let a run that fails repeatedly outrun the
+  quota it is spending.
 - **Budget governor** — run-level cost/token caps enforced across all
   concurrent tasks; on exhaustion the run stops admitting work and returns
   partial results plus the spend so far. Every attempt is charged, not every
@@ -195,13 +203,18 @@ planning or scheduling.
 local implementation:
 
 1. rejects sandbox profiles it can't honor (fail closed);
-2. short-circuits through the content-addressed cache;
-3. dispatches to the stage's op runner with a capability-scoped `Runtime`:
+2. starts the task's budgeted duration — above the cache, because it bounds the
+   task rather than the call inside it;
+3. short-circuits through the content-addressed cache, taking its single-flight
+   lease so identical tasks admitted together collapse onto one execution
+   (§4.7);
+4. dispatches to the stage's op runner with a capability-scoped `Runtime`:
    - `ModelClient` — checks the model grant, checks the endpoint against the
      egress allowlist, scopes secret resolution to the task's grants,
      computes cost from registry pricing, publishes telemetry;
    - `Tools` — grant-checked, audited tool invocation;
-4. stores results in the CAS, records lineage.
+5. stores results in the CAS, records lineage, and serves the records back
+   through the cache, so a computed result has the shape a replayed one does.
 
 Because providers resolve credentials **per call through the broker**,
 executors and ops never hold raw secrets — the same property as vault-style
@@ -282,6 +295,47 @@ exists to earn back a remote write's premium, has nothing left to weigh. See
   rerun (same code, same inputs) replays completed AI work with zero model
   calls and zero cost, across process restarts when a state dir is
   configured. Partial failures resume from where they left off for free.
+  A lookup also hands out a **single-flight lease**, which is what lets the
+  cache serve the *second* asker while the first is still working. An entry
+  exists only after a task finishes, so identical tasks admitted together all
+  miss, all call the model, and all write the same answer — the same thundering
+  herd the findings gate regulates at the source, one level down, and the one
+  place a content-addressed cache is structurally blind. One task computes and
+  the rest wait on it, bounded by the caller's context and a ceiling
+  (`loom.WithCoalesceWait`, default 30s) past which they simply compute: the
+  lease bounds a *saving*, never an answer. Three things keep that true:
+
+  - **A follower re-reads the cache** rather than taking the leader's return
+    value, so a coalesced serve is an ordinary hit produced by the ordinary
+    path — and because the key is a deterministic fingerprint of op and input,
+    the tasks it collapses are the same computation by construction.
+  - **The wait is inside the task's own deadline, not beside it.** A stage's
+    budgeted `MaxDuration` starts above the cache, because it bounds the task
+    rather than the call inside it, and the wait is capped at half of it: a
+    task that waits in vain still has at least as long to do the work as it
+    spent hoping not to have to.
+  - **A hit refunds its admission.** Rate-limit admission is paid per task
+    *before* the executor is entered, so a task that reaches no provider —
+    replayed or coalesced — gives its request/token draw back rather than
+    throttling the calls that still have to be made against a quota nobody
+    spent (§4.4). The in-flight slot is held for the wait, which is strictly
+    less than the duplicate call it replaces would have held it for.
+
+  Reported as `Coalesced` on the run report, separately from hits, because the
+  two answer different questions: hits say what an earlier run already paid
+  for, coalesced serves say what this run's own concurrency would have paid for
+  twice. On the event bus it is an attribute of `cache.hit` rather than an
+  event of its own, so nothing that already counts hits stops counting these.
+  The lease is per process; two workers on different hosts still both run,
+  which is what the shared admission-control service in §6 would fix.
+
+  One consequence worth stating: because a cacheable stage's output is served
+  back through the cache even on the task that computed it, its records are
+  canonical JSON — an `int` arrives as `float64`, a `time.Time` as a string.
+  That was always true of a replay; doing it on the computing task too is what
+  stops one stage handing downstream code two types for one field depending on
+  which task won a race, and is what makes "a replay is substitutable for the
+  call it replaces" a fact rather than an aspiration.
 - **Broadcasts** — run-level read-only values shared by every task that
   declares them. Registered once before execution, serialized into the CAS,
   and carried through envelopes as content hashes. This is how tasks and
@@ -307,9 +361,10 @@ exists to earn back a remote write's premium, has nothing left to weigh. See
   with the provider; a **finding** shares an answer about the world between
   agents that were about to go and get it themselves. The result cache cannot
   do this job, for three structural reasons: its key is the bytes going in, so
-  two wordings of one question are two keys; it serves the second asker only
-  after the first has finished, so agents launched together all miss and all
-  call out; and it is all-or-nothing, so a partial overlap is worth zero.
+  two wordings of one question are two keys; its lease can only collapse askers
+  that already agree on that key, so agents launched together with four
+  phrasings of one question wait on nothing and all call out; and it is
+  all-or-nothing, so a partial overlap is worth zero.
   `findings.Gate` keys on the *question* instead — an exact key, then a
   topic-and-facets class, then optional embedding similarity — collapses
   concurrent askers onto one call with a single-flight lease, and narrows the
@@ -676,7 +731,10 @@ and retraction with dependent reporting, and capability containment), mock,
 Anthropic,
 OpenAI, and llama.cpp providers (the last with device-width admission control,
 loopback egress, no-credential envelopes, and KV-cache prefix reuse),
-cross-restart and cross-process cache resume, stream mode (`loom.Stream`:
+cross-restart and cross-process cache resume, the result cache's single-flight
+lease (concurrent identical tasks collapse onto one execution, with the wait
+bounded by the caller's context and a ceiling, and coalesced serves reported
+apart from ordinary hits), stream mode (`loom.Stream`:
 unbounded partitioned sources with resumable positions, per-split watermarks
 with bounded lateness, idleness and retirement, watermark holdback across
 asynchronous stages, event-time windowing with keyed and sliding assigners and
@@ -700,9 +758,11 @@ Designed but not yet implemented: a shared admission-control service so a fleet
 respects provider limits collectively rather than per client, a broker-backed
 queue for fleets spanning hosts, object-storage state backends,
 subprocess/container/WASM sandbox runtimes, ensemble operators,
-priority/preemptive scheduling, result-cache eviction, a single-flight lease on
-the *result* cache (the findings gate has one; the result cache does not, so
-concurrent identical tasks still both run — see `examples/commons`), findings
+priority/preemptive scheduling, result-cache eviction, a *distributed*
+single-flight lease on the result cache (the in-process one is implemented, so
+identical tasks in one executor collapse; two workers on different hosts still
+both run, because the lease lives in the process rather than beside the shared
+index), findings
 eviction and bi-temporal validity, the inbox tree-reduce for high-degree
 vertices, and the later phases of stream mode (transactional sinks, renewing
 rate budgets with backpressure/shed/degrade policies, session windows, split

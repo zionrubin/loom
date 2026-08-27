@@ -23,15 +23,16 @@ the public source takes 120ms per call
 
                            no commons   with commons
 calls to the source                24              6
-wall clock                      415ms          171ms
+wall clock                      380ms          258ms
 spent at the source           $0.0960        $0.0240
-result-cache hits                  11              5
-spent on models               $0.0015        $0.0021
+result-cache hits                  18             10
+  of those, coalesced               4              5
+spent on models               $0.0007        $0.0016
 
 findings  24 asked · 18 reused (75%) · 6 researched
-  exact 0 · class 12 · near 0 · coalesced 6 · topped-up 0
-  avoided $0.0720 and 2.198s of research, spent $0.0240
-  gate overhead 1.122ms total, 47µs per question
+  local  exact 0 · class 12 · near 0 · coalesced 6 · topped-up 0
+  avoided $0.0720 and 2.168s of research, spent $0.0240
+  gate overhead 754µs total, 31µs per question
 ```
 
 **No embedder is configured.** All 18 reuses come from the two free tiers: the
@@ -53,13 +54,23 @@ first is still in flight.
 argument for gating every task rather than the ones somebody guessed would
 collide.
 
+**The coalesced row is the same trick one level down.** The result cache has a
+single-flight lease of its own now, so the note tasks that arrive together —
+which is exactly what removing the source's latency causes — wait for each
+other instead of each making the call. Those hits could not have come from the
+cache alone: when the task was admitted there was no entry to find. Pass
+`loom.WithoutCoalescing()` and watch them turn back into duplicate model calls.
+
 ## The two things it refuses to hide
 
-**The model column gets slightly worse.** Removing the source's latency makes
-the desks arrive at the note stage together, so more identical tasks are in
-flight at once and the result cache — which has no single-flight lease of its
-own — serves fewer of them. Same thundering herd, one level up. The example
-prints it.
+**The model column is still slightly worse with the commons, and it is no
+longer the herd.** The commons stamps each brief with *how* it was obtained —
+fresh, class, coalesced — and that field rides into the note task's input, so
+four desks whose answers arrived four different ways are four different tasks.
+A cache keyed on input content is right to treat them as different: drop the
+provenance from the record and both columns replay identically at $0.0007. The
+saving lands at the source, where the money is, and the model column is the
+price of being told why.
 
 **The answers must be identical.** After the comparison it diffs every brief
 from both runs and exits non-zero if any differ. A served finding that is not

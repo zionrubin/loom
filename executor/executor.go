@@ -394,6 +394,11 @@ type Local struct {
 	Cache      *store.Cache
 	Lineage    *store.Lineage
 	Bus        *observe.Bus
+	// Coalesce bounds how long a task waits for an identical task already in
+	// flight before running the work itself (zero: store.DefaultCoalesceWait,
+	// negative: no waiting at all). It has no effect without a Cache, because
+	// the lease is what the cache hands out and the wait is for its entry.
+	Coalesce time.Duration
 	// State materializes the evolving contexts task envelopes reference. Nil
 	// unless the deployment enabled them, in which case a task carrying a chain
 	// fails rather than running with no context — the same treatment a
@@ -401,6 +406,29 @@ type Local struct {
 	// executing without the context it was planned with is a wrong answer
 	// wearing a plausible one.
 	State *delta.Store
+}
+
+// coalesceWait is how long this task may wait for an identical one already in
+// flight.
+//
+// It is the configured bound, capped at *half* the task's budgeted duration.
+// The task's deadline covers the wait and the execution together — the wait is
+// wall-clock the task spends, and a budget that only started counting once the
+// call began would be two budgets — so the wait has to leave something behind
+// to spend. Half is the split that makes the failure case symmetric: a task
+// that waits in vain still has at least as long to do the work as it spent
+// hoping not to have to. Without a cap, a follower could spend its whole
+// budget waiting and then fail on a deadline it never got to use, which would
+// make the lease cost an answer rather than save a call.
+func (l *Local) coalesceWait(t task.Task) time.Duration {
+	wait := l.Coalesce
+	if wait <= 0 {
+		wait = store.DefaultCoalesceWait
+	}
+	if d := t.Envelope.Budget.MaxDuration; d > 0 && d/2 < wait {
+		wait = d / 2
+	}
+	return wait
 }
 
 // Execute implements Executor.
@@ -412,31 +440,60 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 			"sandbox profile %q not supported by the local executor", t.Envelope.Sandbox))
 	}
 
+	// The task's budgeted duration starts here, above the cache, because it
+	// bounds the task rather than the call inside it. Waiting for an identical
+	// task to finish is time this task spends; a deadline that only began once
+	// the runner was entered would let a task wait out its whole budget and
+	// then execute for a second one.
+	if d := t.Envelope.Budget.MaxDuration; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+
 	// Cache short-circuit: identical op + identical inputs → replay.
+	//
+	// Claim rather than Get, so the two ways a task can be spared its call are
+	// both taken here: an entry that already exists, and an entry another task
+	// is in the middle of writing. The second is the one a cache cannot do
+	// alone — tasks admitted together all miss a cold key at the same instant
+	// — and it costs the follower a bounded wait instead of a model call.
+	//
+	// The lease is released when Execute returns, which is after the result is
+	// stored: a follower woken by it finds the entry rather than the gap this
+	// task was standing in. A task that failed releases too, and its followers
+	// wake to a miss and compute — which is what they would have been doing
+	// all along.
+	var claim store.Claim
 	if t.CacheKey != "" && l.Cache != nil {
-		if recs, ok := l.Cache.Get(t.CacheKey); ok {
-			if l.Bus != nil {
-				l.Bus.Publish(observe.Event{
-					Type: observe.CacheHit, RunID: t.Envelope.RunID,
-					Stage: t.Stage, TaskID: t.ID,
-				})
+		if l.Coalesce < 0 {
+			// Coalescing off: the plain lookup, and identical tasks admitted
+			// together each pay for their own call.
+			if recs, ok := l.Cache.Get(t.CacheKey); ok {
+				claim = store.Claim{Records: recs, Hit: true}
 			}
-			return task.Result{
-				TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: recs,
-				CacheHit: true, Latency: time.Since(start),
-			}, nil
+		} else {
+			claim = l.Cache.Claim(ctx, t.CacheKey, l.coalesceWait(t))
+			defer claim.Release()
 		}
+	}
+	if claim.Hit {
+		if l.Bus != nil {
+			l.Bus.Publish(observe.Event{
+				Type: observe.CacheHit, RunID: t.Envelope.RunID,
+				Stage: t.Stage, TaskID: t.ID,
+				Coalesced: claim.Coalesced, Latency: claim.Waited,
+			})
+		}
+		return task.Result{
+			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: claim.Records,
+			CacheHit: true, Coalesced: claim.Coalesced, Latency: time.Since(start),
+		}, nil
 	}
 
 	runner, ok := l.Runners[t.Stage]
 	if !ok {
 		return task.Result{}, core.Permanent(fmt.Errorf("stage %q: no runner registered", t.Stage))
-	}
-
-	if d := t.Envelope.Budget.MaxDuration; d > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d)
-		defer cancel()
 	}
 
 	rt := &Runtime{
@@ -487,7 +544,26 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 
 	artifact := ""
 	if t.CacheKey != "" && l.Cache != nil {
-		artifact, _ = l.Cache.Put(t.CacheKey, out)
+		var err error
+		if artifact, err = l.Cache.Put(t.CacheKey, out); err == nil {
+			// Served back through the cache rather than handed straight up from
+			// the runner, so that a cacheable stage emits one shape of record
+			// however its tasks were settled.
+			//
+			// Records cross the cache as JSON, which is what makes them
+			// content-addressable and shippable to another process — and what
+			// turns an int into a float64, a time.Time into a string, and a
+			// struct into a map on the way back. Without this the leader would
+			// return the runner's Go values while every task that replayed or
+			// coalesced returned the round-tripped ones, and a stage could hand
+			// downstream code two types for one field depending on which task
+			// happened to win a race. The claim a result cache rests on is that
+			// a replay is substitutable for the call it replaces; that is only
+			// true if the call's own output already looks like the replay.
+			if canonical, ok := l.Cache.Get(t.CacheKey); ok {
+				out = canonical
+			}
+		}
 	}
 	if l.Lineage != nil {
 		l.Lineage.Record(store.LineageEntry{

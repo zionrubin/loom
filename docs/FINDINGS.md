@@ -35,11 +35,14 @@ search tool with two different query strings. Same subject, same facts wanted,
 two keys. The cache is not *wrong* about this — those really are different
 inputs — it simply cannot see that they are one question.
 
-**It serves the second asker only after the first has finished.** A cache is a
-record of completed work. Agents launched together all miss a cold key at the
-same instant, all call out, and all write the same entry. The more agents you
-run concurrently — which is the entire point of a fleet — the worse this gets,
-because concurrency is exactly what defeats a write-then-read cache.
+**Its lease can only collapse askers that already agree on the key.** A cache
+is a record of completed work, so agents launched together all miss a cold key
+at the same instant, all call out, and all write the same entry.
+`store.Cache` regulates that herd with a single-flight lease of its own — but
+only for tasks whose keys are identical, which returns us to the first point:
+four desks asking one question in four phrasings hold four keys, wait on
+nothing, and make four calls. Deduplicating research needs the sameness to be
+decided about the *question*, before any key exists.
 
 **It is all-or-nothing.** A cached result either matches or does not. It cannot
 say "I have four of the five fields you need, go and get the fifth", so a
@@ -377,12 +380,16 @@ the absolute number, is the argument for gating every task rather than only the
 ones somebody guessed would collide.
 
 **The model column does not improve, and here it gets slightly worse.** The
-layer removes duplicate calls to the *source*; by removing that source's latency
-it makes the desks arrive at the next stage together, so more identical tasks are
-in flight at once and the result cache — which has no single-flight lease of its
-own — serves fewer of them. That is the same thundering herd one level up. It is
-a real finding, it belongs in `store`, and the example prints it rather than
-quietly reporting the good column.
+layer removes duplicate calls to the *source*, not to the model. It used to get
+worse for a second reason as well — removing the source's latency made the desks
+arrive at the next stage together, and the result cache had no single-flight
+lease of its own, so the herd simply moved one level down. That was a real
+finding, it belonged in `store`, and it is fixed there: the example now reports
+how many of its replays were coalesced rather than found. What remains is a
+narrower and more interesting effect. The gate stamps each brief with *how* it
+was answered, that field rides into the next task's input, and four desks whose
+answers arrived four different ways are four genuinely different tasks — the
+price of provenance, paid at the model, against a saving taken at the source.
 
 ---
 
