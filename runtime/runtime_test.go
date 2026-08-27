@@ -76,6 +76,64 @@ func TestRateLimiterUnlimitedAndCancel(t *testing.T) {
 	}
 }
 
+// TestRateLimiterRefundsWhatWasNeverIssued is the other half of drawing the
+// bucket ahead of the call. Admission is paid before the executor is entered,
+// and an executor can settle a task without reaching the provider — a replayed
+// cache hit, or one coalesced onto an identical task already in flight. A draw
+// kept for a call that was never made throttles the calls that still have to
+// be made against a quota nobody spent.
+func TestRateLimiterRefundsWhatWasNeverIssued(t *testing.T) {
+	l := NewRateLimiter()
+	lim := model.Limits{RequestsPerMinute: 1, TokensPerMinute: 1000}
+
+	rel, err := l.Acquire(context.Background(), "m", lim, 400)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	// One request per minute: with the draw kept, the next admission waits
+	// about a minute. Released as never issued, it is immediately admissible.
+	rel(false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	again, err := l.Acquire(ctx, "m", lim, 400)
+	if err != nil {
+		t.Fatalf("a refunded draw must readmit at once: %v", err)
+	}
+
+	// And an issued request keeps its draw, or the ceiling would mean nothing.
+	again(true)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel2()
+	if _, err := l.Acquire(ctx2, "m", lim, 400); err == nil {
+		t.Fatal("a request that was issued must still count against the quota")
+	}
+}
+
+// TestRateLimiterRefundNeverExceedsTheBucket keeps the refund from becoming a
+// licence to overrun: giving back more than was drawn would let a run whose
+// tasks mostly replay accumulate credit it never had.
+func TestRateLimiterRefundNeverExceedsTheBucket(t *testing.T) {
+	l := NewRateLimiter()
+	lim := model.Limits{RequestsPerMinute: 2, TokensPerMinute: 100}
+
+	rel, err := l.Acquire(context.Background(), "m", lim, 10)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for range 5 {
+		rel(false) // a release called too many times must not mint quota
+	}
+
+	l.mu.Lock()
+	b := l.buckets["m"]
+	req, tok := b.req, b.tok
+	l.mu.Unlock()
+	if req > 2 || tok > 100 {
+		t.Errorf("bucket = %.0f req / %.0f tok, want no more than the caps 2 / 100", req, tok)
+	}
+}
+
 // TestRateLimiterMaxConcurrent pins the ceiling a local backend imposes: not
 // a rate, but a number of calls that may be in flight at once. Admissions
 // past the ceiling block until a holder releases, and releasing is what makes
@@ -121,15 +179,15 @@ func TestRateLimiterMaxConcurrent(t *testing.T) {
 
 	// Releasing readmits, and a repeated release must not hand out a slot that
 	// was never held — a released slot belongs to whoever takes it next.
-	rel1()
-	rel1()
+	rel1(true)
+	rel1(true)
 	if _, err := l.Acquire(context.Background(), "local", lim, 1); err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
 	if _, err := blocked(); err == nil {
 		t.Fatal("a repeated release must not free a second slot")
 	}
-	rel2()
+	rel2(true)
 }
 
 // fakeExec is a scriptable executor.
@@ -180,6 +238,39 @@ func testRegistry(t *testing.T) (*model.Registry, *model.Mock, *model.Mock) {
 
 func quickRetry() RetryPolicy {
 	return RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
+}
+
+// TestCacheHitsDoNotSpendTheProvidersQuota is the refund seen from where it
+// matters. Admission is paid per task before the executor is entered, so a
+// stage whose tasks replay — from an earlier run, or by coalescing onto an
+// identical task in flight — would otherwise throttle itself against a
+// per-minute quota it never spent. One request per minute and two replaying
+// tasks: the second must not wait a minute for a call the first never made.
+func TestCacheHitsDoNotSpendTheProvidersQuota(t *testing.T) {
+	reg := model.NewRegistry()
+	if err := reg.Register(model.Info{
+		ID: "small", Provider: model.NewMock("small"), Tier: model.TierFast,
+		Limits: model.Limits{RequestsPerMinute: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := newFakeExec(func(tk task.Task, call int) (task.Result, error) {
+		return task.Result{TaskID: tk.ID, Seq: tk.Seq, Stage: tk.Stage, CacheHit: true}, nil
+	})
+	s := &Scheduler{Workers: 1, Retry: quickRetry(), Registry: reg,
+		Exec: exec, Limiter: NewRateLimiter()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	results, failures, err := s.ExecuteAll(ctx, mkTasks(2, model.Binding{Model: "small"}))
+	if err != nil || len(failures) != 0 {
+		t.Fatalf("a run of replays must not stall on a quota it never spent: err=%v failures=%v",
+			err, failures)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
 }
 
 func TestSchedulerTransientRetry(t *testing.T) {

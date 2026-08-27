@@ -172,7 +172,15 @@ planning or scheduling.
   resource is a device that decodes some fixed number of sequences at once and
   oversubscription queues invisibly inside the server instead of failing. An
   admission returns the release for what it holds, and the scheduler holds it
-  across the call, so a backoff between attempts gives the slot back.
+  across the call, so a backoff between attempts gives the slot back. The
+  release takes whether the request was actually *issued*: admission is paid
+  before the executor is entered, and an executor can settle a task without
+  reaching the provider at all — a replayed cache hit, or one coalesced onto an
+  identical task in flight. Those give the bucket draw back, because the bucket
+  models what the provider saw and the provider saw nothing. A failure keeps
+  its draw: an attempt that errored may well have been answered and rejected,
+  and guessing the other way would let a run that fails repeatedly outrun the
+  quota it is spending.
 - **Budget governor** — run-level cost/token caps enforced across all
   concurrent tasks; on exhaustion the run stops admitting work and returns
   partial results plus the spend so far. Every attempt is charged, not every
@@ -195,13 +203,18 @@ planning or scheduling.
 local implementation:
 
 1. rejects sandbox profiles it can't honor (fail closed);
-2. short-circuits through the content-addressed cache;
-3. dispatches to the stage's op runner with a capability-scoped `Runtime`:
+2. starts the task's budgeted duration — above the cache, because it bounds the
+   task rather than the call inside it;
+3. short-circuits through the content-addressed cache, taking its single-flight
+   lease so identical tasks admitted together collapse onto one execution
+   (§4.7);
+4. dispatches to the stage's op runner with a capability-scoped `Runtime`:
    - `ModelClient` — checks the model grant, checks the endpoint against the
      egress allowlist, scopes secret resolution to the task's grants,
      computes cost from registry pricing, publishes telemetry;
    - `Tools` — grant-checked, audited tool invocation;
-4. stores results in the CAS, records lineage.
+5. stores results in the CAS, records lineage, and serves the records back
+   through the cache, so a computed result has the shape a replayed one does.
 
 Because providers resolve credentials **per call through the broker**,
 executors and ops never hold raw secrets — the same property as vault-style
@@ -290,16 +303,39 @@ exists to earn back a remote write's premium, has nothing left to weigh. See
   place a content-addressed cache is structurally blind. One task computes and
   the rest wait on it, bounded by the caller's context and a ceiling
   (`loom.WithCoalesceWait`, default 30s) past which they simply compute: the
-  lease bounds a *saving*, never an answer. A follower re-reads the cache
-  rather than taking the leader's return value, so a coalesced serve is an
-  ordinary hit produced by the ordinary path — and because the key is a
-  deterministic fingerprint of op and input, the tasks it collapses are the
-  same computation by construction. Reported as `Coalesced` on the run report,
-  separately from hits, because the two answer different questions: hits say
-  what an earlier run already paid for, coalesced serves say what this run's
-  own concurrency would have paid for twice. The lease is per process; two
-  workers on different hosts still both run, which is what the shared
-  admission-control service in §6 would fix.
+  lease bounds a *saving*, never an answer. Three things keep that true:
+
+  - **A follower re-reads the cache** rather than taking the leader's return
+    value, so a coalesced serve is an ordinary hit produced by the ordinary
+    path — and because the key is a deterministic fingerprint of op and input,
+    the tasks it collapses are the same computation by construction.
+  - **The wait is inside the task's own deadline, not beside it.** A stage's
+    budgeted `MaxDuration` starts above the cache, because it bounds the task
+    rather than the call inside it, and the wait is capped at half of it: a
+    task that waits in vain still has at least as long to do the work as it
+    spent hoping not to have to.
+  - **A hit refunds its admission.** Rate-limit admission is paid per task
+    *before* the executor is entered, so a task that reaches no provider —
+    replayed or coalesced — gives its request/token draw back rather than
+    throttling the calls that still have to be made against a quota nobody
+    spent (§4.4). The in-flight slot is held for the wait, which is strictly
+    less than the duplicate call it replaces would have held it for.
+
+  Reported as `Coalesced` on the run report, separately from hits, because the
+  two answer different questions: hits say what an earlier run already paid
+  for, coalesced serves say what this run's own concurrency would have paid for
+  twice. On the event bus it is an attribute of `cache.hit` rather than an
+  event of its own, so nothing that already counts hits stops counting these.
+  The lease is per process; two workers on different hosts still both run,
+  which is what the shared admission-control service in §6 would fix.
+
+  One consequence worth stating: because a cacheable stage's output is served
+  back through the cache even on the task that computed it, its records are
+  canonical JSON — an `int` arrives as `float64`, a `time.Time` as a string.
+  That was always true of a replay; doing it on the computing task too is what
+  stops one stage handing downstream code two types for one field depending on
+  which task won a race, and is what makes "a replay is substitutable for the
+  call it replaces" a fact rather than an aspiration.
 - **Broadcasts** — run-level read-only values shared by every task that
   declares them. Registered once before execution, serialized into the CAS,
   and carried through envelopes as content hashes. This is how tasks and

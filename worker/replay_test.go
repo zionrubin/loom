@@ -66,19 +66,23 @@ func TestCoalescedServeRidesHomeFromAWorker(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	var kinds []observe.EventType
+	var hits []observe.Event
 	for _, e := range seen {
-		if e.Type == observe.CacheHit || e.Type == observe.CacheCoalesced {
-			kinds = append(kinds, e.Type)
+		if e.Type == observe.CacheHit {
+			hits = append(hits, e)
 		}
 	}
-	if len(kinds) != 1 || kinds[0] != observe.CacheCoalesced {
-		t.Errorf("published %v, want exactly one %s: a fleet's report must read "+
-			"the way a local run's does", kinds, observe.CacheCoalesced)
+	// One event, of the type every existing handler already counts — the
+	// distinction is an attribute on it, so a fleet does not silently stop
+	// reporting cache hits to anybody watching for them.
+	if len(hits) != 1 {
+		t.Fatalf("published %d cache.hit events, want exactly 1", len(hits))
 	}
-	for _, e := range seen {
-		if e.Type == observe.CacheCoalesced && e.Latency != 7*time.Millisecond {
-			t.Errorf("coalesced latency = %s, want the wait the worker reported", e.Latency)
-		}
+	if !hits[0].Coalesced {
+		t.Error("the hit must say it was coalesced: a fleet's report should read " +
+			"the way a local run's does")
+	}
+	if hits[0].Latency != 7*time.Millisecond {
+		t.Errorf("coalesced latency = %s, want the wait the worker reported", hits[0].Latency)
 	}
 }

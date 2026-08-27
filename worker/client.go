@@ -394,7 +394,7 @@ func (c *Client) account(t task.Task, s Status, r Receipt) {
 			Type: observe.CacheHit, RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
 		}
 		if r.Coalesced {
-			ev.Type, ev.Latency = observe.CacheCoalesced, r.Latency
+			ev.Coalesced, ev.Latency = true, r.Latency
 		}
 		c.cfg.Bus.Publish(ev)
 	} else if r.Usage.Requests > 0 {

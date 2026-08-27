@@ -716,8 +716,11 @@ func TestConcurrentIdenticalTasksCoalesce(t *testing.T) {
 		return p
 	}
 
+	var hits, coalescedEvents atomic.Int64
 	run := func(t *testing.T, extra ...loom.Option) (*loom.RunResult, int) {
 		t.Helper()
+		hits.Store(0)
+		coalescedEvents.Store(0)
 		release := make(chan struct{})
 		reg := model.NewRegistry()
 		fast, err := model.RegisterMock(reg, "mock-fast", model.TierFast,
@@ -740,6 +743,16 @@ func TestConcurrentIdenticalTasksCoalesce(t *testing.T) {
 			loom.WithRegistry(reg), loom.WithRetry(quickRetry()),
 			loom.WithWorkers(identical),
 			loom.WithEventHandler(func(e observe.Event) {
+				// The handler an existing consumer already wrote: it knows
+				// about cache.hit and nothing else. A coalesced serve has to
+				// reach it, or adding the lease would quietly subtract from
+				// every cache-hit counter in the wild.
+				if e.Type == observe.CacheHit {
+					hits.Add(1)
+					if e.Coalesced {
+						coalescedEvents.Add(1)
+					}
+				}
 				if e.Type != observe.TaskStarted || e.Stage != "answer" {
 					return
 				}
@@ -788,6 +801,16 @@ func TestConcurrentIdenticalTasksCoalesce(t *testing.T) {
 		if res.Spent.Requests != 1 {
 			t.Errorf("governor charged %d requests, want 1", res.Spent.Requests)
 		}
+		// Compatibility: a coalesced serve is a cache.hit carrying an
+		// attribute, not an event type of its own, so a handler that only
+		// knows about cache.hit still sees all three.
+		if n := hits.Load(); n != identical-1 {
+			t.Errorf("cache.hit events = %d, want %d: an existing handler must not "+
+				"silently undercount", n, identical-1)
+		}
+		if n := coalescedEvents.Load(); n != identical-1 {
+			t.Errorf("coalesced hits = %d, want %d", n, identical-1)
+		}
 	})
 
 	t.Run("without the lease", func(t *testing.T) {
@@ -798,6 +821,9 @@ func TestConcurrentIdenticalTasksCoalesce(t *testing.T) {
 		}
 		if n := res.Report.Coalesced(); n != 0 {
 			t.Errorf("coalesced = %d, want 0", n)
+		}
+		if n := coalescedEvents.Load(); n != 0 {
+			t.Errorf("coalesced hits = %d, want 0 with the lease off", n)
 		}
 	})
 }

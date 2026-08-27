@@ -29,19 +29,18 @@ const (
 	TaskRetried   EventType = "task.retried"
 	TaskFailed    EventType = "task.failed"
 	ModelCalled   EventType = "model.called"
-	CacheHit      EventType = "cache.hit"
-	// CacheCoalesced is a task served by the result cache that the cache alone
-	// could not have served: its key was cold when the task was admitted, and
-	// it waited for the identical task already computing the answer instead of
-	// making the same paid call beside it. Latency is how long that wait took.
+	// CacheHit is a task settled without a model call. Coalesced distinguishes
+	// the two ways that happens: false for an entry that was already stored —
+	// by an earlier run, or an earlier task in this one — and true for a task
+	// whose key was cold when it was admitted and which waited for the
+	// identical task already computing the answer, with Latency the wait.
 	//
-	// It is published *instead of* CacheHit, not beside it, so a run's events
-	// never double-count one task — consumers that want the total add the two.
-	// The distinction is worth carrying because the two numbers answer
-	// different questions: hits say what an earlier run or an earlier task
-	// already paid for, coalesced serves say what this run's own concurrency
-	// would have paid for twice.
-	CacheCoalesced EventType = "cache.coalesced"
+	// The distinction rides as an attribute rather than as a second event type
+	// on purpose. Every handler that counts cache hits keeps counting all of
+	// them, including the ones a single-flight lease produced; a separate type
+	// would have silently subtracted those from every counter already written
+	// against this one.
+	CacheHit       EventType = "cache.hit"
 	BudgetExceeded EventType = "budget.exceeded"
 	// BroadcastRegistered announces one run-level shared value, once, before
 	// any task reads it.
@@ -284,8 +283,13 @@ type Event struct {
 	// in dollars against paying the full input rate (model.called). Negative
 	// while a freshly written entry is still unamortized.
 	Saved float64 `json:"saved,omitempty"`
-	Err   string  `json:"err,omitempty"`
-	Note  string  `json:"note,omitempty"`
+	// Coalesced narrows cache.hit to the replays the cache could not have
+	// served on its own: the entry did not exist when the task was admitted,
+	// and it waited on the identical task already computing it. Latency is
+	// that wait.
+	Coalesced bool   `json:"coalesced,omitempty"`
+	Err       string `json:"err,omitempty"`
+	Note      string `json:"note,omitempty"`
 	// Ceiling bounds a projection (stage.projected / run.projected): the same
 	// accounting as Usage with every response filling MaxTokens, which the
 	// provider enforces. Usage on those events is the expected case and rests
@@ -718,11 +722,11 @@ func (c *Collector) Handle(e Event) {
 	case TaskRetried:
 		c.stage(e.Stage).Retries++
 	case CacheHit:
-		c.stage(e.Stage).CacheHits++
-	case CacheCoalesced:
 		st := c.stage(e.Stage)
 		st.CacheHits++
-		st.Coalesced++
+		if e.Coalesced {
+			st.Coalesced++
+		}
 	case RoundFinished:
 		c.stage(e.Stage).Rounds++
 	case DeltaSpliced:

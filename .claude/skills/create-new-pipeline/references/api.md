@@ -202,7 +202,7 @@ res, err := loom.Run(ctx, p, opts...)
 | `WithWorkers(n)` | Default concurrency (default 8) |
 | `WithRunBudget(core.Budget{MaxCostUSD, MaxTokens, MaxDuration, MaxAttempts})` | Stops admitting work when exhausted; returns partial results **and** an error |
 | `WithStateDir(dir)` | Persistent CAS + result cache — reruns replay instead of re-spending |
-| `WithCoalesceWait(d)` | How long a task waits for an identical task already running before making the call itself (default 30s) |
+| `WithCoalesceWait(d)` | How long a task waits for an identical task already running before making the call itself (default 30s, capped at half the stage's `MaxDuration`) |
 | `WithoutCoalescing()` | Turn the result cache's single-flight lease off, so concurrent identical tasks each pay |
 | `WithSecrets(map[security.SecretRef]string)` | Loads the broker; tasks resolve only what their envelope grants |
 | `WithEgress(hosts...)` | Extra allowed hosts beyond provider endpoints (which are auto-allowed per stage) |
@@ -218,7 +218,8 @@ res, err := loom.Run(ctx, p, opts...)
 
 Events worth handling: `RunStarted`, `RunFinished`, `StageStarted`,
 `StageFinished`, `TaskStarted`, `TaskCompleted`, `TaskRetried`, `TaskFailed`,
-`ModelCalled`, `CacheHit`, `CacheCoalesced`, `BudgetExceeded`, `RoundStarted`, `RoundFinished`,
+`ModelCalled`, `CacheHit` (with `Coalesced` for a task that waited on an
+identical one), `BudgetExceeded`, `RoundStarted`, `RoundFinished`,
 `StageConverged`, `MCPConnected`, `MCPCalled`, `BroadcastRead`.
 
 ## RunResult

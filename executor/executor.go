@@ -411,18 +411,22 @@ type Local struct {
 // coalesceWait is how long this task may wait for an identical one already in
 // flight.
 //
-// It is the configured bound, capped by the task's own budgeted duration: a
-// task allowed five seconds to run must not spend thirty waiting for another
-// task to save it the trouble. The cap is applied here rather than by the
-// deadline the runner gets, because that deadline exists to bound a model call
-// and starting it before the call would charge the wait to the provider.
+// It is the configured bound, capped at *half* the task's budgeted duration.
+// The task's deadline covers the wait and the execution together — the wait is
+// wall-clock the task spends, and a budget that only started counting once the
+// call began would be two budgets — so the wait has to leave something behind
+// to spend. Half is the split that makes the failure case symmetric: a task
+// that waits in vain still has at least as long to do the work as it spent
+// hoping not to have to. Without a cap, a follower could spend its whole
+// budget waiting and then fail on a deadline it never got to use, which would
+// make the lease cost an answer rather than save a call.
 func (l *Local) coalesceWait(t task.Task) time.Duration {
 	wait := l.Coalesce
 	if wait <= 0 {
 		wait = store.DefaultCoalesceWait
 	}
-	if d := t.Envelope.Budget.MaxDuration; d > 0 && d < wait {
-		wait = d
+	if d := t.Envelope.Budget.MaxDuration; d > 0 && d/2 < wait {
+		wait = d / 2
 	}
 	return wait
 }
@@ -434,6 +438,17 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	if t.Envelope.Sandbox != "" && t.Envelope.Sandbox != task.SandboxInline {
 		return task.Result{}, core.Permanent(fmt.Errorf(
 			"sandbox profile %q not supported by the local executor", t.Envelope.Sandbox))
+	}
+
+	// The task's budgeted duration starts here, above the cache, because it
+	// bounds the task rather than the call inside it. Waiting for an identical
+	// task to finish is time this task spends; a deadline that only began once
+	// the runner was entered would let a task wait out its whole budget and
+	// then execute for a second one.
+	if d := t.Envelope.Budget.MaxDuration; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
 	}
 
 	// Cache short-circuit: identical op + identical inputs → replay.
@@ -464,14 +479,11 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	}
 	if claim.Hit {
 		if l.Bus != nil {
-			ev := observe.Event{
+			l.Bus.Publish(observe.Event{
 				Type: observe.CacheHit, RunID: t.Envelope.RunID,
 				Stage: t.Stage, TaskID: t.ID,
-			}
-			if claim.Coalesced {
-				ev.Type, ev.Latency = observe.CacheCoalesced, claim.Waited
-			}
-			l.Bus.Publish(ev)
+				Coalesced: claim.Coalesced, Latency: claim.Waited,
+			})
 		}
 		return task.Result{
 			TaskID: t.ID, Seq: t.Seq, Stage: t.Stage, Output: claim.Records,
@@ -482,12 +494,6 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 	runner, ok := l.Runners[t.Stage]
 	if !ok {
 		return task.Result{}, core.Permanent(fmt.Errorf("stage %q: no runner registered", t.Stage))
-	}
-
-	if d := t.Envelope.Budget.MaxDuration; d > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d)
-		defer cancel()
 	}
 
 	rt := &Runtime{
@@ -538,7 +544,26 @@ func (l *Local) Execute(ctx context.Context, t task.Task) (task.Result, error) {
 
 	artifact := ""
 	if t.CacheKey != "" && l.Cache != nil {
-		artifact, _ = l.Cache.Put(t.CacheKey, out)
+		var err error
+		if artifact, err = l.Cache.Put(t.CacheKey, out); err == nil {
+			// Served back through the cache rather than handed straight up from
+			// the runner, so that a cacheable stage emits one shape of record
+			// however its tasks were settled.
+			//
+			// Records cross the cache as JSON, which is what makes them
+			// content-addressable and shippable to another process — and what
+			// turns an int into a float64, a time.Time into a string, and a
+			// struct into a map on the way back. Without this the leader would
+			// return the runner's Go values while every task that replayed or
+			// coalesced returned the round-tripped ones, and a stage could hand
+			// downstream code two types for one field depending on which task
+			// happened to win a race. The claim a result cache rests on is that
+			// a replay is substitutable for the call it replaces; that is only
+			// true if the call's own output already looks like the replay.
+			if canonical, ok := l.Cache.Get(t.CacheKey); ok {
+				out = canonical
+			}
+		}
 	}
 	if l.Lineage != nil {
 		l.Lineage.Record(store.LineageEntry{
