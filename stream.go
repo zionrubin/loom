@@ -214,7 +214,10 @@ func (d *driver) pump(ctx context.Context, cancel context.CancelCauseFunc,
 					class := core.ClassOf(err)
 					d.fail(runtime.Failure{Task: t, Err: err, Class: class})
 					if class == core.FailBudget {
-						cancel(runtime.ErrBudgetExhausted)
+						// The task's own error already names which ceiling
+						// stopped it — the run's budget or the wallet the
+						// fleet shares — and a constant here would lose that.
+						cancel(budgetCause(err))
 					} else if !d.cfg.ContinueOnError {
 						cancel(err)
 					}
@@ -351,4 +354,15 @@ func drain(ctx context.Context, in *runtime.Pipe) []core.Record {
 		}
 		all = append(all, recs...)
 	}
+}
+
+// budgetCause unwraps a task's budget failure to the ceiling that caused it, so
+// a cancelled run reports "shared wallet exhausted" rather than the generic
+// constant when that is what happened. A failure that names neither falls back
+// to the generic one, which is what it always was.
+func budgetCause(err error) error {
+	if errors.Is(err, runtime.ErrWalletExhausted) {
+		return runtime.ErrWalletExhausted
+	}
+	return runtime.ErrBudgetExhausted
 }

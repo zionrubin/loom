@@ -802,3 +802,132 @@ func (c *countingRouter) Observe(o route.Outcome) {
 		c.invalid++
 	}
 }
+
+// --- the shared wallet seam ---------------------------------------------
+
+// fakeWallet is a ceiling somebody else is also spending against.
+type fakeWallet struct {
+	mu    sync.Mutex
+	spent core.Usage
+	cap   float64
+	// open, when set, makes the wallet report itself unspent whatever the
+	// arithmetic says — a window that rolled over while this governor was
+	// holding an opinion about it.
+	open bool
+}
+
+func (w *fakeWallet) Charge(u core.Usage) (core.Usage, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.spent.Add(u)
+	return w.spent, w.exhaustedLocked(), nil
+}
+
+func (w *fakeWallet) Exhausted() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.exhaustedLocked()
+}
+
+func (w *fakeWallet) exhaustedLocked() bool {
+	return !w.open && w.spent.CostUSD >= w.cap
+}
+
+func (w *fakeWallet) reopen() {
+	w.mu.Lock()
+	w.open = true
+	w.mu.Unlock()
+}
+
+// Two ceilings, and the failure has to name the one an operator would have to
+// raise. Anything else leaves them reading a run that stopped for a budget it
+// can see plenty of room in.
+func TestTheGovernorNamesWhichCeilingStopped(t *testing.T) {
+	w := &fakeWallet{cap: 1.00}
+	g := NewSharedGovernor(core.Budget{MaxCostUSD: 100}, w)
+
+	if err := g.Charge(core.Usage{CostUSD: 0.5}); err != nil {
+		t.Fatalf("a charge inside both ceilings returned %v", err)
+	}
+	err := g.Charge(core.Usage{CostUSD: 0.6})
+	if !errors.Is(err, ErrWalletExhausted) {
+		t.Fatalf("the charge that emptied the shared wallet reported %v, want the wallet", err)
+	}
+	// And it is still an exhausted budget to everything that only cares that
+	// money ran out.
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("%v does not read as an exhausted budget", err)
+	}
+	if reason := g.Reason(); !errors.Is(reason, ErrWalletExhausted) {
+		t.Fatalf("Reason is %v, want the wallet", reason)
+	}
+}
+
+// The run's own budget is latched — its spend only grows — but the wallet's is
+// not, because a wallet with a window refills. A governor that latched on
+// somebody else's ceiling would keep a long-lived fleet stopped past midnight.
+func TestAnExhaustedWalletIsNotLatched(t *testing.T) {
+	w := &fakeWallet{cap: 1.00}
+	g := NewSharedGovernor(core.Budget{MaxCostUSD: 100}, w)
+
+	if err := g.Charge(core.Usage{CostUSD: 1.50}); !errors.Is(err, ErrWalletExhausted) {
+		t.Fatalf("charge reported %v, want the wallet", err)
+	}
+	if !g.Exhausted() {
+		t.Fatal("the governor is still admitting work against an empty wallet")
+	}
+	w.reopen() // the window rolled over
+	if g.Exhausted() {
+		t.Fatal("the wallet refilled and the governor is still holding the run down")
+	}
+	// The run's own budget, by contrast, stays spent once it is spent.
+	own := NewSharedGovernor(core.Budget{MaxCostUSD: 1}, w)
+	if err := own.Charge(core.Usage{CostUSD: 2}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("charge reported %v, want the run budget", err)
+	}
+	if !own.Exhausted() {
+		t.Fatal("a run that overspent its own budget un-exhausted itself")
+	}
+}
+
+// The shared buckets are a seam, not a special case: a limiter given one must
+// route every draw and every refund through it, or a fleet's quota is whatever
+// the local bucket happened to think.
+func TestASharedLimiterDrawsNowhereElse(t *testing.T) {
+	b := &countingBuckets{}
+	l := NewSharedRateLimiter(b)
+	lim := model.Limits{RequestsPerMinute: 1} // a local bucket would allow one
+
+	for i := 0; i < 5; i++ {
+		release, err := l.Acquire(t.Context(), "m", lim, 10)
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		release(i%2 == 0) // half of them settle without reaching a provider
+	}
+	if b.acquires != 5 {
+		t.Fatalf("%d of 5 acquisitions reached the shared buckets", b.acquires)
+	}
+	if b.refunds != 2 {
+		t.Fatalf("%d refunds reached the shared buckets, want the 2 unissued draws", b.refunds)
+	}
+}
+
+type countingBuckets struct {
+	mu       sync.Mutex
+	acquires int
+	refunds  int
+}
+
+func (c *countingBuckets) Acquire(_ context.Context, _ string, _ model.Limits, _ int) error {
+	c.mu.Lock()
+	c.acquires++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *countingBuckets) Refund(string, model.Limits, int) {
+	c.mu.Lock()
+	c.refunds++
+	c.mu.Unlock()
+}

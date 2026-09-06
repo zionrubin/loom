@@ -91,6 +91,7 @@ failures.
 | **Workflow-aware priority across agents** (Kairos) | Agents in one workflow have different latency sensitivity | Partly: the pool distinguishes agents by attained service, not by declared sensitivity — an agent cannot yet say "I am the interactive one" | ◐ |
 | **One quota across concurrent programs** | Two runs in a process each believe they own the provider's whole limit | One `runtime.RateLimiter` per fleet, borrowed by every agent | ✅ `fleet.go` |
 | **One ceiling across concurrent programs** | A budget enforced per pipeline is a budget multiplied by pipelines | One `runtime.Governor` per fleet (`WithFleetBudget`) | ✅ `fleet.go` |
+| **One quota and one ceiling across concurrent *processes*** | The two rows above, one level out: a deployment is several processes, and each was getting its own limiter and its own governor — so a rate limit is multiplied by processes and a dollar cap is too, silently | `quota.Store`: shared buckets and a shared ledger, over a directory or an HTTP service, plugged into the limiter and the governor through two-method seams (`loom.WithSharedQuota`) | ✅ `quota`, [QUOTA.md](./QUOTA.md) |
 | **Cross-program cache reuse** | Programs redo work a sibling already paid for | One CAS and result cache per fleet: an agent replays another agent's completed work at zero cost | ✅ `fleet.go` |
 | **Cross-program *research* reuse** | The result cache is blind to the duplication that costs most: one question in three wordings, asked at the same instant | `findings.Gate` keys on the question rather than the bytes, and a single-flight lease collapses concurrent askers onto one call | ✅ `findings`, [FINDINGS.md](./FINDINGS.md) |
 | **Append-only session log** (Anthropic) | State that survives a crashed harness | Loom's equivalent already existed for a different reason: the content-addressed result cache *is* the checkpoint, and lineage is the append-only record | ✅ `store` |
@@ -102,7 +103,11 @@ failures.
 
 Three rows in that table were the work: making the program the scheduling
 unit, admitting slots by attained service, and giving agents a safe way to read
-each other's conclusions.
+each other's conclusions. A fourth was added later, and it is the same argument
+this document makes applied to the thing this document assumed: everything
+below is about many agents in **one process**, and a deployment is several —
+so the quota and the ceiling had to move out of the process too.
+[QUOTA.md](./QUOTA.md) is that.
 
 ---
 

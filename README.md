@@ -74,6 +74,9 @@ go run ./examples/triage   # a complete pipeline on a mock model, offline
 # a desk that reads conversations as they arrive and answers questions about them
 go run ./examples/switchboard
 
+# four processes, one provider account: a $0.05 ceiling that costs $0.20 without it
+go run ./examples/treasury
+
 # watch a run as a sky of stars: http://localhost:8077
 go run ./examples/constellation
 
@@ -86,7 +89,7 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty-two examples ship — fleets, streaming, serving, MCP, local inference,
+Twenty-three examples ship — fleets, streaming, serving, MCP, local inference,
 worker processes, iteration, routing, the studio — and all but five run offline
 against a deterministic mock provider. [docs/EXAMPLES.md](docs/EXAMPLES.md) is
 the catalog.
@@ -167,6 +170,22 @@ the catalog.
   contended slot goes to the agent whose *program* has been served least, so a
   three-call summary overtakes a 10,000-record sweep. Agents coordinate through
   an append-only **blackboard**. [docs/ASYNC.md](docs/ASYNC.md)
+- **One quota, one wallet — across processes** — a fleet gives every agent in a
+  process one limiter and one ceiling. A *deployment* is several processes, and
+  each of them was getting its own: ten workers each admitting against 4,000
+  requests/min collectively admit against 40,000, and
+  `WithRunBudget(MaxCostUSD: 100)` is a hard cap in one process and a $1,000 cap
+  in ten — silently, because all ten finish inside their budget and say so.
+  `loom.WithSharedQuota` puts the per-minute buckets and the ceiling where every
+  process can see them: a shared directory for one host, an HTTP service for a
+  fleet spanning hosts, both passing one conformance suite. It composes with the
+  run budget rather than replacing it, so a run stops at whichever ceiling it
+  reaches first — and `Explain` now answers the question an operator actually
+  has, which is not what a run costs but whether there is enough left for it.
+  The shared quota **errs low, never high**: a draw a dead process never
+  returns costs the fleet throughput until the bucket refills, and a store
+  nobody can reach refuses admission rather than granting it.
+  [docs/QUOTA.md](docs/QUOTA.md)
 - **MCP tools, under the envelope** — stages declare what they may call and the
   planner turns that one declaration into a grant per tool, the server's host on
   the egress allowlist, and the digest of the descriptors it was compiled
@@ -233,6 +252,7 @@ the catalog.
 | [ALGORITHMS.md](docs/ALGORITHMS.md) | The algorithm seam: BSP, refine, beam |
 | [ITERATION.md](docs/ITERATION.md) | Why iteration is the dimension that was missing |
 | [ASYNC.md](docs/ASYNC.md) | Fleets, attained-service scheduling, the blackboard |
+| [QUOTA.md](docs/QUOTA.md) | One rate limit and one wallet, shared across processes |
 | [FINDINGS.md](docs/FINDINGS.md) | The commons: sharing research between concurrent agents |
 | [DELTA.md](docs/DELTA.md) | Stateful delta execution, and proving a splice was safe |
 | [WORKERS.md](docs/WORKERS.md) | Distributing a run across worker processes |
@@ -255,6 +275,8 @@ the catalog.
 | `ops` | Operation runners (infer, reduce, fused transforms) |
 | `model` | Provider abstraction, registry, tiers, escalation bindings, mock |
 | `route` | Where on a stage's ladder a task starts: an online estimator over the validator's own verdicts, a probe that keeps the saving measurable, and a profile that outlives the run |
+| `quota` | The account's two singletons — per-minute buckets and a ledger — where every process can reach them: the `Store` contract, a shared directory, an HTTP service and client, and the coalescing front end the limiter and governor plug into |
+| `quota/quotatest` | The conformance suite both quota backends pass |
 | `mcp` | MCP client: server descriptors, stdio/HTTP transports, the host-owned connection catalog, tool adapters |
 | `mcp/mcptest` | A scriptable in-process MCP server for tests and offline examples |
 | `providers/anthropic` | Official-SDK Anthropic adapter, broker-resolved keys |

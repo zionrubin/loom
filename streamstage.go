@@ -431,7 +431,10 @@ func (j *streamJob) pumpLoop(ctx context.Context, cancel context.CancelCauseFunc
 					class := core.ClassOf(err)
 					j.fail(runtime.Failure{Task: t, Err: err, Class: class})
 					if class == core.FailBudget {
-						cancel(runtime.ErrBudgetExhausted)
+						// The task's own error already names which ceiling
+						// stopped it — the run's budget or the wallet the
+						// fleet shares — and a constant here would lose that.
+						cancel(budgetCause(err))
 					} else if !j.cfg.ContinueOnError {
 						cancel(err)
 					}

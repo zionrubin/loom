@@ -1,6 +1,7 @@
 package loom
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -16,6 +17,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/store"
@@ -171,6 +173,16 @@ type Projection struct {
 	Budget   core.Budget
 	Stages   []StageProjection
 
+	// Wallet is the shared ceiling and what the fleet has already spent
+	// against it, when the run was configured with one. It is the number that
+	// turns "this run costs $12" into the question an operator actually has:
+	// $12 against what is left.
+	//
+	// Nil when no shared quota was given, and nil too when its ledger could not
+	// be read — a projection that invented a balance would be worse than one
+	// that says it does not have it, and the warning says which happened.
+	Wallet *WalletProjection
+
 	// Warnings name every place the projection had to fall back to an
 	// approximation, and every discrepancy worth seeing before spending
 	// money. A projection with no warnings is computed end to end.
@@ -232,6 +244,49 @@ func (p *Projection) AdmissionFloor() time.Duration {
 	return longest
 }
 
+// WalletProjection is the shared ceiling as it stands before this run starts.
+type WalletProjection struct {
+	// Budget is the ceiling this process holds the fleet to, and Window the
+	// span it covers (zero: a pot that does not refill).
+	Budget core.Budget
+	Window time.Duration
+	// Spent is what every process on the account has already spent inside that
+	// window, and Charges how many bills that is.
+	Spent   core.Usage
+	Charges int
+}
+
+// RemainingUSD is what the wallet leaves unspent, or -1 when it sets no dollar
+// ceiling.
+func (w *WalletProjection) RemainingUSD() float64 {
+	if w == nil || w.Budget.MaxCostUSD <= 0 {
+		return -1
+	}
+	return max(0, w.Budget.MaxCostUSD-w.Spent.CostUSD)
+}
+
+// FitsWallet reports whether what the fleet has left covers this run's ceiling.
+//
+// It is a different question from FitsBudget and a more useful one, because the
+// run budget is a number you chose and the wallet is a number other processes
+// have been spending while you were deciding. A false here is the whole reason
+// to read a projection against a shared quota: the run will start, do part of
+// the work, and stop — and knowing that costs one read instead of half a job.
+func (p *Projection) FitsWallet() bool {
+	w := p.Wallet
+	if w == nil {
+		return true
+	}
+	c := p.Ceiling()
+	if w.Budget.MaxCostUSD > 0 && w.Spent.CostUSD+c.CostUSD > w.Budget.MaxCostUSD {
+		return false
+	}
+	if w.Budget.MaxTokens > 0 && w.Spent.TotalTokens()+c.TotalTokens() > w.Budget.MaxTokens {
+		return false
+	}
+	return true
+}
+
 // FitsBudget reports whether the run's budget covers the projected ceiling.
 // A false here does not mean the run fails: the governor stops admitting work
 // and returns partial results, which is sometimes exactly what you want.
@@ -270,11 +325,14 @@ func (p *Projection) FitsBudget() bool {
 // or a MapTools stage, which Explain declines to execute because one may
 // touch the network and the other needs a provisioned session.
 //
-// Explain issues no model calls, resolves no secrets, opens no sockets, and
-// writes nothing to the state directory, so it is safe to run against a
-// production pipeline config. Retries and escalation are excluded: both are
-// responses to failures a projection cannot predict, and both spend above the
-// ceiling when they happen.
+// Explain issues no model calls, resolves no secrets, and writes nothing — not
+// to the state directory and not to the shared quota — so it is safe to run
+// against a production pipeline config. The one thing it reaches outside this
+// process for is a shared wallet's balance, when the config names one: a read,
+// from the same ledger the run would charge, because the useful form of "this
+// run costs $12" is "$12 against the $4 the fleet has left". Retries and
+// escalation are excluded: both are responses to failures a projection cannot
+// predict, and both spend above the ceiling when they happen.
 func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	cfg := Config{Workers: 8, Retry: runtime.DefaultRetry}
 	for _, o := range opts {
@@ -345,6 +403,25 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	}
 	if cfg.Streaming {
 		proj.Driver = "streaming"
+	}
+	// The one thing a projection reads from outside this process. It writes
+	// nothing and issues no model call; what it asks the shared store is what
+	// the fleet has already spent, which is the difference between "this run
+	// costs $12" and "this run costs $12 and $4 is left".
+	if cfg.Quota != nil {
+		q := quota.New(cfg.Quota, cfg.QuotaConfig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		l, err := q.Refresh(ctx)
+		cancel()
+		if err != nil {
+			e.warnf("the shared quota could not be read, so this projection says "+
+				"nothing about what the fleet has left: %v", err)
+		} else {
+			proj.Wallet = &WalletProjection{
+				Budget: cfg.QuotaConfig.Wallet, Window: cfg.QuotaConfig.Window,
+				Spent: l.Spent, Charges: l.Charges,
+			}
+		}
 	}
 	for _, sp := range pl.Order {
 		sproj, err := e.stage(sp)
@@ -1136,6 +1213,26 @@ func (p *Projection) String() string {
 			verdict = "covers the projected stages, but the projection is incomplete"
 		}
 		fmt.Fprintf(&b, "run budget %s %s\n", budgetDetail(p.Budget), verdict)
+	}
+	// The account's ceiling, after the run's own. It goes last of the budget
+	// lines because it is the one that can make the others irrelevant: a run
+	// well inside its own budget still stops where the fleet's money ran out.
+	if w := p.Wallet; w != nil && (w.Budget.MaxCostUSD > 0 || w.Budget.MaxTokens > 0) {
+		span := "all time"
+		if w.Window > 0 {
+			span = "the last " + w.Window.String()
+		}
+		fmt.Fprintf(&b, "shared wallet %s: the fleet has spent $%.4f in %s over %d charge(s)",
+			budgetDetail(w.Budget), w.Spent.CostUSD, span, w.Charges)
+		if left := w.RemainingUSD(); left >= 0 {
+			fmt.Fprintf(&b, ", leaving $%.4f", left)
+		}
+		if p.FitsWallet() {
+			b.WriteString(" — enough for this run's ceiling\n")
+		} else {
+			b.WriteString("\n  which does NOT cover this run's ceiling: it will stop part-way " +
+				"and return partial results, or another process will\n")
+		}
 	}
 	if len(p.Warnings) > 0 {
 		b.WriteString("warnings:\n")

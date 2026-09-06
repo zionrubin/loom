@@ -64,6 +64,27 @@ type RateLimiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	slots   map[string]chan struct{}
+	// shared, when set, replaces the per-minute buckets above with buckets
+	// several *processes* draw from together. The in-flight slots stay here
+	// whatever happens: MaxConcurrent is the ceiling a model on your own
+	// hardware imposes, which is a property of a device rather than of an
+	// account, and two processes on two GPUs would be wrong to share one.
+	shared Buckets
+}
+
+// Buckets is per-minute admission control this process does not own alone: the
+// seam a shared quota plugs into.
+//
+// Its contract is the local bucket's, method for method, which is what lets the
+// scheduler stay ignorant of which one it is talking to. Nothing in planning,
+// execution or recovery learns that the bucket it drew from was in another
+// process.
+type Buckets interface {
+	// Acquire blocks until one request of ~estTokens may be issued against
+	// modelID, or ctx ends.
+	Acquire(ctx context.Context, modelID string, lim model.Limits, estTokens int) error
+	// Refund gives back a draw whose request was never issued.
+	Refund(modelID string, lim model.Limits, estTokens int)
 }
 
 type bucket struct {
@@ -76,6 +97,15 @@ type bucket struct {
 // NewRateLimiter returns an empty limiter; buckets are created on first use.
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{buckets: map[string]*bucket{}, slots: map[string]chan struct{}{}}
+}
+
+// NewSharedRateLimiter returns a limiter whose per-minute buckets live where
+// every process sharing the account can draw on them. The in-flight slots stay
+// local, for the reason stated on RateLimiter.shared.
+func NewSharedRateLimiter(b Buckets) *RateLimiter {
+	l := NewRateLimiter()
+	l.shared = b
+	return l
 }
 
 func (b *bucket) refill(now time.Time) {
@@ -134,6 +164,10 @@ func (l *RateLimiter) Acquire(ctx context.Context, modelID string, lim model.Lim
 // draw is a leak in one direction or a licence to overrun in the other.
 func (l *RateLimiter) refund(modelID string, lim model.Limits, estTokens int) {
 	if lim.RequestsPerMinute <= 0 && lim.TokensPerMinute <= 0 {
+		return
+	}
+	if l.shared != nil {
+		l.shared.Refund(modelID, lim, estTokens)
 		return
 	}
 	l.mu.Lock()
@@ -196,6 +230,9 @@ func (l *RateLimiter) acquireRate(ctx context.Context, modelID string, lim model
 	if lim.RequestsPerMinute <= 0 && lim.TokensPerMinute <= 0 {
 		return nil
 	}
+	if l.shared != nil {
+		return l.shared.Acquire(ctx, modelID, lim, estTokens)
+	}
 	for {
 		l.mu.Lock()
 		b, ok := l.buckets[modelID]
@@ -251,6 +288,15 @@ func (l *RateLimiter) acquireRate(ctx context.Context, modelID string, lim model
 // stops admitting new work and the run returns partial results.
 var ErrBudgetExhausted = errors.New("run budget exhausted")
 
+// ErrWalletExhausted signals that what stopped the run was the ceiling it
+// shares with every other process on the account, rather than its own budget.
+//
+// It wraps ErrBudgetExhausted, so everything that already handles an exhausted
+// budget handles this unchanged — and an operator reading the failure learns
+// which of the two ceilings they have to raise, which is the only question they
+// are going to ask.
+var ErrWalletExhausted = fmt.Errorf("shared wallet exhausted: %w", ErrBudgetExhausted)
+
 // Governor enforces the run-level budget (cost and tokens) across all
 // concurrent tasks. Charging is post-hoc, so overrun is bounded by the
 // number of in-flight tasks.
@@ -259,14 +305,61 @@ type Governor struct {
 	budget    core.Budget
 	spent     core.Usage
 	exhausted bool
+	// byWallet says which of the two ceilings stopped the run, so the failure
+	// names the one an operator would have to raise.
+	byWallet bool
+	// wallet, when set, is a ceiling this run shares with every other process
+	// spending the same account. It never replaces the run's own budget; the
+	// two compose, and the run stops at whichever it reaches first.
+	wallet Wallet
+}
+
+// Wallet is a ceiling this process does not own alone: the seam a shared quota
+// plugs into.
+//
+// It is deliberately not the same shape as Governor. A run budget is a number
+// this process can add up; a wallet is a number several processes are adding to
+// at once, so charging it is a round trip that reports where the fleet now
+// stands rather than a local addition that cannot fail.
+type Wallet interface {
+	// Charge records usage against the shared ceiling and reports the fleet's
+	// spend and whether the ceiling has been reached. An error means the charge
+	// may not have been recorded; the caller decides what to do about that, and
+	// Exhausted is the one that knows how long the outage has lasted.
+	Charge(u core.Usage) (spent core.Usage, exhausted bool, err error)
+	// Exhausted reports whether the fleet has reached the ceiling. The
+	// scheduler asks before every attempt, so implementations are expected to
+	// answer from a cached view rather than a round trip per task.
+	Exhausted() bool
 }
 
 // NewGovernor returns a governor for the budget (zero fields = unlimited).
 func NewGovernor(b core.Budget) *Governor { return &Governor{budget: b} }
 
+// NewSharedGovernor returns a governor that enforces the run's own budget and
+// a ceiling shared with every other process on the same account.
+//
+// Both apply. A run budget bounds what one pipeline may spend however many
+// pipelines there are; the wallet bounds what they may spend together. Dropping
+// either would leave one of the two failures unguarded: a runaway pipeline that
+// empties the shared wallet, or a fleet of well-behaved pipelines that
+// collectively empty the account.
+func NewSharedGovernor(b core.Budget, w Wallet) *Governor {
+	return &Governor{budget: b, wallet: w}
+}
+
 // Charge records usage; it returns ErrBudgetExhausted once a limit is
 // crossed (the usage is still recorded).
 func (g *Governor) Charge(u core.Usage) error {
+	// The shared ceiling is charged outside the lock: it is a round trip, and
+	// holding a mutex every other task's budget check queues on for the length
+	// of one would turn the wallet into the run's bottleneck.
+	var sharedOut bool
+	var sharedErr error
+	if g.wallet != nil {
+		_, sharedOut, sharedErr = g.wallet.Charge(u)
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.spent.Add(u)
@@ -274,8 +367,23 @@ func (g *Governor) Charge(u core.Usage) error {
 		(g.budget.MaxTokens > 0 && g.spent.TotalTokens() >= g.budget.MaxTokens) {
 		g.exhausted = true
 	}
-	if g.exhausted {
-		return ErrBudgetExhausted
+	if sharedOut {
+		// Recorded, not latched. The run's own spend only ever grows, so
+		// exhausting its budget is final; a shared wallet with a window
+		// refills, and a governor that latched on somebody else's ceiling
+		// would keep a long-lived fleet stopped past the point where the money
+		// came back.
+		g.byWallet = true
+	}
+	if g.exhausted || sharedOut {
+		return g.reasonLocked()
+	}
+	if sharedErr != nil {
+		// The call was made and billed whether or not the fleet's ledger
+		// recorded it, so the run hears about it. Whether it stops is
+		// Exhausted's decision, which is the one that knows how long the
+		// shared store has been unreachable.
+		return fmt.Errorf("shared wallet: %w", sharedErr)
 	}
 	return nil
 }
@@ -283,8 +391,45 @@ func (g *Governor) Charge(u core.Usage) error {
 // Exhausted reports whether the budget has been spent.
 func (g *Governor) Exhausted() bool {
 	g.mu.Lock()
+	spent := g.exhausted
+	w := g.wallet
+	g.mu.Unlock()
+	if spent {
+		return true
+	}
+	// Asked of the wallet outside the lock, and asked every time rather than
+	// once: what stops this run may be money another process spent a second
+	// ago, and a governor that only ever consulted its own additions would
+	// never find out.
+	if w == nil || !w.Exhausted() {
+		return false
+	}
+	g.mu.Lock()
+	g.byWallet = true
+	g.mu.Unlock()
+	return true
+}
+
+// Reason is which ceiling stopped the run, for a caller that has to report it.
+// It returns ErrBudgetExhausted when the run's own budget was the binding one
+// and ErrWalletExhausted when the fleet's was; the latter wraps the former, so
+// a caller that only cares that money ran out can ignore the distinction.
+func (g *Governor) Reason() error {
+	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.exhausted
+	return g.reasonLocked()
+}
+
+func (g *Governor) reasonLocked() error {
+	// The run's own budget wins when both are spent: it is latched and
+	// unambiguous, and it is the one the caller of this run controls.
+	if g.exhausted {
+		return ErrBudgetExhausted
+	}
+	if g.byWallet {
+		return ErrWalletExhausted
+	}
+	return ErrBudgetExhausted
 }
 
 // Spent returns the usage recorded so far.
@@ -379,7 +524,7 @@ func (s *Scheduler) ExecuteAll(ctx context.Context, tasks []task.Task) ([]task.R
 			failures = append(failures, Failure{Task: t, Err: err, Class: class, Attempts: attempts})
 			mu.Unlock()
 			if class == core.FailBudget {
-				abort(ErrBudgetExhausted)
+				abort(s.budgetReason())
 			} else if !s.ContinueOnError && ctx.Err() == nil {
 				abort(err)
 			}
@@ -477,7 +622,7 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 
 		if s.Governor != nil && s.Governor.Exhausted() {
 			release(false)
-			return task.Result{}, attempt, core.BudgetExceeded(ErrBudgetExhausted)
+			return task.Result{}, attempt, core.BudgetExceeded(s.budgetReason())
 		}
 		if ctx.Err() != nil {
 			release(false)
@@ -557,6 +702,15 @@ func (s *Scheduler) runTask(ctx context.Context, t task.Task, worker string) (ta
 	}
 }
 
+// budgetReason names the ceiling that stopped the run, so an operator reading
+// the failure learns which of the two they have to raise.
+func (s *Scheduler) budgetReason() error {
+	if s.Governor == nil {
+		return ErrBudgetExhausted
+	}
+	return s.Governor.Reason()
+}
+
 // charge records what one attempt cost against the run budget.
 //
 // Every attempt goes through here, successful or not. A call that was made
@@ -572,12 +726,21 @@ func (s *Scheduler) charge(t task.Task, res task.Result) {
 	if s.Governor == nil || res.Usage == (core.Usage{}) {
 		return
 	}
-	if err := s.Governor.Charge(res.Usage); err != nil {
+	err := s.Governor.Charge(res.Usage)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, ErrBudgetExhausted) {
 		// What was spent stands; the governor stops *future* work.
 		s.publish(observe.Event{Type: observe.BudgetExceeded,
 			RunID: t.Envelope.RunID, Stage: t.Stage, TaskID: t.ID,
 			Note: err.Error()})
+		return
 	}
+	// A shared ceiling that could not be written to. The bill is real and this
+	// run's own accounting has it; what is short by exactly this is the fleet's
+	// ledger, which is where the run report reads the failure from. Announcing
+	// it as a budget event would say a budget was exceeded when none was.
 }
 
 // route asks the router where this task should enter its ladder, and reports

@@ -26,6 +26,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
@@ -97,6 +98,13 @@ type Config struct {
 	// runtime default). It has no effect on a single Run, whose tasks all
 	// belong to one program and therefore tie.
 	AdmissionAging float64
+	// Quota is the rate limit and wallet this process shares with every other
+	// process spending the same provider account, and QuotaConfig the policy
+	// it applies to them — the ceiling and the window it covers. Nil — the
+	// default — gives this process its own buckets and its own governor, which
+	// is the right scope for the only process there is.
+	Quota       quota.Store
+	QuotaConfig quota.Config
 
 	// Stream-mode settings. They configure Stream and are ignored by Run, so
 	// one config can describe both a backfill and the live job that follows it.
@@ -474,6 +482,52 @@ func WithRouter(r route.Router) Option {
 // many pipelines happen to be running.
 func WithFleetBudget(b core.Budget) Option { return WithRunBudget(b) }
 
+// WithSharedQuota puts this run's admission control and its ceiling where every
+// other process on the same provider account can see them.
+//
+// A fleet already holds one rate limiter, one governor and one cache for every
+// agent in a process, because none of those is a property of a pipeline: a rate
+// limit belongs to an account, a ceiling belongs to a wallet. The same sentence
+// is true of a process — a worker fleet, a job per pod, a service running a
+// pipeline per request — and until this option there was no way to say so. Ten
+// processes each admitting against 4,000 requests/min collectively admit
+// against 40,000, and ten processes each holding a $100 ceiling collectively
+// hold $1,000.
+//
+//	q, _ := quota.Open("/var/lib/loom/quota", quota.Options{})
+//	defer q.Close()
+//
+//	loom.Run(ctx, p,
+//	    loom.WithSharedQuota(q, core.Budget{MaxCostUSD: 500}, 24*time.Hour),
+//	    loom.WithRunBudget(core.Budget{MaxCostUSD: 5}),
+//	)
+//
+// wallet is what the *fleet* may spend inside window (zero window: a pot that
+// does not refill; zero budget: no ceiling, which still records spend, because
+// a shared ledger with no ceiling is a fleet-wide cost report worth having on
+// its own). It composes with WithRunBudget rather than replacing it: a run
+// stops at whichever ceiling it reaches first, so a runaway pipeline still
+// cannot outspend its own budget and a fleet of well-behaved pipelines still
+// cannot outspend the account.
+//
+// The store is the caller's to close, because the caller is the one who knows
+// when the last run using it has finished.
+func WithSharedQuota(store quota.Store, wallet core.Budget, window time.Duration) Option {
+	return func(c *Config) {
+		c.Quota = store
+		c.QuotaConfig.Wallet = wallet
+		c.QuotaConfig.Window = window
+	}
+}
+
+// WithQuotaConfig tunes how this process talks to a shared quota: how stale its
+// view of the fleet's spend may be, how long an unreachable store is treated as
+// a blip rather than an outage, and how long one round trip may take. The
+// ceiling and window it sets are overridden by a later WithSharedQuota.
+func WithQuotaConfig(cfg quota.Config) Option {
+	return func(c *Config) { c.QuotaConfig = cfg }
+}
+
 // WithAdmissionAging tunes how fast a fleet's queued tasks earn priority
 // credit for waiting (default runtime.DefaultAging).
 //
@@ -626,7 +680,13 @@ type RunResult struct {
 	// configured. The per-stage detail, including what the skipped calls would
 	// have cost, is on Report.
 	Routing route.Stats
-	Spent   core.Usage
+	// Quota reports the shared quota this process drew on: what the fleet has
+	// spent against the ceiling every process holds it to, how much of the
+	// shared rate buckets this run drew and gave back, and what contending for
+	// them cost in waiting. Zero when no shared quota was configured — which
+	// says this process owned its own limits, not that the fleet spent nothing.
+	Quota quota.Stats
+	Spent core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.
