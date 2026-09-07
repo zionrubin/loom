@@ -22,6 +22,7 @@ import (
 	"github.com/zionrubin/loom/ops"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
 	"github.com/zionrubin/loom/security"
@@ -619,6 +620,10 @@ type FleetReport struct {
 	// Commons summarizes the ledger by topic — what the fleet now knows, as
 	// distinct from what it saved by knowing it.
 	Commons []findings.TopicStat
+	// Quota is the shared rate limit and wallet, if this fleet is one of
+	// several processes on one account. Spent and Budget above are this
+	// process's; these are the account's.
+	Quota quota.Stats
 }
 
 // Duration is the fleet's wall-clock span.
@@ -664,6 +669,7 @@ func (f *Fleet) Report() FleetReport {
 		Spent: f.gov.Spent(), Budget: f.cfg.RunBudget,
 		Topics: topics, Posts: posts, MCP: f.mcpStats(),
 		Findings: f.findingsStats(), Commons: f.commonsTopics(),
+		Quota: f.host.quotaStats(),
 	}
 	for _, a := range agents {
 		ar := AgentReport{Name: a.Name, RunID: a.RunID}
@@ -768,6 +774,13 @@ func (r FleetReport) String() string {
 		fmt.Fprintf(&b, "fleet budget $%.4f, spent $%.4f (%.0f%%) across every agent\n",
 			r.Budget.MaxCostUSD, r.Spent.CostUSD, 100*r.Spent.CostUSD/r.Budget.MaxCostUSD)
 	}
+	// The line above is this process's ceiling; this one is the account's. A
+	// fleet sharing a quota with other processes has spent more than its own
+	// report knows about, and printing only the first number would be the exact
+	// mistake the shared quota exists to correct.
+	if r.Quota.Ledger.Charges > 0 || r.Quota.Admitted > 0 {
+		b.WriteString(r.Quota.String())
+	}
 	if r.Topics > 0 {
 		fmt.Fprintf(&b, "blackboard: %d topic(s), %d post(s), read by reference\n", r.Topics, r.Posts)
 	}
@@ -836,8 +849,19 @@ type host struct {
 	shared  *store.Broadcasts
 	gov     *runtime.Governor
 	limiter *runtime.RateLimiter
-	client  *executor.ModelClient
-	tools   *executor.ToolSet
+	// quota is this process's view of a rate limit and a wallet it does not own
+	// alone: the buckets the limiter draws from and the ceiling the governor
+	// charges, held where every process spending the same account can reach
+	// them. Nil unless WithSharedQuota was given, which is what keeps a single
+	// process's own limiter and governor the default — the right scope for the
+	// only process there is.
+	//
+	// It sits on the host beside them for the reason everything else here does:
+	// a quota is a property of an account rather than of a pipeline, so a fleet
+	// of ten agents borrows one and not ten.
+	quota  *quota.Shared
+	client *executor.ModelClient
+	tools  *executor.ToolSet
 	// mcp holds the host's connections to MCP servers, alongside the limiter
 	// and the governor and for the same reason: a connection belongs to an
 	// account and a server process rather than to a pipeline, so every agent
@@ -923,6 +947,14 @@ func newHost(cfg Config) (*host, error) {
 		limiter: runtime.NewRateLimiter(),
 		tools:   executor.NewToolSet(cfg.Tools...),
 		traces:  map[string]*agentTrace{},
+	}
+	// The shared quota is installed before anything else that could spend,
+	// because a limiter or a governor built local and swapped later would be a
+	// window in which this process believed it owned the account.
+	if cfg.Quota != nil {
+		h.quota = quota.New(cfg.Quota, cfg.QuotaConfig)
+		h.limiter = runtime.NewSharedRateLimiter(h.quota)
+		h.gov = runtime.NewSharedGovernor(cfg.RunBudget, h.quota)
 	}
 
 	// One handler demultiplexes the shared stream into each agent's own
@@ -1129,6 +1161,18 @@ func (h *host) provisionFindings() error {
 	return nil
 }
 
+// quotaStats reports what this process made of the shared quota: its own
+// traffic through it, and the fleet's ledger and buckets as they stand.
+//
+// Zero when no shared quota was configured, which is the shape that says "this
+// process owned its limits" rather than "the fleet spent nothing".
+func (h *host) quotaStats() quota.Stats {
+	if h.quota == nil {
+		return quota.Stats{}
+	}
+	return h.quota.Stats()
+}
+
 func (h *host) closeMCP() error {
 	if h.mcp == nil {
 		return nil
@@ -1213,6 +1257,13 @@ func (h *host) mcpStats() []mcp.Stats {
 }
 
 func (h *host) close() error {
+	if h.quota != nil {
+		// The last replayed tasks give their admission back to the fleet
+		// rather than to the refill rate: a batch of short-lived processes
+		// that each exited holding a handful of unreturned draws would keep
+		// the shared bucket permanently below where the account allows.
+		h.quota.Flush()
+	}
 	var ledger, shared error
 	if h.ledger != nil {
 		ledger = h.ledger.Close()
@@ -1367,6 +1418,7 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		MCP:          h.mcpStats(),
 		Findings:     h.findingsStats(),
 		Routing:      h.routingStats(),
+		Quota:        h.quotaStats(),
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {

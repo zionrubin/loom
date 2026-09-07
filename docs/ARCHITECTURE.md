@@ -594,6 +594,63 @@ under-projected by exactly the escalations. Sharing `route.Adaptive` rather
 than reimplementing the arithmetic is what stops the forecast and the
 scheduler drifting into disagreement. [ROUTING.md](./ROUTING.md).
 
+### 4.14 Shared quota (`quota`)
+
+§4.9's argument for a fleet is that a rate limit belongs to an account, a
+ceiling to a wallet, and a cache to work already done — so anything `loom.Run`
+provisions per pipeline is a thing each concurrent pipeline gets its own copy
+of. `Fleet` acts on that inside a process. `quota` acts on it between them,
+which is where a deployment actually lives: a worker fleet, a job per pod, a
+service running a pipeline per request, two teams on one API key.
+
+The rate half is a throughput bug — ten processes admitting against 4,000
+requests/min collectively admit against 40,000, and the provider answers the
+difference with the 429s admission control exists to avoid. The budget half is
+worse, because it is not about throughput: `WithRunBudget(MaxCostUSD: 100)` is a
+hard cap in one process and a $1,000 cap in ten, and nothing reports it, because
+all ten finish inside their budget and say so.
+
+`quota.Store` is the shared state — per-model buckets and one ledger of spend —
+with two implementations behind one conformance suite: a directory with an
+`O_EXCL` lock and a small state file rewritten under it, and an HTTP service
+wrapping any store for a fleet that spans hosts. `quota.Shared` is the process's
+view, and it satisfies exactly two seams: `runtime.Buckets` (two methods, the
+in-process limiter's contract unchanged) and `runtime.Wallet` (charge, and
+whether the ceiling is reached). Nothing in planning, execution or recovery
+learns that the bucket it drew from was in another process.
+
+Three choices carry the design:
+
+- **The store is bookkeeping, not policy.** The ceiling is never written to it.
+  Each process compares the shared spend against the budget it was given, so a
+  fleet whose processes disagree needs no reconciliation — each stops at its own
+  ceiling and the strictest stops first. The same holds for the window: spend is
+  kept at hourly resolution for a week plus an all-time total, and each caller
+  sums the span it cares about.
+- **It errs low, never high.** A draw a dead process never returns is a request
+  the fleet was entitled to make and did not, and the bucket refills toward its
+  cap regardless. A store nobody can reach refuses admission — as a *transient*
+  failure, so the scheduler backs off rather than dead-lettering — and a wallet
+  nobody can read is treated as spent once the outage outlasts a grace window.
+  The only unbounded-by-design overrun is the one post-hoc charging always had:
+  whatever was in flight across the fleet when the ceiling was crossed, which
+  the run report prints rather than rounding away.
+- **Coordination gets cheaper as the fleet gets busier.** A shared bucket is a
+  bucket behind a round trip, so one goroutine per model takes the round trip on
+  behalf of every task waiting in this process and hands out what came back in
+  arrival order. `Draw` is therefore a batch answered with a count, served from
+  the front. The leader holds no quota — it draws exactly what its followers are
+  waiting for — which is what keeps the bucket exact rather than approximately
+  fair, and is why nothing is lost when the process dies mid-round.
+
+`loom.Explain` reads the ledger (and writes nothing), so a projection answers
+the question an operator has: not what this run costs, but whether what the
+fleet has left covers it. And because there are now two ceilings,
+`runtime.ErrWalletExhausted` wraps `ErrBudgetExhausted` so a stopped run names
+which one has to be raised. [QUOTA.md](./QUOTA.md).
+
+---
+
 ## 5. Failure taxonomy (summary)
 
 | Class | Detected by | Recovery |
@@ -627,13 +684,19 @@ merely slow. §4.5 has the details, `examples/worker-fleet` runs it, and
 `worker_process_test.go` kills a worker mid-call and checks the run's answers
 against a single-process baseline.
 
-Still open in this phase: the scheduler's admission control is still per-client,
-so a fleet's collective respect for provider limits rests on how the clients are
-configured rather than on a shared token-bucket service; per-call telemetry
-stays in the process that made the calls, so a remote run's report is exact in
-tokens, cost and cache rate but counts model calls per task; and the queue is a
-directory or a map, with a broker-backed implementation of the same contract
-left to whoever needs many hosts.
+The admission-control half of this phase is now closed, and it turned out to be
+a bigger hole than the sentence that named it: the scheduler's buckets were
+per-client, but so was the *budget governor*, so a deployment of ten processes
+held ten copies of a ceiling that was supposed to be one. `quota` (§4.14) is
+where both live now — a shared directory for many processes on one host, an HTTP
+service for a fleet spanning hosts — and the run budget composes with it rather
+than being replaced by it.
+
+Still open in this phase: per-call telemetry stays in the process that made the
+calls, so a remote run's report is exact in tokens, cost and cache rate but
+counts model calls per task; and the queue is a directory or a map, with a
+broker-backed implementation of the same contract left to whoever needs many
+hosts.
 
 **Phase 2 — shared state.** The CAS maps naturally onto object storage
 (S3/GCS) with the same hash keys; the cache index and lineage onto any
@@ -752,10 +815,15 @@ capability-advertising workers; CAS-referenced inputs and outputs; idempotent
 result commit; two queue backends behind one conformance suite; and failure
 tests for worker death, late results, lease expiry, network interruption and
 duplicate execution, including a multi-process test that SIGKILLs a worker
-mid-call).
+mid-call), and the shared quota (`quota`: per-model token buckets and a ledger
+of spend held where every process on one account can reach them, a coalescing
+front end that takes one round trip on behalf of every task waiting in a
+process, a shared directory and an HTTP service behind one conformance suite,
+composition with the run budget so a run stops at whichever ceiling it reaches
+first, a projection that reads the fleet's remaining balance, and a two-process
+test whose control arm measures the ceiling being multiplied by processes).
 
-Designed but not yet implemented: a shared admission-control service so a fleet
-respects provider limits collectively rather than per client, a broker-backed
+Designed but not yet implemented: a broker-backed
 queue for fleets spanning hosts, object-storage state backends,
 subprocess/container/WASM sandbox runtimes, ensemble operators,
 priority/preemptive scheduling, result-cache eviction, a *distributed*

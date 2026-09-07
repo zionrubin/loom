@@ -22,6 +22,7 @@ to a real provider say so.
 | [`switchboard`](../examples/switchboard) | The serving layer: conversations in, a maintained context, questions against it | — |
 | [`commons`](../examples/commons) | The findings gate: four desks, one question each | — |
 | [`commons-shared`](../examples/commons-shared) | The same commons across four executor *processes* | — |
+| [`treasury`](../examples/treasury) | Four processes, one wallet: a $0.05 ceiling that costs $0.20 without it | — |
 | [`studio`](../examples/studio) | Loom Studio on an invented archive | — (`-openai` optional) |
 | [`anthropic-review`](../examples/anthropic-review) | Classification + summary, budget-capped | `ANTHROPIC_API_KEY` |
 | [`openai-review`](../examples/openai-review) | The same on the GPT-5.4 family, with the live view | `OPENAI_API_KEY` |
@@ -127,6 +128,17 @@ go run ./examples/delta-session -kill=false             # the undisturbed sessio
 # four executor processes over six overlapping subjects, counting the calls in
 # the source's own log: 24 asked, 6 researched
 go run ./examples/commons-shared
+
+# four processes against one provider account, run twice against the same $0.05
+# ceiling: holding it alone they spend $0.20 — four correct processes each
+# enforcing a number that was never theirs alone — and sharing it they spend
+# $0.05, with the overrun bounded by the calls in flight when it was crossed.
+# Ends by asking Explain the same question twice: what this run costs, and
+# whether the wallet the fleet just emptied still covers it
+go run ./examples/treasury
+go run ./examples/treasury -processes 8
+go run ./examples/treasury -service   # the same quota behind an HTTP service
+go run ./examples/treasury -rpm 60    # a rate bucket tight enough to bind (slow)
 ```
 
 ### Streaming
