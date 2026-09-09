@@ -12,8 +12,8 @@ import "github.com/zionrubin/loom/stream"
 // quietly became unbounded depending on which entry point was called would hide
 // all three. loom.Run refuses a pipeline with a stream source, and loom.Stream
 // refuses one without.
-func (p *Pipeline) FromStream(name string) Dataset {
-	return p.add(&Stage{ID: name, Kind: KindSource, Stream: true})
+func (p *Pipeline) FromStream(name string, opts ...Option) Dataset {
+	return p.add(&Stage{ID: name, Kind: KindSource, Stream: true, Opts: applyOpts(opts)})
 }
 
 // Window cuts an unbounded input into finite sets.

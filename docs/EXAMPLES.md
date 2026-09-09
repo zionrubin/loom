@@ -23,6 +23,7 @@ to a real provider say so.
 | [`commons`](../examples/commons) | The findings gate: four desks, one question each | — |
 | [`commons-shared`](../examples/commons-shared) | The same commons across four executor *processes* | — |
 | [`treasury`](../examples/treasury) | Four processes, one wallet: a $0.05 ceiling that costs $0.20 without it | — |
+| [`clearance`](../examples/clearance) | One pipeline, three deployment policies: the refused round makes zero calls | — |
 | [`studio`](../examples/studio) | Loom Studio on an invented archive | — (`-openai` optional) |
 | [`anthropic-review`](../examples/anthropic-review) | Classification + summary, budget-capped | `ANTHROPIC_API_KEY` |
 | [`openai-review`](../examples/openai-review) | The same on the GPT-5.4 family, with the live view | `OPENAI_API_KEY` |
@@ -139,6 +140,16 @@ go run ./examples/treasury
 go run ./examples/treasury -processes 8
 go run ./examples/treasury -service   # the same quota behind an HTTP service
 go run ./examples/treasury -rpm 60    # a rate bucket tight enough to bind (slow)
+
+# one pipeline run three times under three deployment policies — ungoverned, a
+# policy it violates, and the same policy against a pipeline that conforms. The
+# refused round makes zero model calls, and the example counts them, because
+# admission runs against the compiled plan before a scheduler exists. The class
+# that refuses it is declared once, on the source; the stage that calls a model
+# is two hops downstream and never mentions it
+go run ./examples/clearance
+go run ./examples/clearance -show-audit          # the trail each round leaves
+go run ./examples/clearance -policy prod.json    # the governing document as a file
 ```
 
 ### Streaming

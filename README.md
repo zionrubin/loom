@@ -77,6 +77,9 @@ go run ./examples/switchboard
 # four processes, one provider account: a $0.05 ceiling that costs $0.20 without it
 go run ./examples/treasury
 
+# one pipeline, three deployment policies: the refused round makes zero calls
+go run ./examples/clearance
+
 # watch a run as a sky of stars: http://localhost:8077
 go run ./examples/constellation
 
@@ -89,10 +92,10 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty-three examples ship — fleets, streaming, serving, MCP, local inference,
-worker processes, iteration, routing, the studio — and all but five run offline
-against a deterministic mock provider. [docs/EXAMPLES.md](docs/EXAMPLES.md) is
-the catalog.
+Twenty-four examples ship — fleets, streaming, serving, MCP, local inference,
+worker processes, iteration, routing, governance, the studio — and all but five
+run offline against a deterministic mock provider.
+[docs/EXAMPLES.md](docs/EXAMPLES.md) is the catalog.
 
 ## What you get
 
@@ -105,6 +108,25 @@ the catalog.
   references, egress allowlist, context bundle, budget, and sandbox profile. The
   planner assembles the *minimal* envelope automatically; executors enforce it
   at the moment of use, with an append-only audit log.
+- **Governance — the authority the pipeline's author does not hold** — least
+  privilege answers "what does this task need?" and never asked the prior
+  question, which is *who decides what it may need*. The planner assembles the
+  minimal envelope that satisfies **what the stage declared**, so the author is
+  also the security officer; in a deployment those are two people.
+  `loom.WithPolicy` is the missing one, and it needs no new vocabulary: the
+  envelope is already the complete statement of what a task may use, so a
+  policy is a **predicate over envelopes** — which models, tools, hosts and
+  secrets, under which isolation, for how much money. Data classes are declared
+  where data *enters* and propagate to every stage downstream, because that is
+  where the data goes, so a clearance table (`pii` → self-hosted models only)
+  refuses a pipeline **before a single call** — the whole escalation ladder
+  judged, not just the rung it starts on, and every violation reported at once.
+  An admitted run is still contained: every envelope is narrowed to what the
+  policy permits, under an invariant the tests assert — **narrowing never
+  widens**, so on the conforming path it is the identity. A policy is JSON, so
+  it is a document reviewed and versioned beside the infrastructure it governs
+  rather than a function compiled into the program it constrains.
+  [docs/POLICY.md](docs/POLICY.md)
 - **An AI-aware scheduler** — per-model token-bucket admission control
   (requests/min and tokens/min), a run-level dollar/token budget governor with
   graceful partial results, and class-aware recovery: transient failures back
@@ -219,7 +241,9 @@ the catalog.
   becomes one call. PostgreSQL/`pgvector` or a shared directory extends the same
   gate across executor processes. [docs/FINDINGS.md](docs/FINDINGS.md)
 - **Lineage & audit** — every artifact traces to the op, model, and inputs that
-  produced it; every secret/tool/egress/broadcast decision is audited.
+  produced it; every secret/tool/egress/broadcast decision is audited, as is
+  every admission — a deployment asked to prove a run was authorized needs the
+  line that says so, not only the absence of one saying it was not.
 - **Observability** — a typed event bus and per-stage run reports (tasks,
   failures, retries, cache hits, tokens, dollars, latency percentiles), plus the
   **constellation view**: a live, zero-dependency web UI where every task and
@@ -253,6 +277,7 @@ the catalog.
 | [ITERATION.md](docs/ITERATION.md) | Why iteration is the dimension that was missing |
 | [ASYNC.md](docs/ASYNC.md) | Fleets, attained-service scheduling, the blackboard |
 | [QUOTA.md](docs/QUOTA.md) | One rate limit and one wallet, shared across processes |
+| [POLICY.md](docs/POLICY.md) | Governance: the authority a pipeline author does not hold |
 | [FINDINGS.md](docs/FINDINGS.md) | The commons: sharing research between concurrent agents |
 | [DELTA.md](docs/DELTA.md) | Stateful delta execution, and proving a splice was safe |
 | [WORKERS.md](docs/WORKERS.md) | Distributing a run across worker processes |
@@ -289,6 +314,7 @@ the catalog.
 | `stream/file` | A directory of JSONL as a stream: a file is a split, a byte offset a position |
 | `stream/kafka` | Topics as streams, with Loom's checkpoint as the source of truth for offsets |
 | `security` | Grants, secret broker, egress policy, audit log |
+| `policy` | The deployment's constraint on what a pipeline may do: rules over models, tools, egress, secrets, sandbox and data classes; the admission gate over a compiled plan and the containment over every envelope it builds |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
 | `viz` | Constellation view: tasks and executors as stars, and the universe of every run |

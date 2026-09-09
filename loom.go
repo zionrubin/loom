@@ -26,6 +26,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/policy"
 	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
@@ -106,6 +107,11 @@ type Config struct {
 	Quota       quota.Store
 	QuotaConfig quota.Config
 
+	// Policy is the deployment's constraint on what this run may do — see
+	// WithPolicy. The zero policy governs nothing, which is the default and
+	// what every run did before there was one.
+	Policy policy.Policy
+
 	// Stream-mode settings. They configure Stream and are ignored by Run, so
 	// one config can describe both a backfill and the live job that follows it.
 	//
@@ -166,6 +172,39 @@ func WithSecrets(s map[security.SecretRef]string) Option {
 // endpoints (which are allowed automatically per stage, least-privilege).
 func WithEgress(hosts ...string) Option {
 	return func(c *Config) { c.EgressAllow = append(c.EgressAllow, hosts...) }
+}
+
+// WithPolicy runs the pipeline under a deployment policy: which models may see
+// which data, which tools and hosts are reachable, which secrets may be
+// resolved, and what the run may spend — decided by whoever operates the
+// account rather than whoever wrote the pipeline.
+//
+// Loom already made every one of those an explicit field of the task envelope.
+// What it had no way to say was that somebody other than the pipeline's author
+// gets to fill them in. A policy says exactly that, and needs no new
+// vocabulary to do it: the envelope is the complete statement of what a task
+// may use, so a policy is a predicate over envelopes.
+//
+// A run whose plan the policy refuses does not start. The error is a
+// *policy.Denied carrying every violation — the whole list, at once, before a
+// scheduler exists — because a plan refused for three reasons should be fixed
+// once rather than three times. loom.Explain reports the same verdict without
+// running anything, so "may this run" is answered next to "what will it cost".
+//
+// A run that is admitted is still contained: every envelope it builds is
+// narrowed to what the policy permits, so a capability the gate refused cannot
+// reappear in a task assembled afterward — by a loop that discovers its own
+// next target, or by a tool server that begins advertising something new. On
+// the ordinary path the narrowing changes nothing, which is the invariant
+// rather than a coincidence: admission and containment read the same document.
+//
+// The policy's ceiling composes with WithRunBudget the way the shared quota's
+// does — the run stops at whichever it reaches first — except that a run
+// budget *above* the ceiling is refused rather than clamped. A run silently
+// given a tenth of the money it asked for would die at ten percent and report
+// budget exhaustion, which tells an operator nothing about why.
+func WithPolicy(p policy.Policy) Option {
+	return func(c *Config) { c.Policy = p }
 }
 
 // WithStateDir enables persistent state under dir: the content-addressed
@@ -686,7 +725,14 @@ type RunResult struct {
 	// them cost in waiting. Zero when no shared quota was configured — which
 	// says this process owned its own limits, not that the fleet spent nothing.
 	Quota quota.Stats
-	Spent core.Usage
+	// Policy is the deployment policy's verdict on this run's plan: the
+	// document that judged it and how many stages it checked. A run in hand
+	// was admitted, so the violations are empty — the report is here so that
+	// what authorized the run can be recorded beside what the run did. Zero
+	// when the run was given no policy, which says nothing was looked at
+	// rather than that nothing was wrong.
+	Policy policy.Report
+	Spent  core.Usage
 	// Iterations reports how each iterative stage ran: rounds, per-round
 	// frontier sizes, and which bound halted it. Empty for a pipeline with no
 	// Iterate stage.

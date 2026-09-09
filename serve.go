@@ -83,8 +83,8 @@ func NewWorker(p *pipeline.Pipeline, opts ...Option) (*Worker, error) {
 	// pipeline the client compiled is how it gets one that agrees.
 	pl, err := plan.Compile(p, cfg.Registry,
 		plan.WithBroadcasts(h.shared.Hashes()), plan.WithContinuations(declared(p, cfg)),
-		plan.WithMCP(h.manifest))
-	if err != nil {
+		plan.WithMCP(h.manifest), plan.WithPolicy(cfg.Policy))
+	if pl, err = h.admit("", pl, err); err != nil {
 		_ = h.close()
 		return nil, err
 	}

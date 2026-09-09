@@ -382,8 +382,8 @@ func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Confi
 	snapshot := h.shared.Hashes()
 	pl, err := plan.Compile(p, cfg.Registry,
 		plan.WithBroadcasts(snapshot), plan.WithContinuations(cfg.Continuations),
-		plan.WithMCP(h.manifest))
-	if err != nil {
+		plan.WithMCP(h.manifest), plan.WithPolicy(h.governing(cfg)))
+	if pl, err = h.admit(jobID, pl, err); err != nil {
 		return nil, err
 	}
 	if err := validateStream(pl, cfg); err != nil {
