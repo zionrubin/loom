@@ -3,6 +3,7 @@ package loom
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"github.com/zionrubin/loom/observe"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/policy"
 	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
@@ -172,6 +174,16 @@ type Projection struct {
 	Driver   string
 	Budget   core.Budget
 	Stages   []StageProjection
+
+	// Policy is the deployment policy's verdict on this plan. A projection in
+	// hand was admitted — Explain returns the refusal instead — so this says
+	// which document authorized it and how many stages that took. Zero when
+	// no policy was configured.
+	//
+	// It belongs next to the cost for the same reason the wallet does: the
+	// question before a run is not only what it costs but whether it may
+	// happen, and both are answerable without making a call.
+	Policy policy.Report
 
 	// Wallet is the shared ceiling and what the fleet has already spent
 	// against it, when the run was configured with one. It is the number that
@@ -363,11 +375,33 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	// fingerprints differently under Explain than under Run. Nothing in a
 	// projection reads a fingerprint, so this costs a warning rather than a
 	// wrong number.
+	//
+	// The policy is applied here for the same reason the prices are: a
+	// projection exists to answer the questions worth asking before spending
+	// money, and "may this run at all" is one of them. A refused plan comes
+	// back as the same *policy.Denied a run would return, with the same
+	// violations, so a pipeline is never priced and then found inadmissible.
 	pl, err := plan.Compile(p, cfg.Registry,
 		plan.WithBroadcasts(broadcasts.Hashes()),
 		plan.WithContinuations(cfg.Continuations),
-		plan.WithMCP(mcp.Declared(cfg.MCPServers...)))
+		plan.WithMCP(mcp.Declared(cfg.MCPServers...)),
+		plan.WithPolicy(cfg.Policy))
+	// The run-level inputs no stage carries — the wallet, any egress opened for
+	// the whole run — are judged here and folded into whichever report comes
+	// back, so a projection refuses for everything at once, exactly as a run
+	// does.
+	runViolations := cfg.Policy.CheckRun(cfg.RunBudget, cfg.EgressAllow)
+	var denied *policy.Denied
+	if errors.As(err, &denied) {
+		denied.Report.Add(runViolations...)
+		return nil, denied
+	}
 	if err != nil {
+		return nil, err
+	}
+	admission := pl.Admission
+	admission.Add(runViolations...)
+	if err := admission.Err(); err != nil {
 		return nil, err
 	}
 
@@ -399,7 +433,8 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	proj := &Projection{
 		Pipeline: p.Name,
 		Driver:   "barrier",
-		Budget:   cfg.RunBudget,
+		Budget:   cfg.Policy.BoundBudget(cfg.RunBudget),
+		Policy:   admission,
 	}
 	if cfg.Streaming {
 		proj.Driver = "streaming"
@@ -1147,6 +1182,9 @@ func (e *explainer) reduceOutputs(s *pipeline.Stage, n, expected int) []core.Rec
 func (p *Projection) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "projection  %s  (%s driver, no calls issued)\n", p.Pipeline, p.Driver)
+	if p.Policy.Checked > 0 {
+		fmt.Fprintf(&b, "%s\n", p.Policy)
+	}
 	fmt.Fprintf(&b, "%-22s %-24s %6s %6s %8s %8s %10s %10s %8s\n",
 		"stage", "model", "recs", "calls", "prompt", "cached", "exp($)", "max($)", "floor")
 	for _, s := range p.Stages {

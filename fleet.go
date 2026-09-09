@@ -22,6 +22,7 @@ import (
 	"github.com/zionrubin/loom/ops"
 	"github.com/zionrubin/loom/pipeline"
 	"github.com/zionrubin/loom/plan"
+	"github.com/zionrubin/loom/policy"
 	"github.com/zionrubin/loom/quota"
 	"github.com/zionrubin/loom/route"
 	"github.com/zionrubin/loom/runtime"
@@ -839,16 +840,19 @@ func clip(s string, n int) string {
 // stream of events. A single Run is a fleet of one and is built the same way,
 // so what a run and an agent share cannot drift apart.
 type host struct {
-	cfg     Config
-	bus     *observe.Bus
-	audit   *security.AuditLog
-	broker  security.SecretBroker
-	lineage *store.Lineage
-	cas     *store.CAS
-	cache   *store.Cache
-	shared  *store.Broadcasts
-	gov     *runtime.Governor
-	limiter *runtime.RateLimiter
+	cfg   Config
+	bus   *observe.Bus
+	audit *security.AuditLog
+	// policyRun holds the run-level policy violations found when the host was
+	// built, waiting for the plan's own so the refusal names everything at once.
+	policyRun []policy.Violation
+	broker    security.SecretBroker
+	lineage   *store.Lineage
+	cas       *store.CAS
+	cache     *store.Cache
+	shared    *store.Broadcasts
+	gov       *runtime.Governor
+	limiter   *runtime.RateLimiter
 	// quota is this process's view of a rate limit and a wallet it does not own
 	// alone: the buckets the limiter draws from and the ceiling the governor
 	// charges, held where every process spending the same account can reach
@@ -936,17 +940,28 @@ func newHost(cfg Config) (*host, error) {
 	if cfg.Registry == nil {
 		cfg.Registry = model.NewRegistry()
 	}
+	// The run-level inputs a plan does not carry — the wallet, and any egress
+	// opened for the whole run — are judged here, where they are configured,
+	// and held rather than raised: they join the plan's own violations at
+	// admission so an operator gets one list instead of fixing the budget only
+	// to be refused again for the model. The ceiling is applied after the
+	// check, so a run that named no budget inherits the policy's while one
+	// that named too large a budget is still refused for it.
+	runViolations := cfg.Policy.CheckRun(cfg.RunBudget, cfg.EgressAllow)
+	cfg.RunBudget = cfg.Policy.BoundBudget(cfg.RunBudget)
+
 	audit := &security.AuditLog{}
 	h := &host{
-		cfg:     cfg,
-		bus:     observe.NewBus(),
-		audit:   audit,
-		broker:  security.NewStaticBroker(cfg.Secrets, audit),
-		lineage: &store.Lineage{},
-		gov:     runtime.NewGovernor(cfg.RunBudget),
-		limiter: runtime.NewRateLimiter(),
-		tools:   executor.NewToolSet(cfg.Tools...),
-		traces:  map[string]*agentTrace{},
+		cfg:       cfg,
+		policyRun: runViolations,
+		bus:       observe.NewBus(),
+		audit:     audit,
+		broker:    security.NewStaticBroker(cfg.Secrets, audit),
+		lineage:   &store.Lineage{},
+		gov:       runtime.NewGovernor(cfg.RunBudget),
+		limiter:   runtime.NewRateLimiter(),
+		tools:     executor.NewToolSet(cfg.Tools...),
+		traces:    map[string]*agentTrace{},
 	}
 	// The shared quota is installed before anything else that could spend,
 	// because a limiter or a governor built local and swapped later would be a
@@ -1317,6 +1332,83 @@ func (h *host) executorFor(runners map[string]executor.OpRunner) executor.Execut
 	}
 }
 
+// governing returns the policy an agent actually runs under.
+//
+// For a single Run the two configs are the same object and this is an
+// identity. For a fleet they are not: the host holds the deployment's
+// document and each agent brings its own options, so an agent passing
+// WithPolicy could otherwise swap the fleet's policy for a weaker one — a
+// governing document an agent can replace governs nothing. The host's wins
+// whenever it has one; an agent's applies only to a fleet that declared none.
+//
+// This is not a privilege boundary — everything here is one program — but the
+// surprising reading is the dangerous one, and "the deployment's policy binds"
+// is the only reading worth having.
+func (h *host) governing(cfg Config) policy.Policy {
+	if !h.cfg.Policy.IsZero() {
+		return h.cfg.Policy
+	}
+	return cfg.Policy
+}
+
+// admit completes a compilation under the deployment policy.
+//
+// plan.Compile already judged every stage and refused a plan that violated
+// the policy; what it could not see is the run-level configuration that
+// belongs to no stage. This folds those violations in — on the refusal path
+// as well as the successful one — so the operator is handed one list, and
+// records the verdict in the audit log either way, because an admission is a
+// decision worth keeping beside the denials.
+func (h *host) admit(runID string, pl *plan.Plan, err error) (*plan.Plan, error) {
+	var denied *policy.Denied
+	if errors.As(err, &denied) {
+		denied.Report.Add(h.policyRun...)
+		h.auditPolicy(runID, denied.Report)
+		return nil, denied
+	}
+	if err != nil {
+		return nil, err
+	}
+	if h.cfg.Policy.IsZero() && len(h.policyRun) == 0 {
+		return pl, nil
+	}
+	pl.Admission.Add(h.policyRun...)
+	h.auditPolicy(runID, pl.Admission)
+	if pErr := pl.Admission.Err(); pErr != nil {
+		return nil, pErr
+	}
+	return pl, nil
+}
+
+// auditPolicy records the verdict: one entry per violation, and one for the
+// admission itself. A deployment that has to prove a run was authorized needs
+// the line that says it was, not only the absence of a line saying it was not.
+func (h *host) auditPolicy(runID string, rep policy.Report) {
+	if h.audit == nil {
+		return
+	}
+	for _, v := range rep.Violations {
+		h.audit.Record(security.AuditEntry{
+			RunID: runID, Action: "policy.admit",
+			Subject: string(v.Axis) + ":" + v.Subject,
+			Allowed: false, Reason: refusalReason(v),
+		})
+	}
+	if rep.Admitted() {
+		h.audit.Record(security.AuditEntry{
+			RunID: runID, Action: "policy.admit", Subject: rep.Policy, Allowed: true,
+			Reason: fmt.Sprintf("%d stages checked", rep.Checked),
+		})
+	}
+}
+
+func refusalReason(v policy.Violation) string {
+	if v.Stage == "" {
+		return v.Reason
+	}
+	return "stage " + v.Stage + ": " + v.Reason
+}
+
 func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	cfg Config, pool *runtime.Pool) (*RunResult, error) {
 
@@ -1326,8 +1418,8 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	snapshot := h.shared.Hashes()
 	pl, err := plan.Compile(p, cfg.Registry,
 		plan.WithBroadcasts(snapshot), plan.WithContinuations(cfg.Continuations),
-		plan.WithMCP(h.manifest))
-	if err != nil {
+		plan.WithMCP(h.manifest), plan.WithPolicy(h.governing(cfg)))
+	if pl, err = h.admit(runID, pl, err); err != nil {
 		return nil, err
 	}
 	// A bounded driver has no answer to "when is the input complete?" for a
@@ -1413,12 +1505,13 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 		Failures:     d.failures,
 		Iterations:   d.iterations,
 		Lineage:      lineageOf(h.lineage.Entries(), runID),
-		Audit:        auditOf(h.audit.Entries(), tr),
+		Audit:        auditOf(h.audit.Entries(), runID, tr),
 		Broadcasts:   snapshot,
 		MCP:          h.mcpStats(),
 		Findings:     h.findingsStats(),
 		Routing:      h.routingStats(),
 		Quota:        h.quotaStats(),
+		Policy:       pl.Admission,
 		Spent:        h.gov.Spent(),
 	}
 	if term := pl.Terminal(); len(term) == 1 {
@@ -1442,10 +1535,12 @@ func lineageOf(all []store.LineageEntry, runID string) []store.LineageEntry {
 // entries name a task rather than a run — a secret is resolved by the broker,
 // which knows nothing of pipelines — so the agent's own task IDs are what
 // attribute them.
-func auditOf(all []security.AuditEntry, tr *agentTrace) []security.AuditEntry {
+func auditOf(all []security.AuditEntry, runID string, tr *agentTrace) []security.AuditEntry {
 	out := make([]security.AuditEntry, 0, len(all))
 	for _, e := range all {
-		if tr.owns(e.TaskID) {
+		// A decision made before any task existed — an admission, a refusal —
+		// names the run instead, and is this agent's by that name.
+		if (e.RunID != "" && e.RunID == runID) || tr.owns(e.TaskID) {
 			out = append(out, e)
 		}
 	}

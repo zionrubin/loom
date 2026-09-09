@@ -179,12 +179,19 @@ func (p EgressPolicy) With(hosts ...string) EgressPolicy {
 // AuditEntry is one access decision: who (task), what (action + subject),
 // and the outcome.
 type AuditEntry struct {
-	Time    time.Time `json:"time"`
-	TaskID  string    `json:"task_id"`
-	Action  string    `json:"action"`
-	Subject string    `json:"subject"`
-	Allowed bool      `json:"allowed"`
-	Reason  string    `json:"reason,omitempty"`
+	Time   time.Time `json:"time"`
+	TaskID string    `json:"task_id"`
+	// RunID attributes a decision that belongs to no single task — a whole
+	// plan admitted or refused before any task existed. A broker resolving a
+	// secret knows only the task that asked, which is why the task is the
+	// usual attribution; a decision made before scheduling has nothing else
+	// to name, and without this it would be indistinguishable from every
+	// other run's on a shared log.
+	RunID   string `json:"run_id,omitempty"`
+	Action  string `json:"action"`
+	Subject string `json:"subject"`
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // AuditLog is an append-only, concurrency-safe log of access decisions.

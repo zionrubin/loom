@@ -98,6 +98,20 @@ type Envelope struct {
 	CachePrefix bool           `json:"cache_prefix,omitempty"`
 	Budget      core.Budget    `json:"budget"`
 	Sandbox     SandboxProfile `json:"sandbox"`
+	// DataClasses labels what this task is handling — "pii", "phi",
+	// "confidential", whatever vocabulary the deployment uses. The planner
+	// computes it by propagation rather than reading it off the stage: a
+	// class declared on a source reaches every stage downstream of it,
+	// because that is where the data goes.
+	//
+	// It rides in the envelope for the same reason the grants do. A worker in
+	// another process is handed a task and nothing else, and "may this
+	// executor see this?" is a question it can only answer if the answer
+	// travelled with the work. It is also what the audit trail names, so a
+	// record of which model saw which class survives the run that produced
+	// it. Nothing about execution branches on it — a class constrains which
+	// envelopes may exist, not what the executor holding one does.
+	DataClasses []string `json:"data_classes,omitempty"`
 }
 
 // Task is one schedulable unit: a batch of input records plus the envelope

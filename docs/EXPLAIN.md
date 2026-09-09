@@ -27,6 +27,19 @@ run budget $5.0000 is below the ceiling: the governor will stop the run and retu
 No model calls, no secrets resolved, no sockets opened, nothing written to the
 state dir — safe to point at a production config.
 
+Under a deployment policy it answers a second question in the same breath. "May
+this run at all" is decided from the compiled plan, exactly as the cost is, so a
+projection either carries the verdict —
+
+```
+projection  ticket-triage  (barrier driver, no calls issued)
+prod-eu: admitted (2 stages checked)
+```
+
+— or *is* the refusal, with the same violations a run would report and without
+having priced a pipeline that was never going to be permitted. See
+[POLICY.md](./POLICY.md).
+
 ## Why the number is sharp rather than a guess
 
 Because of a property specific to this framework: the cheap stages are ordinary

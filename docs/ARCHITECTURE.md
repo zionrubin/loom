@@ -64,7 +64,8 @@ rather than something bolted onto a generic DAG runner.
   │  .Infer          │   │  fingerprint ops    │   │  class-aware retries     │
   │  .ReduceAI       │   │  resolve bindings   │   │  escalation ladder       │
   │  .Combine        │   │  build envelopes    │   └────────────┬─────────────┘
-  └──────────────────┘   └─────────────────────┘                │ task + envelope
+  └──────────────────┘   │  admit vs. policy   │                │ task + envelope
+                         └─────────────────────┘                │
                                                                 ▼
   ┌─────────────────────┐   ┌───────────────────┐   ┌──────────────────────────┐
   │ observe.Bus/Report  │◀──│ store.CAS/Cache/  │◀──│ executor.Local           │
@@ -91,7 +92,8 @@ changing:
 ```
 
 A run flows: **author** a pipeline → **compile** it into a plan (validation,
-fusion, fingerprints, envelopes) → the **driver** walks stages in
+fusion, fingerprints, envelopes) → **admit** it against the deployment policy,
+which refuses before a scheduler exists → the **driver** walks stages in
 topological order, building tasks and handing each stage's batch to the
 **scheduler** → the scheduler admits tasks under rate limits and budget and
 drives them through an **executor** with class-aware recovery → results are
@@ -415,7 +417,61 @@ Four cooperating mechanisms, all exercised by tests:
 3. **Egress policy** — deny-by-default allowlist per task; a provider
    endpoint not implied by the stage's binding is unreachable.
 4. **Audit log** — append-only record of every allow/deny decision with the
-   task that triggered it.
+   task — or, for a decision made before any task existed, the run — that
+   triggered it.
+
+### 4.9a Governance (`policy`)
+
+The four mechanisms above are least privilege, and least privilege answers
+"what does this task need?" It never asked the prior question: **who decides
+what it may need?** The planner assembles the minimal envelope that satisfies
+*what the stage declared*, which makes a pipeline's author its own security
+officer. In a deployment those are two people.
+
+`policy.Policy` is the second one, and the shape of the answer follows from
+something already true: the envelope is the *complete* statement of what a task
+may use, so a governing document is a **predicate over envelopes** and needs no
+new vocabulary to be enforceable.
+
+It has two faces, and the split is the design:
+
+- **`Check`** — the loud gate, run once against the compiled plan, before a
+  scheduler exists. It reports every violation rather than the first, because a
+  plan refused for four reasons should be fixed once. `loom.Explain` runs the
+  same gate, so "may this run" is answered beside "what will it cost", both
+  without making a call.
+- **`Bound`** — the quiet containment, applied to every envelope the plan
+  builds, so a capability the gate refused cannot reappear in a task assembled
+  afterward — by a loop that discovers its own next target, by a tool server
+  that begins advertising something new, or by run-level egress the gate never
+  saw.
+
+They are tied by an invariant the tests assert directly: **`Bound` never
+widens.** If `Check` admitted an envelope, `Bound` is the identity; if it did
+not, `Bound` is what makes the refusal true of the tasks as well as of the
+plan. It narrows sets (grants, egress) and leaves scalars (sandbox, binding)
+alone — those are fixed when the stage is written, so `Check` is the whole of
+their enforcement, and rewriting them would change what a pipeline *does*
+rather than what it *may do*.
+
+Five axes share one `Rule` type — allow/deny globs, deny wins, an empty allow
+list leaves the axis unconstrained: models, tools, secrets, egress, sandbox.
+The sixth is data classification, which is the axis a regulated deployment
+reaches for first. A class is declared where data **enters**
+(`pipeline.WithDataClass`) and the planner propagates it forward along the DAG:
+one pass, because the plan's order is topological, run after fusion so a class
+on an absorbed stage survives into the stage that absorbed it. The clearance
+table then says which models may see which class, checked against *every* model
+the task can reach — so a ladder that escalates to an uncleared model is
+refused rather than discovered on its second call. Classes ride in the
+envelope, so a worker in another process knows what it is holding, and they
+deliberately do *not* join the stage fingerprint: a class says who may see a
+result, not what the result is.
+
+A `Policy` is JSON, which is the point — a security control compiled into the
+program it constrains is one the constrained party can edit. `Parse` rejects
+unknown fields, because a misspelled rule is a rule that does not apply.
+[POLICY.md](./POLICY.md) is the full treatment.
 
 ### 4.10 Aggregation
 
@@ -779,7 +835,14 @@ a cap, which is blunt but reported).
 Implemented and tested in this repository: the pipeline API, planner
 (validation, fusion, fingerprints, least-privilege envelopes), scheduler
 (admission control, governor, class-aware retries with escalation), local
-executor, capability/secret/egress/broadcast/audit security, CAS + persistent
+executor, capability/secret/egress/broadcast/audit security, deployment
+governance (`policy`: allow/deny rules over models, tools, secrets, egress and
+sandbox profiles; a data classification declared where data enters and
+propagated along the DAG, with a clearance table checked against every model on
+a stage's ladder; a plan-time admission gate that reports every violation
+before a scheduler exists and an envelope-time containment that never widens;
+composition with the run budget; the same verdict from `loom.Explain`; and an
+audit trail carrying the admission as well as the denials), CAS + persistent
 cache + lineage, content-hash-referenced broadcast values, shared prompt
 prefixes with provider prompt-cache accounting, streaming (continuously
 batched) execution alongside the barrier driver, pre-flight cost projection

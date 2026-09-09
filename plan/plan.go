@@ -16,6 +16,7 @@ import (
 	"github.com/zionrubin/loom/mcp"
 	"github.com/zionrubin/loom/model"
 	"github.com/zionrubin/loom/pipeline"
+	"github.com/zionrubin/loom/policy"
 	"github.com/zionrubin/loom/security"
 	"github.com/zionrubin/loom/store"
 	"github.com/zionrubin/loom/task"
@@ -37,6 +38,13 @@ type StagePlan struct {
 	MCPTools  []string
 	MCPHosts  []string
 	Cacheable bool
+	// DataClasses is what this stage handles, computed rather than declared:
+	// the classes the stage itself introduced, plus every class its upstream
+	// carries. See pipeline.WithDataClass.
+	DataClasses []string
+	// policy is the deployment policy every envelope this stage builds is
+	// narrowed to. Zero when compilation was given none.
+	policy policy.Policy
 
 	// built counts the tasks this stage has produced across every call to
 	// BuildTasks. It is what makes the prefix-cache break-even test work
@@ -54,6 +62,7 @@ type compileOpts struct {
 	broadcasts    map[string]string
 	continuations map[string]delta.Ref
 	mcp           mcp.Manifest
+	policy        policy.Policy
 }
 
 // WithBroadcasts supplies the run's registered shared values as name →
@@ -85,6 +94,26 @@ func WithContinuations(refs map[string]delta.Ref) Option {
 	return func(o *compileOpts) { o.continuations = refs }
 }
 
+// WithPolicy compiles the pipeline under a deployment policy: the authority
+// the pipeline's author does not hold.
+//
+// It does two things, and the difference between them is the point. Every
+// stage's envelope is checked against the policy here, and a plan with any
+// violation is not returned at all — the refusal arrives before a scheduler
+// exists, let alone a model call, and names every violation rather than the
+// first. And every envelope the returned plan builds is narrowed to what the
+// policy permits, so a capability the gate refused cannot reappear in a task
+// assembled afterward.
+//
+// The check is over the envelope and nothing else, which is why it needs no
+// new declaration to be complete: the envelope already says everything a task
+// may reach. What it cannot see is the run-level configuration that is not
+// part of any stage — a run budget, egress hosts added for the whole run — so
+// loom.WithPolicy checks those too, against the same document.
+func WithPolicy(p policy.Policy) Option {
+	return func(o *compileOpts) { o.policy = p }
+}
+
 func WithMCP(m mcp.Manifest) Option {
 	return func(o *compileOpts) { o.mcp = m }
 }
@@ -95,6 +124,18 @@ type Plan struct {
 	Order    []*StagePlan // topological execution order
 	ByID     map[string]*StagePlan
 	Children map[string][]string // stage → downstream stage IDs
+	// Policy is the deployment policy this plan was compiled under, and
+	// Admission its verdict on the plan. Both are zero when compilation was
+	// given no policy, which is the difference between "nothing was wrong"
+	// and "nothing was looked at".
+	//
+	// A plan that fails admission is never returned — Compile returns the
+	// refusal instead — so a Plan in hand has an Admission that admits it.
+	// It is kept because a caller that wants to show what was checked, or
+	// record the verdict beside the run it authorized, would otherwise have
+	// to re-derive it.
+	Policy    policy.Policy
+	Admission policy.Report
 }
 
 // Terminal returns the IDs of stages with no downstream consumers.
@@ -403,7 +444,75 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			pl.Children[up.ID] = append(pl.Children[up.ID], sp.Stage.ID)
 		}
 	}
+
+	classify(pl)
+
+	if !co.policy.IsZero() {
+		pl.Policy = co.policy
+		for _, sp := range pl.Order {
+			sp.policy = co.policy
+		}
+		pl.Admission = Admit(pl, co.policy)
+		if err := pl.Admission.Err(); err != nil {
+			return nil, err
+		}
+	}
 	return pl, nil
+}
+
+// classify propagates data classes forward through the graph: a stage handles
+// what it declared plus everything its upstream carries.
+//
+// One pass suffices because Order is topological, which is the same reason the
+// barrier driver can execute it in that order — a stage's upstream is always
+// already resolved when its turn comes. Fusion happens first, so a fused run's
+// declarations were merged into one stage before this ran.
+func classify(pl *Plan) {
+	for _, sp := range pl.Order {
+		classes := map[string]struct{}{}
+		if up := sp.Stage.Upstream; up != nil {
+			if parent, ok := pl.ByID[up.ID]; ok {
+				for _, c := range parent.DataClasses {
+					classes[c] = struct{}{}
+				}
+			}
+		}
+		for _, c := range sp.Stage.Opts.DataClasses {
+			if c != "" {
+				classes[c] = struct{}{}
+			}
+		}
+		if len(classes) == 0 {
+			continue
+		}
+		out := make([]string, 0, len(classes))
+		for c := range classes {
+			out = append(out, c)
+		}
+		sort.Strings(out) // an envelope is compared and serialized; order it
+		sp.DataClasses = out
+	}
+}
+
+// Admit judges a compiled plan against a policy without compiling it again,
+// which is what lets loom.Explain answer "may this run" beside "what will it
+// cost" — both before anything is spent.
+//
+// Every stage is checked and every violation reported: a plan refused for
+// three reasons should be fixed once, not three times.
+func Admit(pl *Plan, pol policy.Policy) policy.Report {
+	rep := policy.Report{Policy: pol.Name}
+	if pol.IsZero() {
+		return rep
+	}
+	for _, sp := range pl.Order {
+		if sp.Stage.Kind == pipeline.KindSource || sp.Stage.Kind == pipeline.KindWindow {
+			continue // neither reaches a model, a tool, or the network
+		}
+		rep.Checked++
+		rep.Add(pol.Check(sp.envelope("", nil, policy.Policy{}))...)
+	}
+	return rep
 }
 
 func soleChild(stages []*pipeline.Stage, parentID string) *pipeline.Stage {
@@ -446,6 +555,7 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 			o.Budget.MaxAttempts = s.Opts.Budget.MaxAttempts
 		}
 		o.Grants = append(o.Grants, s.Opts.Grants...)
+		o.DataClasses = append(o.DataClasses, s.Opts.DataClasses...)
 	}
 	// A fused run is cache-consistent only if every member declared a
 	// version; a partial version string would produce wrong cache reuse
@@ -661,6 +771,13 @@ func fingerprint(sp *StagePlan, parts ...any) (string, error) {
 // (plus extraEgress for tools), the stage's context bundle, the content
 // hashes of exactly the broadcasts it declared, budget, and sandbox profile.
 func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope {
+	return sp.envelope(runID, extraEgress, sp.policy)
+}
+
+// envelope is Envelope with the narrowing policy passed explicitly, so
+// admission can build the envelope a stage *asked* for — judging what a stage
+// may do after removing what it may not is judging a plan nobody wrote.
+func (sp *StagePlan) envelope(runID string, extraEgress []string, pol policy.Policy) task.Envelope {
 	s := sp.Stage
 	var caps []security.Capability
 	var hosts []string
@@ -732,18 +849,30 @@ func (sp *StagePlan) Envelope(runID string, extraEgress []string) task.Envelope 
 		sandbox = task.SandboxInline
 	}
 
-	return task.Envelope{
-		RunID:      runID,
-		Stage:      s.ID,
-		Binding:    binding,
-		Grants:     security.NewGrantSet(caps...),
-		Egress:     security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
-		Context:    ctxBundle,
-		Broadcasts: bcast,
-		MCP:        servers,
-		Budget:     s.Opts.Budget,
-		Sandbox:    sandbox,
+	env := task.Envelope{
+		RunID:       runID,
+		Stage:       s.ID,
+		Binding:     binding,
+		Grants:      security.NewGrantSet(caps...),
+		Egress:      security.EgressPolicy{}.With(append(hosts, extraEgress...)...),
+		Context:     ctxBundle,
+		Broadcasts:  bcast,
+		MCP:         servers,
+		Budget:      s.Opts.Budget,
+		Sandbox:     sandbox,
+		DataClasses: sp.DataClasses,
 	}
+	// Containment, applied after assembly rather than during it: the envelope
+	// is built from what the stage asked for and then narrowed to what the
+	// deployment permits, so the two decisions stay separable and the
+	// narrowing is a property of every envelope this plan can produce —
+	// including ones built with run-level egress the compile-time gate never
+	// saw. Compile already refused a plan whose stages need more than this,
+	// so on the ordinary path Bound returns exactly what it was given.
+	if !pol.IsZero() {
+		env = pol.Bound(env)
+	}
+	return env
 }
 
 // BuildTasks splits input records into scheduled tasks for this stage,

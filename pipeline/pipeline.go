@@ -59,6 +59,8 @@ type StageOpts struct {
 	NoCache      bool
 	// NoPrefixCache opts the stage out of provider prompt-prefix caching.
 	NoPrefixCache bool
+	// DataClasses labels the data this stage introduces — see WithDataClass.
+	DataClasses []string
 }
 
 // Option configures a stage.
@@ -153,6 +155,32 @@ func WithMCP(server string, tools ...string) Option {
 	return func(o *StageOpts) {
 		o.MCP = append(o.MCP, MCPUse{Server: server, Tools: tools})
 	}
+}
+
+// WithDataClass labels the data this stage introduces with one or more
+// classification names — "pii", "phi", "confidential", whatever vocabulary the
+// deployment's policy uses.
+//
+// It is declared where data *enters* the pipeline, not everywhere it goes: the
+// planner propagates a class to every stage downstream of the one that
+// declared it, because that is where the data goes. Labelling a source of
+// customer tickets "pii" therefore classifies the stage that triages them, the
+// one that summarizes the triage, and the report at the end, without the author
+// remembering to say so at each — and forgetting one of those is exactly the
+// mistake a classification scheme exists to prevent.
+//
+// The label does nothing by itself. It is a fact the planner records in every
+// envelope downstream, which a policy.Policy then turns into a constraint:
+// which models are cleared to see a class is the deployment's decision, made in
+// a document the pipeline author does not write. A run with no policy carries
+// its classes into the envelope and the audit trail and is otherwise unchanged.
+//
+// It deliberately does not join the stage fingerprint. A class says who may see
+// a result, not what the result is, so relabelling data must not throw away
+// answers already paid for — and the model a policy steers the work to is
+// already in the fingerprint through the binding.
+func WithDataClass(names ...string) Option {
+	return func(o *StageOpts) { o.DataClasses = append(o.DataClasses, names...) }
 }
 
 // WithVersion declares a content version for Go-function stages, enabling
@@ -314,13 +342,13 @@ func applyOpts(opts []Option) StageOpts {
 }
 
 // FromRecords starts a pipeline from in-memory records.
-func (p *Pipeline) FromRecords(name string, recs []core.Record) Dataset {
-	return p.add(&Stage{ID: name, Kind: KindSource, SourceRecords: recs})
+func (p *Pipeline) FromRecords(name string, recs []core.Record, opts ...Option) Dataset {
+	return p.add(&Stage{ID: name, Kind: KindSource, SourceRecords: recs, Opts: applyOpts(opts)})
 }
 
 // FromFunc starts a pipeline from a loader invoked at run time.
-func (p *Pipeline) FromFunc(name string, fn func(ctx context.Context) ([]core.Record, error)) Dataset {
-	return p.add(&Stage{ID: name, Kind: KindSource, SourceFn: fn})
+func (p *Pipeline) FromFunc(name string, fn func(ctx context.Context) ([]core.Record, error), opts ...Option) Dataset {
+	return p.add(&Stage{ID: name, Kind: KindSource, SourceFn: fn, Opts: applyOpts(opts)})
 }
 
 // Map applies a pure transformation per record.

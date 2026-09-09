@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,18 @@ func (m *ModelClient) Call(ctx context.Context, env task.Envelope, taskID, model
 	if host := info.Provider.Endpoint(); host != "" && !env.Egress.Allowed(host) {
 		m.audit(taskID, "egress", host, false, "host not on egress allowlist")
 		return model.Response{}, core.Permanent(fmt.Errorf("egress to %q denied", host))
+	}
+
+	// A call carrying classified data is recorded as it is allowed, not only
+	// when it is refused. Containment already guarantees the property — an
+	// uncleared model has no grant, so the check above refuses it — but a
+	// deployment asked to show that no PII reached an uncleared model cannot
+	// do it from an absence of denials. This is the affirmative line, and it
+	// is written only for classified tasks, so a pipeline that handles nothing
+	// sensitive pays nothing for the guarantee.
+	if len(env.DataClasses) > 0 {
+		m.audit(taskID, "data.access", modelID, true,
+			"classes: "+strings.Join(env.DataClasses, ","))
 	}
 
 	call := model.CallContext{
