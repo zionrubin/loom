@@ -16,8 +16,16 @@ go run ./examples/agent-forge
 ```
 
 Offline by default: three scripted models stand in for a provider, so this needs
-**no key, no network, and costs nothing**. It reads the 12-day corpus bundled
-beside it and finishes in under a second.
+**no key, no network, and costs nothing**. It reads a 12-day corpus from
+`corpus/` beside it and finishes in under a second.
+
+> **The corpus is not in the repository.** It is real chat history with its
+> identifiers scrubbed, and scrubbed is not the same as nobody's, so it is not
+> committed. Point `-messages` at a directory of your own in the same shape —
+> a directory per space holding one `YYYY-MM-DD.jsonl` per day, one message per
+> line (a flat `<space>.jsonl` also works, dateless) — or see *Running it on a
+> real corpus* below. The tests that need it skip when `corpus/` is absent
+> rather than failing, so `go test ./...` stays green on a fresh clone.
 
 ## The three runs
 

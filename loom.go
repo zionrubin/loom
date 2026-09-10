@@ -34,6 +34,7 @@ import (
 	"github.com/zionrubin/loom/store"
 	"github.com/zionrubin/loom/stream"
 	"github.com/zionrubin/loom/task"
+	"github.com/zionrubin/loom/telemetry"
 	"github.com/zionrubin/loom/worker"
 )
 
@@ -83,8 +84,13 @@ type Config struct {
 	Router       route.Router
 	Findings     *findings.Config
 	EventHandler func(observe.Event)
-	Streaming    bool
-	BatchWait    time.Duration
+	// Telemetry, when set, receives every event this host publishes and
+	// exports it to the deployment's monitoring stack. It sits beside
+	// EventHandler rather than replacing it: a process usually wants both a
+	// human-facing observer and a machine-facing one.
+	Telemetry *telemetry.Telemetry
+	Streaming bool
+	BatchWait time.Duration
 	// Queue routes execution to a worker fleet instead of this process. Nil —
 	// the default — keeps every task local.
 	Queue worker.Queue
@@ -626,6 +632,27 @@ func WithBatchWait(d time.Duration) Option { return func(c *Config) { c.BatchWai
 // WithEventHandler attaches a synchronous observer of all run events.
 func WithEventHandler(fn func(observe.Event)) Option {
 	return func(c *Config) { c.EventHandler = fn }
+}
+
+// WithTelemetry exports this run to the monitoring stack the deployment
+// already runs: Prometheus metrics on the exporter's own HTTP endpoint, and
+// OpenTelemetry spans to a collector.
+//
+//	tel := telemetry.New(telemetry.Options{Service: "ticket-triage"})
+//	go tel.Serve(ctx, ":9090")
+//	res, err := loom.Run(ctx, p, loom.WithTelemetry(tel), ...)
+//
+// It composes with WithEventHandler rather than competing with it — the
+// constellation view and the exporter can watch the same run — and it costs
+// nothing on the model call path: the exporter folds an event into counters
+// under a mutex and queues spans without ever blocking, so a collector that
+// has gone away costs a counter rather than a stalled pipeline.
+//
+// One exporter can serve any number of runs, fleets, stream jobs and worker
+// processes in one program, and should: its metrics are cumulative for the
+// life of the process, which is what a scrape expects.
+func WithTelemetry(t *telemetry.Telemetry) Option {
+	return func(c *Config) { c.Telemetry = t }
 }
 
 // WithWorkerService runs this pipeline's tasks on a fleet of worker processes

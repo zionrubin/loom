@@ -497,8 +497,22 @@ func TestMockProfileCountsRealJobsOnly(t *testing.T) {
 // the three runs, end to end, against the scripted studio
 // ---------------------------------------------------------------------------
 
+// requireCorpus skips the tests that read the bundled conversation archive
+// when it is not on disk. The archive is real chat history, scrubbed of its
+// identifiers but still somebody's, so it is not committed — which means a
+// fresh clone has the code and not the data. Failing five tests to say so
+// would make `go test ./...` red for a reason that is not a defect; skipping
+// says the same thing and leaves the suite meaning what it says.
+func requireCorpus(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat("corpus"); err != nil {
+		t.Skip("no corpus/ in this checkout — see the example's README for how to point it at one")
+	}
+}
+
 func offlineRun(t *testing.T) (*loom.RunResult, *loom.RunResult, *loom.RunResult, census, rosterDecision) {
 	t.Helper()
+	requireCorpus(t)
 	reg, _, err := buildRegistry("mock", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -843,6 +857,7 @@ func TestRenderUIEmbedsAndEscapes(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRunWritesTheFullBlueprint(t *testing.T) {
+	requireCorpus(t)
 	out := t.TempDir()
 	cfg := runConfig{messages: "corpus", out: out, provider: "mock", budget: 5, workers: 4, salt: "test"}
 	if err := run(cfg); err != nil {
@@ -897,6 +912,7 @@ func TestRunWritesTheFullBlueprint(t *testing.T) {
 }
 
 func TestRosterReloadSteersTheDesign(t *testing.T) {
+	requireCorpus(t)
 	// The edit loop the README describes: run once, hand-edit roster.json, re-run
 	// with -roster. Asserting the frozen file unmarshals is not enough — it has to
 	// survive recordOf/rosterFrom and reach the charters.

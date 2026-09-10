@@ -404,6 +404,52 @@ run count rather than by age: runs are held whole, so the oldest is dropped
 when a new one pushes past the limit, and the run still receiving events is
 never the one dropped.
 
+#### 4.8a Telemetry (`telemetry`)
+
+Everything above lives in the process and ends with it. `telemetry` is the same
+event stream exported to the monitoring system a deployment already runs:
+Prometheus text exposition on `/metrics`, OpenTelemetry spans over OTLP/HTTP,
+and `/healthz` and `/readyz` beside them. `loom.WithTelemetry` attaches it as a
+third bus handler, so it composes with the collector and with any
+`WithEventHandler` observer rather than displacing them.
+
+Four decisions in it are load-bearing.
+
+**Cost is folded from `model.called`, not from `task.completed`.** The
+scheduler charges the governor for every attempt, including the ones whose
+answers a validator rejected; a task's completion event carries only the usage
+of the call that answered. A cost counter fed from completions would therefore
+under-report a run by exactly what its escalations cost. The root-level test
+asserts the exposition's totals against `RunResult.Spent`, because an exporter
+that disagrees with the run report is worse than no exporter.
+
+**Trace identifiers are derived rather than generated.** `TraceIDFor(runID)`
+is a hash, and a stage's span ID is a hash of the run ID and the stage name.
+So a run ID from a report or a log line locates the trace with no correlation
+field, and — because an envelope already carries the run ID and the stage — a
+worker process derives the same IDs and lands its spans in the right place in a
+tree it never saw. Task and call spans mix in the process instance, so the
+driver's view of a task and the worker's are two spans under one stage rather
+than two processes writing one ID.
+
+**Sampling decides when a task settles.** A run of ten thousand records is ten
+thousand task spans, and the ones worth keeping — failed, retried, escalated,
+slow — are exactly the ones a head sampler cannot recognize yet. Spans are held
+until the outcome is known; run and stage spans are always kept, because they
+are the skeleton the sampled tasks hang from.
+
+**Cardinality is bounded, and the bound degrades attribution rather than
+truth.** A stage ID is whatever the pipeline's author named it, and a generated
+pipeline generates names. Past a family's ceiling, new label sets fold into one
+`__overflow__` member and the totals stay correct; the exporter's own overflow,
+drops and export failures are themselves exported.
+
+Nothing on the path can block a run: folding is map work under a mutex, spans
+go onto a bounded queue with a non-blocking send, and export happens on one
+background goroutine with a timeout and a retry that only fires when the
+collector's answer says retrying could help. Full treatment in
+[TELEMETRY.md](./TELEMETRY.md).
+
 ### 4.9 Security
 
 Four cooperating mechanisms, all exercised by tests:
@@ -843,7 +889,12 @@ a stage's ladder; a plan-time admission gate that reports every violation
 before a scheduler exists and an envelope-time containment that never widens;
 composition with the run budget; the same verdict from `loom.Explain`; and an
 audit trail carrying the admission as well as the denials), CAS + persistent
-cache + lineage, content-hash-referenced broadcast values, shared prompt
+cache + lineage, telemetry export (`telemetry`: a declared Prometheus metric
+surface folded from the same event bus, with cost counted at the call and
+asserted against the run report; OTLP/HTTP spans with identifiers derived from
+the run ID so a fleet's processes assemble one trace without propagation;
+outcome-aware sampling; a bounded, non-blocking export path; and a
+`/metrics` `/healthz` `/readyz` surface), content-hash-referenced broadcast values, shared prompt
 prefixes with provider prompt-cache accounting, streaming (continuously
 batched) execution alongside the barrier driver, pre-flight cost projection
 (`loom.Explain`), event bus + run reports, tree AI-reduce, iterative execution
