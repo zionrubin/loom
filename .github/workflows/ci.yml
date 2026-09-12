@@ -1,0 +1,69 @@
+# Builds, vets and tests the module on every push and pull request.
+#
+# The suite is hermetic by construction: every test runs against the mock
+# provider, a temporary directory, or a loopback socket, so this workflow needs
+# no keys, no services and no network beyond fetching the module cache. That is
+# the property worth protecting — a suite that needs a secret is a suite that
+# stops running on forks and then stops being true.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # The module graph is checked rather than allowed to drift: `go mod tidy`
+      # must be a no-op, because a dependency that is in go.sum and in nobody's
+      # imports is a supply-chain surface nobody chose.
+      - name: go.mod is tidy
+        run: |
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          go mod tidy
+          diff -u go.mod.orig go.mod || { echo "::error::go.mod is not tidy — run 'go mod tidy'"; exit 1; }
+          diff -u go.sum.orig go.sum || { echo "::error::go.sum is not tidy — run 'go mod tidy'"; exit 1; }
+
+      - name: go test
+        run: go test ./...
+
+      # The race detector runs over the packages where concurrency is the
+      # design rather than an accident: the scheduler and its slot pool, the
+      # fleet, the shared quota, the durable queue, the commons, and the
+      # telemetry exporter that folds one event stream from every one of them.
+      - name: go test -race
+        run: |
+          go test -race -count=1 \
+            . \
+            ./runtime/... \
+            ./worker/... \
+            ./quota/... \
+            ./findings/... \
+            ./telemetry/... \
+            ./executor/... \
+            ./store/...

@@ -469,6 +469,11 @@ func Explain(p *pipeline.Pipeline, opts ...Option) (*Projection, error) {
 	if cfg.EventHandler != nil {
 		proj.publish(cfg.EventHandler)
 	}
+	// The exporter gets the projection too, so a dashboard can hold forecast
+	// against actual without anybody having to route Explain's events by hand.
+	if cfg.Telemetry != nil {
+		proj.publish(cfg.Telemetry.Handle)
+	}
 	return proj, nil
 }
 

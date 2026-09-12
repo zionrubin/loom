@@ -24,6 +24,7 @@ to a real provider say so.
 | [`commons-shared`](../examples/commons-shared) | The same commons across four executor *processes* | — |
 | [`treasury`](../examples/treasury) | Four processes, one wallet: a $0.05 ceiling that costs $0.20 without it | — |
 | [`clearance`](../examples/clearance) | One pipeline, three deployment policies: the refused round makes zero calls | — |
+| [`beacon`](../examples/beacon) | The run as a monitoring system sees it: a scrape, and a trace off the wire | — |
 | [`studio`](../examples/studio) | Loom Studio on an invented archive | — (`-openai` optional) |
 | [`anthropic-review`](../examples/anthropic-review) | Classification + summary, budget-capped | `ANTHROPIC_API_KEY` |
 | [`openai-review`](../examples/openai-review) | The same on the GPT-5.4 family, with the live view | `OPENAI_API_KEY` |
@@ -150,6 +151,22 @@ go run ./examples/treasury -rpm 60    # a rate bucket tight enough to bind (slow
 go run ./examples/clearance
 go run ./examples/clearance -show-audit          # the trail each round leaves
 go run ./examples/clearance -policy prod.json    # the governing document as a file
+```
+
+### Operating a deployment
+
+```sh
+# a run with telemetry attached, and then what a monitoring system would have
+# seen of it: the Prometheus exposition scraped over HTTP from the process's
+# own /metrics, the liveness and readiness endpoints beside it, and the trace
+# printed off the wire — this program stands up an OTLP/HTTP collector on
+# loopback and posts to it, so the encoding is exercised rather than described.
+# Four tasks, six calls: two records were rejected on the cheap model and
+# answered on the rung above, and the counters have both, because cost is
+# counted at the call
+go run ./examples/beacon
+go run ./examples/beacon -serve                     # leave the endpoint up to curl
+go run ./examples/beacon -otlp http://localhost:4318 # a real collector instead
 ```
 
 ### Streaming

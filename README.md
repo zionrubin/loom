@@ -80,6 +80,9 @@ go run ./examples/treasury
 # one pipeline, three deployment policies: the refused round makes zero calls
 go run ./examples/clearance
 
+# the run as a monitoring system sees it: a scrape, and a trace off the wire
+go run ./examples/beacon
+
 # watch a run as a sky of stars: http://localhost:8077
 go run ./examples/constellation
 
@@ -92,9 +95,9 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty-four examples ship — fleets, streaming, serving, MCP, local inference,
-worker processes, iteration, routing, governance, the studio — and all but five
-run offline against a deterministic mock provider.
+Twenty-five examples ship — fleets, streaming, serving, MCP, local inference,
+worker processes, iteration, routing, governance, telemetry, the studio — and
+all but five run offline against a deterministic mock provider.
 [docs/EXAMPLES.md](docs/EXAMPLES.md) is the catalog.
 
 ## What you get
@@ -250,6 +253,30 @@ run offline against a deterministic mock provider.
   executor is a star, with per-node prompts and responses, lineage, a run
   summary, forecast-against-actual, and a universe of every run in the process.
   [docs/VIZ.md](docs/VIZ.md)
+- **Telemetry — a run you can see from outside the process** — everything
+  above is in-process, and all of it ends when the process does. That is the
+  right shape for building a pipeline and the wrong one for running a
+  deployment, which does not ask what a run cost but what is being spent right
+  now, whether the wallet lasts the hour, and which stage is throttled.
+  `loom.WithTelemetry` exports the same event stream to the stack a team
+  already pages off: Prometheus metrics on `/metrics` (with `/healthz` and
+  `/readyz` beside them) and OpenTelemetry spans over OTLP. What it exports is
+  chosen by what is scarce — **dollars, tokens, wallet headroom and admission
+  waits come before throughput** — and cost is counted at the *call* rather
+  than the task, so a record that climbed an escalation ladder is counted as
+  having paid for every rung, which is what the provider charged. Trace
+  identifiers are **derived rather than generated**: a trace ID is a hash of
+  the run ID, so `RunResult.RunID` is enough to find the trace, and a worker
+  process that never saw the driver's context derives the same IDs from the
+  envelope and lands its spans in the right place in a tree it never saw.
+  Sampling decides when a task *settles*, so the failures, retries and
+  escalations a head sampler could not recognize yet are never sampled away.
+  Cardinality is bounded per family, and past the bound the attribution folds
+  into one overflow member rather than the number being dropped — a counter
+  that silently stops counting money is a lie, and one labelled "too many
+  stages to break down" is a fact. OTLP is written against the specification
+  rather than the SDK, so the dependency list is still provider SDKs and
+  nothing else. [docs/TELEMETRY.md](docs/TELEMETRY.md)
 - **A canvas that prices itself** — `studio` serves **Loom Studio**: the same
   pipeline as a document you edit in the browser, with `loom.Explain` running
   behind every keystroke. ⌘K proposes edits it computed rather than generated,
@@ -273,6 +300,7 @@ run offline against a deterministic mock provider.
 | [ROUTING.md](docs/ROUTING.md) | The escalation ladder as policy: not paying for the call that was going to fail |
 | [SHARING.md](docs/SHARING.md) | Broadcasts and shared prompt prefixes |
 | [VIZ.md](docs/VIZ.md) | The constellation view and the universe of runs |
+| [TELEMETRY.md](docs/TELEMETRY.md) | Metrics, traces and the ops surface: operating a deployment |
 | [ALGORITHMS.md](docs/ALGORITHMS.md) | The algorithm seam: BSP, refine, beam |
 | [ITERATION.md](docs/ITERATION.md) | Why iteration is the dimension that was missing |
 | [ASYNC.md](docs/ASYNC.md) | Fleets, attained-service scheduling, the blackboard |
@@ -317,6 +345,7 @@ run offline against a deterministic mock provider.
 | `policy` | The deployment's constraint on what a pipeline may do: rules over models, tools, egress, secrets, sandbox and data classes; the admission gate over a compiled plan and the containment over every envelope it builds |
 | `store` | Content-addressed store, persistent cache, lineage |
 | `observe` | Event bus, metrics collector, run reports |
+| `telemetry` | The seam onto a deployment's monitoring: Prometheus exposition, OTLP spans with derived identifiers, outcome-aware sampling, and the `/metrics` `/healthz` `/readyz` surface |
 | `viz` | Constellation view: tasks and executors as stars, and the universe of every run |
 | `studio` | Loom Studio: canvas, live projection, ⌘K proposals, a Go export that compiles |
 | `worker` | Durable task queue with leases, heartbeats, expiry and fencing tokens; `filequeue` spans processes, `queuetest` is the conformance suite |

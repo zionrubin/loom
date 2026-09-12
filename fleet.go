@@ -356,6 +356,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 		{probe.Topics != nil, "WithTopic"},
 		{probe.Findings != nil, "WithFindings (a fleet shares one commons)"},
 		{probe.EventHandler != nil, "WithEventHandler"},
+		{probe.Telemetry != nil, "WithTelemetry (one exporter covers the fleet)"},
 	}
 	for _, s := range shared {
 		if s.set {
@@ -381,6 +382,7 @@ func (f *Fleet) agentConfig(opts []Option) (Config, error) {
 	cfg.MCPServers, cfg.MCPResources = f.cfg.MCPServers, f.cfg.MCPResources
 	cfg.Findings = f.cfg.Findings
 	cfg.EventHandler = f.cfg.EventHandler
+	cfg.Telemetry = f.cfg.Telemetry
 	return cfg, nil
 }
 
@@ -984,6 +986,11 @@ func newHost(cfg Config) (*host, error) {
 	if cfg.EventHandler != nil {
 		h.bus.On(cfg.EventHandler)
 	}
+	// The exporter is attached last of the three, so a scrape never sees a
+	// number the run's own report does not have.
+	if cfg.Telemetry != nil {
+		h.bus.On(cfg.Telemetry.Handle)
+	}
 
 	casDir, cacheDir := "", ""
 	if cfg.StateDir != "" {
@@ -1461,9 +1468,14 @@ func (h *host) launch(ctx context.Context, runID string, p *pipeline.Pipeline,
 	// under streaming shows overlapping stages and shared execution slots, and
 	// that is only legible if the view knows which one ran. The pipeline's name
 	// rides along for the same reason: a process that runs several needs them
-	// told apart by something other than a random run ID.
+	// told apart by something other than a random run ID. The ceiling rides
+	// along for a third reason: it is the other half of every number that
+	// follows, since an observer can total what has been spent from the calls
+	// alone and can only say how much is *left* if it knows what the wallet
+	// held.
 	h.bus.Publish(observe.Event{
-		Type: observe.RunStarted, RunID: runID, Pipeline: p.Name, Kind: driverName})
+		Type: observe.RunStarted, RunID: runID, Pipeline: p.Name, Kind: driverName,
+		Budget: cfg.RunBudget})
 
 	// Announce the shared values after the run header (which opens the run in
 	// an observer) and before any task runs, so a viewer sees what this agent

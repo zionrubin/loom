@@ -407,8 +407,12 @@ func (h *host) launchStream(ctx context.Context, p *pipeline.Pipeline, cfg Confi
 	}
 
 	tr := h.open(jobID)
+	// The ceiling rides on the header for the same reason it does on a bounded
+	// run's, and more so: a stream job is the thing most likely to still be
+	// running when somebody asks how much of the wallet is left.
 	h.bus.Publish(observe.Event{
-		Type: observe.RunStarted, RunID: jobID, Pipeline: p.Name, Kind: "stream"})
+		Type: observe.RunStarted, RunID: jobID, Pipeline: p.Name, Kind: "stream",
+		Budget: cfg.RunBudget})
 
 	workers := cfg.Workers
 	if workers <= 0 {
