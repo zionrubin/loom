@@ -311,12 +311,30 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 					return nil, fmt.Errorf("stage %q: prefix template: %w", s.ID, err)
 				}
 			}
+			decision := len(spec.Questions) > 0
+			if decision {
+				if err := spec.Questions.Validate(); err != nil {
+					return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+				}
+				if spec.ParseJSON {
+					return nil, fmt.Errorf("stage %q: a decision stage's answers are typed; "+
+						"ParseJSON does not apply", s.ID)
+				}
+			}
+			if err := checkCapabilities(s.ID, cands, decision); err != nil {
+				return nil, err
+			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
-			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix,
-				"infer", bindingKey(spec.Binding), spec.System,
+			parts := []any{"infer", bindingKey(spec.Binding), spec.System,
 				spec.Prompt, spec.MaxTokens, spec.ParseJSON, spec.OutputField,
-				fragmentKey(spec.Context), s.Opts.Version)...)
+				fragmentKey(spec.Context), s.Opts.Version}
+			if decision {
+				// Appended rather than interleaved, so an ordinary inference
+				// stage keeps the fingerprint — and the cache — it always had.
+				parts = append(parts, "decide", spec.Questions, spec.MinConfidence)
+			}
+			sp.Fingerprint, err = fingerprint(sp, prefixKey(spec.Prefix, parts...)...)
 			if err != nil {
 				return nil, err
 			}
@@ -339,6 +357,9 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			cands, err := reg.Candidates(spec.Binding)
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			if err := checkCapabilities(s.ID, cands, false); err != nil {
+				return nil, err
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
@@ -378,6 +399,9 @@ func Compile(p *pipeline.Pipeline, reg *model.Registry, opts ...Option) (*Plan, 
 			cands, err := reg.Candidates(spec.Step.Binding)
 			if err != nil {
 				return nil, fmt.Errorf("stage %q: %w", s.ID, err)
+			}
+			if err := checkCapabilities(s.ID, cands, len(spec.Step.Questions) > 0); err != nil {
+				return nil, err
 			}
 			sp.Candidates = cands
 			sp.Cacheable = !s.Opts.NoCache
@@ -567,6 +591,27 @@ func mergeOpts(run []*pipeline.Stage) pipeline.StageOpts {
 		}
 	}
 	return o
+}
+
+// checkCapabilities refuses a ladder holding a model that cannot do what the
+// stage asks of it. A decision stage can be answered by a decision model or by
+// any text model (through a rendered prompt); every other model stage needs
+// text. Catching a decision-only model on a text stage here turns a failure
+// on the first record — after the rungs below it had been paid for — into an
+// error on the declaration.
+func checkCapabilities(stageID string, cands []model.Info, decision bool) error {
+	for _, c := range cands {
+		caps := model.CapabilitiesOf(c.Provider)
+		if caps.Text || (decision && caps.Decisions) {
+			continue
+		}
+		if caps.Decisions {
+			return fmt.Errorf("stage %q: model %q answers typed questions only and cannot "+
+				"serve a text stage (declare the stage with Dataset.Decide)", stageID, c.ID)
+		}
+		return fmt.Errorf("stage %q: model %q declares no capability this stage can use", stageID, c.ID)
+	}
+	return nil
 }
 
 func bindingKey(b model.Binding) map[string]any {

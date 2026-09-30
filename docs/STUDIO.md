@@ -67,6 +67,7 @@ undo stack. So the studio's document holds declarations instead:
 | `Map(func(r) (Record, error))` | `FieldSpec{Name, Template}` |
 | `FromFunc(func(ctx) ([]Record, error))` | `SourceSpec{From, Root, Line, Scrub…}` |
 | `InferSpec.Validate` | `Answer{Name, Kind, Required}` |
+| `DecideSpec.Questions` | `Question{ID, Type, Ask, Options, Levels}` — see [DECISIONS.md](DECISIONS.md) |
 | `algo.NewRefine(Accept, Note)` | `LoopSpec{Until, Note, Rounds, CapUSD}` |
 
 `Doc.Build` turns each one back into the closure the authoring API wants. The

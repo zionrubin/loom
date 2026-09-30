@@ -214,6 +214,8 @@ func (g *gen) step(d *Doc, s *Step, root string) error {
 	switch s.Kind {
 	case KindInfer:
 		return g.infer(s, up, assigned)
+	case KindDecide:
+		return g.decide(s, up, assigned)
 	case KindReduce:
 		return g.reduce(s, up, assigned)
 	case KindLoop:
@@ -660,6 +662,8 @@ func describe(s *Step) string {
 		return title + " — records in"
 	case KindInfer:
 		return title + " — one model call per record"
+	case KindDecide:
+		return fmt.Sprintf("%s — %d typed questions per record", title, len(s.Decide.Questions))
 	case KindReduce:
 		if s.Merging() {
 			return title + " — folds " + strings.Join(s.Merge, ", ")

@@ -179,6 +179,10 @@ func (Insight) why(req Request) (*Proposal, error) {
 	case KindInfer:
 		fmt.Fprintf(&b, "It runs once per record, against %s records, which is what makes it the "+
 			"expensive one — a fold reads a summary per record instead of a record. ", thousands(top.Records))
+	case KindDecide:
+		fmt.Fprintf(&b, "It asks typed questions of %s records; the decision model bills input only, "+
+			"so most of this is the escalations its confidence gate sends to the LLM above it. ",
+			thousands(top.Records))
 	case KindReduce:
 		fmt.Fprintf(&b, "It folds %s records through a tree, so the calls are fewer but each one "+
 			"carries a batch. ", thousands(top.Records))

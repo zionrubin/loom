@@ -206,14 +206,24 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 		if err := tmpl.Execute(&sb, rec.Data); err != nil {
 			return nil, usage, modelID, core.Permanent(fmt.Errorf("render prompt: %w", err))
 		}
-		resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, model.Request{
+		req := model.Request{
 			System:       rt.Env.Context.System,
 			Prefix:       prefix,
 			Prompt:       sb.String(),
 			MaxTokens:    maxTokens,
 			CachePrefix:  rt.Env.CachePrefix,
 			Continuation: rt.Continuation.Hint(),
-		})
+		}
+		if len(r.spec.Questions) > 0 {
+			nr, u, err := r.decide(ctx, rt, t, modelID, rec, req)
+			usage.Add(u)
+			if err != nil {
+				return nil, usage, modelID, err
+			}
+			out = append(out, nr)
+			continue
+		}
+		resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, req)
 		if err != nil {
 			return nil, usage, modelID, err
 		}
@@ -245,6 +255,101 @@ func (r *inferRunner) Run(ctx context.Context, rt *executor.Runtime, t task.Task
 		out = append(out, nr)
 	}
 	return out, usage, modelID, nil
+}
+
+// decide makes one decision call for one record and writes its answers.
+//
+// A decision model is asked the questions directly. A text model is asked the
+// same questions through a rendered prompt and its reply is held to the same
+// schema, so which rung answered changes the latency and the price but never
+// the shape of the record. The confidence gate applies only to answers whose
+// confidences were measured rather than stated, and never on the last rung:
+// there is nothing above it to hand the record to, so the decision is kept and
+// flagged instead.
+func (r *inferRunner) decide(ctx context.Context, rt *executor.Runtime, t task.Task, modelID string, rec core.Record, req model.Request) (core.Record, core.Usage, error) {
+	info, err := rt.Models.Registry.Get(modelID)
+	if err != nil {
+		return core.Record{}, core.Usage{}, core.Permanent(err)
+	}
+	qs := r.spec.Questions
+	calibrated := model.CapabilitiesOf(info.Provider).Decisions
+	req.Questions = qs
+	if !calibrated {
+		req = model.Generative(req)
+	}
+	resp, err := rt.Models.Call(ctx, rt.Env, rt.TaskID, modelID, req)
+	if err != nil {
+		return core.Record{}, core.Usage{}, err
+	}
+	answers := resp.Answers
+	if calibrated {
+		err = qs.Check(answers)
+	} else {
+		answers, err = model.ParseDecision(resp.Text, qs)
+	}
+	if err != nil {
+		return core.Record{}, resp.Usage, core.Semantic(fmt.Errorf("record %s: decision: %w", rec.ID, err))
+	}
+
+	dec := model.Decision{Model: resp.Model, Calibrated: calibrated, Answers: answers}
+	conf, weakest := dec.Confidence(), dec.Weakest()
+	low := calibrated && r.spec.MinConfidence > 0 && conf < r.spec.MinConfidence
+	if low && !lastRung(rt, t) {
+		return core.Record{}, resp.Usage, core.Semantic(fmt.Errorf(
+			"record %s: decision confidence %.2f on %q is below %.2f",
+			rec.ID, conf, weakest, r.spec.MinConfidence))
+	}
+
+	nr := rec.Clone()
+	for id, a := range answers {
+		nr.Data[id] = a.Value()
+	}
+	full, err := asMap(dec)
+	if err != nil {
+		return core.Record{}, resp.Usage, core.Permanent(err)
+	}
+	full["confidence"] = conf
+	full["weakest"] = weakest
+	full["rung"] = float64(t.Escalation) // float64: the type it has after the cache round trip
+	if low {
+		full["low_confidence"] = true
+	}
+	field := r.spec.OutputField
+	if field == "" {
+		field = pipeline.DefaultDecisionField
+	}
+	nr.Data[field] = full
+	if r.spec.Validate != nil {
+		if err := r.spec.Validate(nr); err != nil {
+			return core.Record{}, resp.Usage, core.Semantic(
+				fmt.Errorf("record %s: validation: %w", rec.ID, err))
+		}
+	}
+	return nr, resp.Usage, nil
+}
+
+// lastRung reports whether this attempt is on the top of its ladder.
+func lastRung(rt *executor.Runtime, t task.Task) bool {
+	cands, err := rt.Models.Registry.Candidates(rt.Env.Binding)
+	if err != nil {
+		return true
+	}
+	return t.Escalation >= len(cands)-1
+}
+
+// asMap converts a value to the plain map a record holds after a trip through
+// JSON, so a freshly computed record and one replayed from the cache are the
+// same shape to whatever reads them.
+func asMap(v any) (map[string]any, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 type reduceRunner struct {

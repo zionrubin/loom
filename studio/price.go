@@ -175,7 +175,7 @@ func Price(d *Doc, opts ...PriceOption) *Estimate {
 		s := &d.Steps[i]
 		est.Steps = append(est.Steps, StepPrice{
 			ID: s.ID, Kind: s.Kind, Title: s.Title,
-			Free: s.Kind != KindInfer && s.Kind != KindReduce && s.Kind != KindLoop,
+			Free: s.Kind != KindInfer && s.Kind != KindDecide && s.Kind != KindReduce && s.Kind != KindLoop,
 		})
 	}
 
@@ -209,6 +209,17 @@ func Price(d *Doc, opts ...PriceOption) *Estimate {
 	// projects as no work at all. Here the fields are not invented: the step
 	// declares them, so the projection can be told exactly what to expect, and
 	// the assumption that remains is only how long each one will be.
+	for i := range d.Steps {
+		s := &d.Steps[i]
+		if s.Kind != KindDecide {
+			continue
+		}
+		lopts = append(lopts, loom.WithStageSample(s.ID, s.Decide.sample(d, s.ID)))
+		est.Warnings = append(est.Warnings, fmt.Sprintf(
+			"%q declares its answers' fields and types, so only their values are assumed "+
+				"for pricing (%s) — the answers the filters below it keep, so the most records go on",
+			s.ID, s.Decide.sampleText(d, s.ID)))
+	}
 	for i := range d.Steps {
 		s := &d.Steps[i]
 		var spec *InferSpec

@@ -119,6 +119,9 @@ func (m *ModelClient) Call(ctx context.Context, env task.Envelope, taskID, model
 	// The full rendered request, for observability consumers (e.g. the
 	// constellation view's per-call drill-down).
 	rendered := req.FullPrompt()
+	if len(req.Questions) > 0 {
+		rendered += "\n\n" + model.RenderQuestions(req.Questions)
+	}
 	if req.System != "" {
 		rendered = "[system] " + req.System + "\n\n" + rendered
 	}
