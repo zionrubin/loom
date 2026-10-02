@@ -276,7 +276,7 @@ func SplitTokens(total int) (in, out int) {
 func PriceLadder(candidates []model.Info, inTokens, outTokens int) []Rung {
 	rungs := make([]Rung, 0, len(candidates))
 	for _, c := range candidates {
-		u := core.Usage{InputTokens: inTokens, OutputTokens: outTokens, Requests: 1}
+		u := core.Usage{InputTokens: inTokens + c.InputOverheadTokens, OutputTokens: outTokens, Requests: 1}
 		rungs = append(rungs, Rung{Model: c.ID, PriceUSD: c.Pricing.Cost(u)})
 	}
 	return rungs

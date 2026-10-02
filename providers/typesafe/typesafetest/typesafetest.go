@@ -158,8 +158,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := typesafe.WireResponse{Model: served, Answers: answers}
 	// Input is what is billed; count it the way every offline provider in
-	// Loom does, so a projection and a run agree.
-	resp.Usage.InputTokens = model.EstimateTokens(state)
+	// Loom does, plus the preamble the real API bills on every call, so a
+	// projection and a run agree.
+	resp.Usage.InputTokens = typesafe.RequestOverheadTokens + model.EstimateTokens(state)
 	for _, id := range qs.IDs() {
 		resp.Usage.InputTokens += model.EstimateTokens(qs[id].Instructions)
 	}

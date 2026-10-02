@@ -970,7 +970,7 @@ func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StagePr
 // the entry, every later one reads it.
 func (e *explainer) accumulate(out *StageProjection, info model.Info, prompts []int, shared, expected, maxTokens int) {
 	for i, p := range prompts {
-		u := core.Usage{InputTokens: p, Requests: 1}
+		u := core.Usage{InputTokens: p + info.InputOverheadTokens, Requests: 1}
 		switch {
 		case !out.CachePrefix:
 			u.InputTokens += shared

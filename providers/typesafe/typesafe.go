@@ -64,6 +64,12 @@ const (
 	// Jev is the model ID RegisterDefaults registers: TypeSafe's flagship
 	// decision model, on its rolling "latest" route.
 	Jev = "jev-latest"
+	// RequestOverheadTokens is the input System One bills on every call over
+	// and above the state and the questions: the prompt Jev wraps them in.
+	// Measured against jev-1.13.0 — a one-word state and a one-word noul
+	// bill 269 input tokens — and rounded up, because projections use it to
+	// bound spend and a bound has to err high.
+	RequestOverheadTokens = 270
 )
 
 // Pricing is Jev's published rate: $0.042 per million input tokens, with
@@ -299,6 +305,8 @@ func Register(reg *model.Registry, p *Provider, id string, limits model.Limits) 
 		Pricing:   Pricing,
 		Limits:    limits,
 		SecretRef: p.secretRef,
+
+		InputOverheadTokens: RequestOverheadTokens,
 	})
 }
 

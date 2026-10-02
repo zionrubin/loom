@@ -55,7 +55,10 @@ typed **questions**:
 A Choice or Score confidence comes from the shape of the distribution —
 concentrated is high, spread is low. A Noul needs none: its value already is a
 probability. Answers come back in roughly 70–500 ms. Billing is input-only at
-$0.042 per million tokens; **output is free**.
+$0.042 per million tokens; **output is free**. Every call also bills a fixed
+preamble of about 270 input tokens on top of the state and the questions;
+the provider registers it as `model.Info.InputOverheadTokens`, so `Explain`
+counts it per call and its ceiling stays a bound.
 
 Two properties follow that shape how it belongs in a pipeline:
 

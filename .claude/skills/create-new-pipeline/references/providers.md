@@ -177,7 +177,9 @@ Binding: model.Binding{Model: typesafe.Jev, Escalation: []string{"claude-sonnet-
 |---|---|---|---|
 | `jev-latest` | — (bind by ID) | 0.042 | 0 (free) |
 
-Endpoint `api.typesafe.ai`, `POST /v1/systemone`. Offline, run
+Endpoint `api.typesafe.ai`, `POST /v1/systemone`. Each call also bills a
+~270-token server-side preamble (`typesafe.RequestOverheadTokens`, registered as
+`Info.InputOverheadTokens` so projections count it). Offline, run
 `typesafetest.Server{Judge: fn}` on loopback and register
 `typesafe.New(typesafe.WithBaseURL(url))`. The server speaks the real
 protocol, and `typesafetest.Choice/Score/Noul` build realistic answers

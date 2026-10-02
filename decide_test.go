@@ -270,3 +270,33 @@ func TestExplainKnowsWhatADecisionAdds(t *testing.T) {
 		t.Error("Explain must make no calls")
 	}
 }
+
+// TestExplainCeilingCoversJevPreamble holds the projection to what System One
+// actually bills: every call carries a server-side preamble on top of the
+// state and the questions, and output is free, so a ceiling that leaves the
+// preamble out is below the run's real spend.
+func TestExplainCeilingCoversJevPreamble(t *testing.T) {
+	rig := newDecideRig(t)
+	p := decidePipeline()
+	proj, err := loom.Explain(p, rig.opts()...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	var ceiling core.Usage
+	for _, s := range proj.Stages {
+		if s.Stage == "triage" {
+			ceiling = s.Ceiling
+		}
+	}
+	res, err := loom.Run(context.Background(), p, rig.opts()...)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Spent.InputTokens < 3*typesafe.RequestOverheadTokens {
+		t.Fatalf("the offline server should bill the preamble: spent %+v", res.Spent)
+	}
+	if ceiling.InputTokens < res.Spent.InputTokens || ceiling.CostUSD < res.Spent.CostUSD {
+		t.Errorf("ceiling %d tokens / $%.8f is below the run's %d tokens / $%.8f",
+			ceiling.InputTokens, ceiling.CostUSD, res.Spent.InputTokens, res.Spent.CostUSD)
+	}
+}

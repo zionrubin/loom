@@ -130,6 +130,9 @@ func TestRegisterDefaults(t *testing.T) {
 	if info.Pricing.OutputPerMTok != 0 || info.Pricing.InputPerMTok != 0.042 {
 		t.Errorf("pricing = %+v", info.Pricing)
 	}
+	if info.InputOverheadTokens != typesafe.RequestOverheadTokens {
+		t.Errorf("Jev bills a preamble on every call; registered overhead = %d", info.InputOverheadTokens)
+	}
 	if info.SecretRef != typesafe.DefaultSecretRef || info.Provider.Endpoint() != typesafe.Endpoint {
 		t.Errorf("secret %q endpoint %q", info.SecretRef, info.Provider.Endpoint())
 	}

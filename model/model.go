@@ -205,6 +205,11 @@ type Info struct {
 	Limits    Limits
 	Tier      Tier
 	SecretRef security.SecretRef
+	// InputOverheadTokens is input the provider bills on every call that the
+	// request itself does not carry — a server-side prompt wrapped around it.
+	// Projections add it per call, so a model with a fixed preamble cannot
+	// make a ceiling a lie. Zero for a model that bills only what it is sent.
+	InputOverheadTokens int
 }
 
 // Registry holds all models a deployment may use and the tier mapping.
