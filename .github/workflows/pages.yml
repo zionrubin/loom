@@ -43,53 +43,56 @@ jobs:
           test -f public/woven-knot.html
           test -f public/knot-model.js
           test -f public/three-d-stage.js
+          test -f public/survey/index.html
+          test -f public/survey/survey.js
           test -f public/survey/survey-animation.dc.html
-          test -f public/survey/support.js
-          test -f public/survey/animations-v3.jsx
-          test -f public/survey/tweaks-panel.jsx
-          test -f public/survey/loom-survey-scene.jsx
-          test -f public/survey/page-embed.jsx
 
-      # The player mounts the page wrapper, the composition is cued against a
-      # scene list that lives in the host page, and the frame's geometry is
-      # built around the 44px the stage reserves for its transport. All three
-      # are easy to lose in a re-copy from the design, and all three fail at
-      # runtime rather than here.
-      - name: Check the survey player is wired to its scenes
+      # The run is one dependency-free module, so Node can import it and catch
+      # what would otherwise only fail in a reader's browser: a scene table
+      # that no longer adds up to the 65.5 seconds the camera is keyed to, a
+      # cue the choreography uses that names no scene, counts that disagree
+      # with the description screen readers are given, or a frame anywhere on
+      # the timeline that throws. Every frame is a pure function of the time,
+      # so drawing all of them into a stub context is the whole smoke test.
+      - name: Check the run draws, end to end
         run: |
-          python3 - <<'PY'
-          import json, re
-          host = open('public/survey/survey-animation.dc.html').read()
-          scene = open('public/survey/loom-survey-scene.jsx').read()
-          engine = open('public/survey/animations-v3.jsx').read()
-          page = open('public/index.html').read()
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          const m = await import(process.cwd() + '/public/survey/survey.js');
+          const src = readFileSync('public/survey/survey.js', 'utf8');
+          const page = readFileSync('public/index.html', 'utf8');
+          const player = readFileSync('public/survey/index.html', 'utf8');
+          const fail = (msg) => { console.log('::error::' + msg); process.exit(1); };
 
-          assert 'component-from-global-scope="LoomSurveyPageEmbed"' in host, \
-              'host page does not mount LoomSurveyPageEmbed'
-          assert './page-embed.jsx' in host, 'host page does not import the wrapper'
-          assert 'window.LoomSurveyEmbed' in open('public/survey/page-embed.jsx').read(), \
-              'the wrapper no longer renders LoomSurveyEmbed'
-          assert 'window.LoomSurveyEmbed = LoomSurveyEmbed' in scene, \
-              'the scene file no longer exports LoomSurveyEmbed'
+          if (m.SCENES.length !== 12) fail(`expected 12 scenes, found ${m.SCENES.length}`);
+          if (Math.abs(m.DURATION - 65.5) > 1e-9) fail(`expected a 65.5s run, found ${m.DURATION}s`);
+          const names = new Set(m.SCENES.map((s) => s.name));
+          const missing = [...new Set([...src.matchAll(/\bC\.([A-Z]\w*)/g)].map((x) => x[1]))].filter((n) => !names.has(n));
+          if (missing.length) fail(`choreography cues scenes the table does not name: ${missing}`);
 
-          scenes = json.loads(re.search(r"window\.OM_SCENES = '(.+?)';", host, re.S).group(1))
-          assert len(scenes) == 12, f'expected 12 scenes, found {len(scenes)}'
-          total = sum(s['dur'] for s in scenes)
-          assert abs(total - 65.5) < 1e-9, f'expected a 65.5s composition, found {total}s'
+          for (const [file, html] of [['index.html', page], ['survey/index.html', player]]) {
+            if (!html.includes(`${m.COUNTS.tasks} tasks`)) fail(`${file} does not describe the run as ${m.COUNTS.tasks} tasks`);
+          }
+          if (!page.includes("import('./survey/survey.js')")) fail('index.html no longer loads survey/survey.js');
+          if (!player.includes("from './survey.js'")) fail('survey/index.html no longer loads survey.js');
 
-          cued = set(re.findall(r'C\.(\w+)', scene))
-          missing = cued - {s['name'] for s in scenes}
-          assert not missing, f'choreography cues sections the scene list does not name: {sorted(missing)}'
-
-          # The frame clips the transport away, and the hidden bar is pinned to
-          # the same figure. If the engine ever reserves something other than
-          # 44px, both go wrong together and silently.
-          bar = re.search(r'const barH = (\d+);', engine)
-          assert bar and bar.group(1) == '44', \
-              f'the stage reserves {bar.group(1) if bar else "?"}px for its transport, not the 44 the frame is built around'
-          assert 'calc(100% + 44px)' in page, 'index.html no longer sizes the iframe to canvas + 44px'
-          assert 'height: 44px;' in host, 'the hidden transport is no longer pinned to 44px'
-          PY
+          const noop = () => {};
+          const ctx = new Proxy({}, {
+            get: (t, k) => k in t ? t[k]
+              : k === 'measureText' ? (s) => ({ width: String(s).length * 11 })
+              : k === 'createLinearGradient' ? () => ({ addColorStop: noop })
+              : noop,
+            set: (t, k, v) => { t[k] = v; return true; },
+          });
+          let frames = 0;
+          for (const dark of [false, true]) {
+            for (let T = 0; T <= m.DURATION; T += 1 / 30, frames++) {
+              try { m.drawFrame(ctx, T, { width: 1920, height: 1080, dark, captions: true }); }
+              catch (e) { fail(`frame at T=${T.toFixed(3)}s (${dark ? 'dark' : 'light'}) throws: ${e.message}`); }
+            }
+          }
+          console.log(`${frames} frames drawn, ${m.SCENES.length} scenes, ${m.DURATION}s, ${m.COUNTS.tasks} tasks`);
+          JS
 
       - uses: actions/configure-pages@v5
 
