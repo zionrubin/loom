@@ -9,6 +9,7 @@ provider.
 - [Anthropic](#anthropic)
 - [OpenAI](#openai)
 - [llama.cpp (local)](#llamacpp-local)
+- [TypeSafe Jev (decisions)](#typesafe-jev-decisions)
 - [Pricing and limits](#pricing-and-limits)
 - [Mixing providers](#mixing-providers)
 
@@ -152,6 +153,38 @@ and use `llamacpp.WithAuth(ref)` on the provider.
 
 `examples/on-device` runs this whole path offline against real loopback
 sockets — no weights downloaded, nothing installed.
+
+## TypeSafe Jev (decisions)
+
+Jev is a *decision* model: it answers typed questions (`noul` yes/no, `choice`,
+`score`) with probabilities and a calibrated confidence, and writes no text. It
+serves `Decide` stages only; binding an `Infer`/`ReduceAI` to it fails
+compilation.
+
+```go
+import "github.com/zionrubin/loom/providers/typesafe"
+
+typesafe.RegisterDefaults(reg, model.Limits{RequestsPerMinute: 600}) // registers typesafe.Jev = "jev-latest", NO tier
+loom.WithSecrets(map[security.SecretRef]string{
+    typesafe.DefaultSecretRef: os.Getenv("TYPESAFE_API_KEY"),
+})
+
+// in build():
+Binding: model.Binding{Model: typesafe.Jev, Escalation: []string{"claude-sonnet-5"}},
+```
+
+| Model | Tier | $/MTok in | $/MTok out |
+|---|---|---|---|
+| `jev-latest` | — (bind by ID) | 0.042 | 0 (free) |
+
+Endpoint `api.typesafe.ai`, `POST /v1/systemone`. Each call also bills a
+~270-token server-side preamble (`typesafe.RequestOverheadTokens`, registered as
+`Info.InputOverheadTokens` so projections count it). Offline, run
+`typesafetest.Server{Judge: fn}` on loopback and register
+`typesafe.New(typesafe.WithBaseURL(url))`. The server speaks the real
+protocol, and `typesafetest.Choice/Score/Noul` build realistic answers
+(entropy-derived confidence) from weights. `examples/reflex` is the full
+pattern.
 
 ## Pricing and limits
 

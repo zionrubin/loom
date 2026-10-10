@@ -24,6 +24,7 @@ to a real provider say so.
 | [`commons-shared`](../examples/commons-shared) | The same commons across four executor *processes* | — |
 | [`treasury`](../examples/treasury) | Four processes, one wallet: a $0.05 ceiling that costs $0.20 without it | — |
 | [`clearance`](../examples/clearance) | One pipeline, three deployment policies: the refused round makes zero calls | — |
+| [`reflex`](../examples/reflex) | A decision model (Jev) guards and triages an inbox; an LLM reviews only the unsure — with a decision board and a studio view | — (`TYPESAFE_API_KEY` optional) |
 | [`beacon`](../examples/beacon) | The run as a monitoring system sees it: a scrape, and a trace off the wire | — |
 | [`studio`](../examples/studio) | Loom Studio on an invented archive | — (`-openai` optional) |
 | [`anthropic-review`](../examples/anthropic-review) | Classification + summary, budget-capped | `ANTHROPIC_API_KEY` |

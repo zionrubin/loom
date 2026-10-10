@@ -579,6 +579,7 @@ func (e *explainer) funcs(declared map[string]string) template.FuncMap {
 		return e.values[name], nil
 	}
 	return template.FuncMap{
+		"json":      pipeline.TemplateFuncs()["json"],
 		"broadcast": get,
 		"broadcastJSON": func(name string) (string, error) {
 			v, err := get(name)
@@ -867,9 +868,31 @@ func (e *explainer) infer(sp *plan.StagePlan, input []core.Record, out *StagePro
 	shared := model.EstimateTokens(spec.System) +
 		model.EstimateTokens(e.renderPrefix(s.ID, spec.Prefix, spec.Context, sp.Broadcasts))
 	prompts := e.renderPrompts(s.ID, spec.Prompt, input, sp.Broadcasts)
+	if len(spec.Questions) > 0 {
+		// The questions ride along with every record: a decision model is
+		// billed for them as input, and a generative rung reads them rendered
+		// into its prompt. Counting the rendered form bounds both.
+		q := model.EstimateTokens(model.RenderQuestions(spec.Questions))
+		for i := range prompts {
+			prompts[i] += q
+		}
+	}
 
 	e.accumulate(out, info, prompts, shared, expected, maxTokens)
 	e.ladder(sp, out, prompts, shared, expected)
+	if len(spec.Questions) > 0 && spec.MinConfidence > 0 && len(sp.Candidates) > 1 {
+		// A confidence gate escalates by design, not by failure, so unlike an
+		// ordinary retry its cost is part of the plan. The projection cannot
+		// know the fraction that will fall below the gate; it can say what the
+		// worst case — every record climbing to the top — costs.
+		top := sp.Candidates[len(sp.Candidates)-1]
+		worst := StageProjection{CachePrefix: out.CachePrefix}
+		e.accumulate(&worst, top, prompts, shared, expected, maxTokens)
+		e.warnf("stage %q sends records whose weakest answer is below %.2f confidence up its "+
+			"ladder: if every record escalated to %s the stage would cost up to $%.4f more "+
+			"(the fraction that does is what a run's report measures)",
+			s.ID, spec.MinConfidence, top.ID, worst.Ceiling.CostUSD)
+	}
 	e.recs[s.ID] = e.inferOutputs(s.ID, spec, input, expected)
 }
 
@@ -947,7 +970,7 @@ func (e *explainer) reduce(sp *plan.StagePlan, input []core.Record, out *StagePr
 // the entry, every later one reads it.
 func (e *explainer) accumulate(out *StageProjection, info model.Info, prompts []int, shared, expected, maxTokens int) {
 	for i, p := range prompts {
-		u := core.Usage{InputTokens: p, Requests: 1}
+		u := core.Usage{InputTokens: p + info.InputOverheadTokens, Requests: 1}
 		switch {
 		case !out.CachePrefix:
 			u.InputTokens += shared
@@ -1139,6 +1162,24 @@ func (e *explainer) inferOutputs(stageID string, spec *pipeline.InferSpec, input
 		field = "output"
 	}
 	sample, sampled := e.cfg.StageSamples[stageID]
+	if len(spec.Questions) > 0 {
+		out, guessed := decisionOutputs(spec, input, sample)
+		if len(guessed) > 0 {
+			// Better than ParseJSON — the field names and types are declared,
+			// so every template below renders — but not exact: which answer
+			// each record gets is the one thing a plan cannot know, and a
+			// filter on it keeps or drops records by the guess. No placeholder
+			// is safe for every filter (a guard drops exactly the records a
+			// "yes" describes), so the stage is marked estimated until the
+			// values are named.
+			e.tainted[stageID] = true
+			e.warnf("stage %q is a decision: the fields it adds are declared, but the answers "+
+				"to %s are not knowable from the plan, so a filter on them is projected against "+
+				"a placeholder. Name the values that make the most downstream work with "+
+				"loom.WithStageSample(%q, ...)", stageID, strings.Join(guessed, ", "), stageID)
+		}
+		return out
+	}
 	if spec.ParseJSON && !sampled {
 		// This is the one way a projection can be wrong in the dangerous
 		// direction. A downstream Filter testing a field the model was going to
@@ -1166,6 +1207,51 @@ func (e *explainer) inferOutputs(stageID string, spec *pipeline.InferSpec, input
 		out = append(out, nr)
 	}
 	return out
+}
+
+// decisionOutputs projects a decision stage's records. The fields it adds are
+// the question IDs, declared in the plan, so every one is present and of its
+// declared type — a template below reads them without falling back. The
+// values come from the stage sample; a question without one gets a
+// placeholder (yes, the first option, the top of the rubric) and is returned
+// in guessed.
+func decisionOutputs(spec *pipeline.InferSpec, input []core.Record, sample map[string]any) ([]core.Record, []string) {
+	field := spec.OutputField
+	if field == "" {
+		field = pipeline.DefaultDecisionField
+	}
+	values := map[string]any{}
+	answers := map[string]any{}
+	var guessed []string
+	for _, id := range spec.Questions.IDs() {
+		q := spec.Questions[id]
+		var v any
+		switch q.Type {
+		case model.QuestionNoul:
+			v = 1.0
+		case model.QuestionChoice:
+			v = q.OptionNames()[0]
+		case model.QuestionScore:
+			v = float64(len(q.Levels) - 1)
+		}
+		if sv, ok := sample[id]; ok {
+			v = sv
+		} else {
+			guessed = append(guessed, id)
+		}
+		values[id] = v
+		answers[id] = map[string]any{"type": string(q.Type)}
+	}
+	out := make([]core.Record, 0, len(input))
+	for _, r := range input {
+		nr := r.Clone()
+		for k, v := range values {
+			nr.Data[k] = v
+		}
+		nr.Data[field] = map[string]any{"answers": answers, "confidence": 1.0}
+		out = append(out, nr)
+	}
+	return out, guessed
 }
 
 func (e *explainer) reduceOutputs(s *pipeline.Stage, n, expected int) []core.Record {

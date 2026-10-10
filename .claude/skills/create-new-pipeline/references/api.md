@@ -54,6 +54,7 @@ d.MapTools(name, func(ctx, core.Session, core.Record) (core.Record, error), opts
 
 // Model operations
 d.Infer(name, pipeline.InferSpec{...}, opts...) Dataset
+d.Decide(name, pipeline.DecideSpec{...}, opts...) Dataset     // typed questions; compiles to an Infer
 d.ReduceAI(name, pipeline.ReduceAISpec{...}, opts...) Dataset
 d.Iterate(name, pipeline.IterateSpec{...}, opts...) Dataset   // see iterate.md
 
@@ -67,6 +68,34 @@ second pipeline over the first's `StageOutputs`.
 
 `Combine` and `ReduceAI` are natural barriers: they need the whole dataset, so
 they stay barriers even under `WithStreaming`.
+
+## DecideSpec
+
+Typed questions per record, answered by a decision model (or any LLM on the
+same ladder, held to the same schema). Full design: `docs/DECISIONS.md`.
+
+```go
+type DecideSpec struct {
+    Binding       model.Binding   // e.g. {Model: typesafe.Jev, Escalation: []string{"claude-sonnet-5"}}
+    System        string          // for generative rungs only — a decision model has no system prompt
+    Prefix        string          // stage-wide context ahead of every state (policy, glossary)
+    State         string          // text/template over Data; empty = {{json .}}
+    Questions     model.Questions // model.Noul(q), model.Choice(q, map[name]desc), model.Score(q, levels...)
+    MinConfidence float64         // weakest calibrated answer below this → semantic failure → escalate
+    MaxTokens     int             // generative rung's reply cap (default 48/question + 64)
+    OutputField   string          // full decision (default "decision"); read with model.ReadDecision
+    Validate      func(core.Record) error
+}
+```
+
+- Each question ID becomes a record field: the option (string), the
+  probability of yes (float64), or the weighted score (float64).
+- On the last rung a low-confidence answer is kept with
+  `decision.low_confidence = true` rather than failed.
+- `Explain` knows the fields but not the answers: filters below an unsampled
+  Decide mark the projection estimated. Name the answers with
+  `loom.WithStageSample(stage, map[string]any{...})`.
+- Binding a text stage to a decision-only model fails compilation.
 
 ## InferSpec
 

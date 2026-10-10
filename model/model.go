@@ -61,6 +61,12 @@ type Request struct {
 	// retained region of a certified splice. Providers that have no use for it
 	// ignore it, which is all of them today.
 	Continuation delta.Hint `json:"continuation,omitzero"`
+	// Questions makes this a decision request: the prompt is the *state* to
+	// judge, and the reply is one typed answer per question rather than text.
+	// A provider declaring Capabilities.Decisions answers them natively in
+	// Response.Answers; a text provider is never handed one — the stage
+	// rewrites the request with Generative first. See decision.go.
+	Questions Questions `json:"questions,omitempty"`
 }
 
 // FullPrompt returns the prompt as the model sees it: shared prefix first,
@@ -73,6 +79,11 @@ type Response struct {
 	Text  string
 	Model string
 	Usage core.Usage
+	// Answers holds a decision provider's typed answers to Request.Questions.
+	// Such a provider also sets Text to the answers as JSON, so everything
+	// that observes a call as text — telemetry, the run view — still sees
+	// what came back.
+	Answers map[string]Answer
 }
 
 // CallContext carries per-task security context into a provider call.
@@ -194,6 +205,11 @@ type Info struct {
 	Limits    Limits
 	Tier      Tier
 	SecretRef security.SecretRef
+	// InputOverheadTokens is input the provider bills on every call that the
+	// request itself does not carry — a server-side prompt wrapped around it.
+	// Projections add it per call, so a model with a fixed preamble cannot
+	// make a ceiling a lie. Zero for a model that bills only what it is sent.
+	InputOverheadTokens int
 }
 
 // Registry holds all models a deployment may use and the tier mapping.

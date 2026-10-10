@@ -47,6 +47,7 @@ records; nothing else flows.
 | Pure Go transform | `Map` / `Filter` / `FlatMap` | free, fused together, no model |
 | Go transform needing tools or broadcasts | `MapTools` | gets a capability-checked `core.Session` |
 | One model call per record | `Infer` | the workhorse |
+| Closed questions per record (which queue, yes/no, rate 1–5) | `Decide` | typed answers + calibrated confidence; Jev first, LLM when unsure — `references/providers.md#typesafe-jev-decisions` |
 | Many records → one, via the model | `ReduceAI` | hierarchical tree, `FanIn` per level |
 | Many records → one, in Go | `Combine` | associative fold, no model, no cost |
 | Loop until it converges | `Iterate` | see `references/iterate.md` |

@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reflex · Decision Board</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0a10'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%23fab219'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #08080c;
+    --panel: #0a0a10;
+    --card: #0e0e15;
+    --hairline: rgba(255,255,255,.08);
+    --line: rgba(255,255,255,.12);
+    --ink: #ffffff;
+    --ink-1: #e8e6df;
+    --ink-2: #c3c2b7;
+    --ink-3: #898781;
+    --ink-4: #5c5c66;
+    --jev: #fab219;       /* System One: the decision model */
+    --llm: #9085e9;       /* System Two: the generative fallback */
+    --infer: #3987e5;
+    --source: #2ab5a6;
+    --bad: #d03b3b;
+    --good: #0ca30c;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --serif: "Instrument Serif", Georgia, "Times New Roman", serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--ink-1); font-family: var(--mono); font-size: 12px; min-height: 100vh; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 9px; }
+
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--hairline); background: var(--panel);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; }
+  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--jev); box-shadow: 0 0 10px 2px rgba(250,178,25,.35); }
+  .brand .name { font-family: var(--serif); font-size: 21px; color: var(--ink); }
+  .brand .sub { color: var(--ink-3); font-size: 11px; letter-spacing: .08em; }
+  .mode { margin-left: auto; font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1px; background: var(--hairline); border-bottom: 1px solid var(--hairline); }
+  .tile { background: var(--panel); padding: 13px 16px; }
+  .tile .k { font-size: 10px; letter-spacing: .16em; color: var(--ink-4); text-transform: uppercase; }
+  .tile .v { font-size: 22px; color: var(--ink); margin-top: 5px; font-family: var(--serif); }
+  .tile .d { font-size: 11px; color: var(--ink-3); margin-top: 3px; }
+  .tile .v .jev { color: var(--jev); } .tile .v .llm { color: var(--llm); }
+
+  .layout { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; min-height: calc(100vh - 150px); }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } .msgs { max-height: 46vh; } .list { border-right: 0; border-bottom: 1px solid var(--hairline); } .detail { padding: 18px 16px 32px; } }
+
+  .list { border-right: 1px solid var(--hairline); background: var(--panel); display: flex; flex-direction: column; min-width: 0; }
+  .filters { display: flex; flex-wrap: wrap; gap: 5px; padding: 11px 12px; border-bottom: 1px solid var(--hairline); }
+  .chip { border: 1px solid var(--line); border-radius: 20px; background: transparent; color: var(--ink-3); padding: 3px 10px; cursor: pointer; font: inherit; font-size: 11px; }
+  .chip.on { color: var(--ink); border-color: rgba(255,255,255,.35); background: rgba(255,255,255,.06); }
+  .chip .n { color: var(--ink-4); margin-left: 4px; }
+  .msgs { overflow: auto; flex: 1; }
+  .msg { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--hairline); background: transparent; color: inherit; font: inherit; padding: 11px 14px; cursor: pointer; }
+  .msg:hover { background: rgba(255,255,255,.025); }
+  .msg.sel { background: rgba(255,255,255,.05); box-shadow: inset 2px 0 0 var(--ink-2); }
+  .msg .top { display: flex; gap: 8px; align-items: baseline; }
+  .msg .id { color: var(--ink-4); font-size: 10.5px; }
+  .msg .subj { color: var(--ink-1); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .msg .meta { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  .lane { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; border: 1px solid var(--line); color: var(--ink-2); }
+  .lane.page-oncall { border-color: rgba(208,59,59,.5); color: #e08585; background: rgba(208,59,59,.08); }
+  .lane.quarantine { border-color: rgba(208,59,59,.5); color: #e08585; background: repeating-linear-gradient(135deg, rgba(208,59,59,.1) 0 5px, transparent 5px 10px); }
+  .who { font-size: 10.5px; display: inline-flex; align-items: center; gap: 5px; color: var(--ink-3); }
+  .who i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .who.jev i { background: var(--jev); } .who.llm i { background: var(--llm); }
+  .confbar { flex: 0 0 64px; height: 4px; background: rgba(255,255,255,.07); border-radius: 2px; position: relative; margin-left: auto; }
+  .confbar b { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; }
+  .confbar .gate { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--ink-3); }
+
+  .detail { padding: 22px 26px 40px; min-width: 0; overflow: auto; }
+  .detail h1 { font-family: var(--serif); font-weight: 400; font-size: 26px; color: var(--ink); line-height: 1.2; }
+  .detail .from { color: var(--ink-3); margin-top: 6px; }
+  .body { margin-top: 14px; padding: 13px 15px; border: 1px solid var(--hairline); border-radius: 6px; background: var(--card); color: var(--ink-2); line-height: 1.6; font-size: 12.5px; }
+  h2 { font-size: 10px; letter-spacing: .18em; color: var(--ink-4); font-weight: 400; text-transform: uppercase; margin: 26px 0 10px; display: flex; gap: 10px; align-items: center; }
+  h2 .note { text-transform: none; letter-spacing: 0; color: var(--ink-3); font-size: 11px; }
+  .answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .ans { border: 1px solid var(--hairline); border-radius: 6px; background: var(--card); padding: 12px 14px; }
+  .ans.weak { border-color: rgba(250,178,25,.45); }
+  .ans .hd { display: flex; align-items: baseline; gap: 8px; }
+  .ans .qid { color: var(--ink); }
+  .ans .type { font-size: 10px; color: var(--ink-4); letter-spacing: .1em; }
+  .ans .val { margin-left: auto; color: var(--ink); }
+  .ans .q { color: var(--ink-3); font-size: 11px; margin: 5px 0 10px; line-height: 1.45; }
+  .row { display: grid; grid-template-columns: 92px 1fr 44px; gap: 8px; align-items: center; margin: 4px 0; font-size: 11px; }
+  .row .lbl { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.pick .lbl { color: var(--ink); }
+  .track { height: 7px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; }
+  .track b { display: block; height: 100%; border-radius: 3px; background: var(--ink-4); }
+  .row.pick .track b { background: var(--src, var(--jev)); }
+  .row .pct { text-align: right; color: var(--ink-3); }
+  .meter { position: relative; height: 10px; background: linear-gradient(90deg, rgba(12,163,12,.25), rgba(255,255,255,.05) 50%, rgba(208,59,59,.3)); border-radius: 5px; margin: 8px 0 4px; }
+  .meter .mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--ink-4); }
+  .meter .pin { position: absolute; top: -4px; width: 4px; height: 18px; margin-left: -2px; border-radius: 2px; background: var(--src, var(--jev)); box-shadow: 0 0 8px rgba(0,0,0,.6); }
+  .scale { display: flex; justify-content: space-between; color: var(--ink-4); font-size: 10px; }
+  .ladder { position: relative; height: 26px; margin: 10px 4px 4px; }
+  .ladder .rail { position: absolute; left: 0; right: 0; top: 12px; height: 2px; background: rgba(255,255,255,.1); }
+  .ladder .tick { position: absolute; top: 7px; width: 1px; height: 12px; background: var(--ink-4); }
+  .ladder .pin { position: absolute; top: 5px; width: 16px; height: 16px; margin-left: -8px; border-radius: 50%; background: var(--src, var(--jev)); border: 3px solid var(--card); }
+  .ladder .names { position: absolute; left: 0; right: 0; top: 24px; display: flex; justify-content: space-between; font-size: 10px; color: var(--ink-4); }
+  .cert { display: flex; gap: 8px; align-items: center; font-size: 10.5px; color: var(--ink-3); margin-top: 10px; }
+  .cert .confbar { flex: 1; margin: 0; }
+  .banner { margin-top: 14px; padding: 10px 13px; border-radius: 6px; font-size: 11.5px; line-height: 1.5; }
+  .banner.esc { border: 1px solid rgba(144,133,233,.4); background: rgba(144,133,233,.08); color: #c2bbf6; }
+  .banner.q { border: 1px solid rgba(208,59,59,.45); background: rgba(208,59,59,.08); color: #e8a0a0; }
+  .banner.ok { border: 1px solid rgba(250,178,25,.35); background: rgba(250,178,25,.06); color: #f0cd80; }
+
+  .foot { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1px; background: var(--hairline); border-top: 1px solid var(--hairline); }
+  .foot section { background: var(--panel); padding: 16px 18px 20px; }
+  .foot h2 { margin-top: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  td, th { padding: 6px 4px; border-bottom: 1px solid var(--hairline); text-align: right; font-weight: 400; }
+  th { color: var(--ink-4); font-size: 10px; letter-spacing: .1em; }
+  td:first-child, th:first-child { text-align: left; }
+  .brief { color: var(--ink-2); line-height: 1.65; font-size: 12.5px; }
+  .lanes .row { grid-template-columns: 110px 1fr 30px; }
+  .empty { color: var(--ink-4); padding: 30px; }
+  .first { margin-top: 12px; border: 1px dashed rgba(250,178,25,.35); border-radius: 6px; padding: 10px 13px; }
+  .first .t { font-size: 10px; letter-spacing: .14em; color: var(--ink-4); text-transform: uppercase; margin-bottom: 6px; }
+  .first .row { grid-template-columns: 92px 1fr 150px; }
+  .first .row.low .lbl, .first .row.low .pct { color: #e08585; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span><span class="name">Reflex</span><span class="sub">DECISION BOARD</span></div>
+  <span class="mode" id="mode">loading…</span>
+</header>
+<div class="tiles" id="tiles"></div>
+<div class="layout">
+  <div class="list">
+    <div class="filters" id="filters"></div>
+    <div class="msgs" id="msgs"></div>
+  </div>
+  <div class="detail" id="detail"><p class="empty">Select a message.</p></div>
+</div>
+<div class="foot" id="foot"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct = (v) => Math.round((v || 0) * 100) + '%';
+const usd = (v) => '$' + (v || 0).toFixed(v < 0.01 ? 5 : 4);
+
+let B = null, filter = 'all', selected = null;
+
+// certainty on one 0..1 scale for all three types — the same rule the
+// pipeline gates on (model.Answer.Certainty).
+function certainty(a) {
+  if (!a) return 0;
+  if (a.type === 'noul') return Math.abs(2 * (a.noul || 0) - 1);
+  return a.confidence || 0;
+}
+function isLLM(dec) { return dec && dec.calibrated === false; }
+function laneOf(m) { return m.status === 'quarantined' ? 'quarantine' : (m.lane || '?'); }
+function src(dec) { return isLLM(dec) ? 'var(--llm)' : 'var(--jev)'; }
+
+function confbar(v, gate, color) {
+  return `<span class="confbar" title="confidence ${v.toFixed(2)}"><b style="width:${pct(v)};background:${color}"></b>` +
+    (gate ? `<span class="gate" style="left:${pct(gate)}"></span>` : '') + `</span>`;
+}
+
+function render() {
+  $('#mode').textContent = B.mode + ' · ran in ' + B.took;
+  const jev = B.triaged - B.escalated;
+  const jevModel = B.models.find(m => m.model.startsWith('jev'));
+  const llmCalls = B.models.filter(m => !m.model.startsWith('jev'));
+  const llmP50 = llmCalls.length ? Math.max(...llmCalls.map(m => m.p50_ms)) : 0;
+  const x = B.triage_usd > 0 ? (B.llm_only_usd / B.triage_usd) : 0;
+  const quarantined = B.messages.filter(m => m.status === 'quarantined').length;
+  $('#tiles').innerHTML = [
+    ['Messages', B.messages.length, `${quarantined} quarantined by the guard`],
+    ['Answered by Jev', `<span class="jev">${jev}</span> / ${B.triaged}`, jevModel ? `p50 ${jevModel.p50_ms.toFixed(0)} ms · calibrated` : ''],
+    ['Escalated', `<span class="llm">${B.escalated}</span>`, `weakest answer below ${B.gate.toFixed(2)} → LLM${llmP50 ? ' · p50 ' + llmP50.toFixed(0) + ' ms' : ''}`],
+    ['Triage cost', usd(B.triage_usd), `vs ${usd(B.llm_only_usd)} with the LLM alone${x > 1 ? ' · ' + x.toFixed(1) + '× less' : ''}`],
+    ['Run total', usd(B.spent_usd), 'every call, every stage'],
+  ].map(([k, v, d]) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="d">${esc(d)}</div></div>`).join('');
+
+  const counts = {};
+  B.messages.forEach(m => { const l = laneOf(m); counts[l] = (counts[l] || 0) + 1; });
+  const esced = B.messages.filter(m => isLLM(m.triage)).length;
+  const chips = [['all', B.messages.length], ['escalated', esced], ...Object.entries(counts).sort((a, b) => b[1] - a[1])];
+  $('#filters').innerHTML = chips.map(([k, n]) =>
+    `<button class="chip ${filter === k ? 'on' : ''}" data-f="${esc(k)}">${esc(k)}<span class="n">${n}</span></button>`).join('');
+  $('#filters').querySelectorAll('.chip').forEach(b => b.onclick = () => { filter = b.dataset.f; render(); });
+
+  const shown = B.messages.filter(m => filter === 'all' || (filter === 'escalated' ? isLLM(m.triage) : laneOf(m) === filter));
+  if (!selected || !shown.find(m => m.id === selected)) selected = shown[0] && shown[0].id;
+  $('#msgs').innerHTML = shown.map(m => {
+    const dec = m.status === 'quarantined' ? m.guard : m.triage;
+    const llm = isLLM(dec);
+    const conf = dec ? (dec.confidence || 0) : 0;
+    return `<button class="msg ${m.id === selected ? 'sel' : ''}" data-id="${m.id}">
+      <div class="top"><span class="id">${esc(m.id)}</span><span class="subj">${esc(m.subject)}</span></div>
+      <div class="meta"><span class="lane ${esc(laneOf(m))}">${esc(laneOf(m))}</span>
+        <span class="who ${llm ? 'llm' : 'jev'}"><i></i>${llm ? '↑ ' : ''}${esc(dec && dec.model)}</span>
+        ${llm ? '<span class="who">stated</span>' : confbar(conf, m.status === 'quarantined' ? 0 : B.gate, src(dec))}
+      </div></button>`;
+  }).join('') || '<p class="empty">Nothing in this lane.</p>';
+  $('#msgs').querySelectorAll('.msg').forEach(b => b.onclick = () => { selected = b.dataset.id; render(); });
+
+  renderDetail(B.messages.find(m => m.id === selected));
+  renderFoot();
+}
+
+function answerCard(id, q, a, dec, weakest) {
+  const color = src(dec);
+  let viz = '', val = '';
+  if (q.type === 'choice') {
+    const names = Object.keys(q.options).sort();
+    val = esc(a.choice);
+    viz = names.map(n => {
+      const p = a.probabilities ? (a.probabilities[n] || 0) : (n === a.choice ? 1 : 0);
+      return `<div class="row ${n === a.choice ? 'pick' : ''}" style="--src:${color}"><span class="lbl" title="${esc(q.options[n])}">${esc(n)}</span>
+        <span class="track"><b style="width:${pct(p)}"></b></span><span class="pct">${a.probabilities ? pct(p) : ''}</span></div>`;
+    }).join('');
+  } else if (q.type === 'score') {
+    const n = q.levels.length, s = a.score || 0;
+    val = `${s.toFixed(2)} · ${esc(q.levels[Math.round(s)])}`;
+    viz = `<div class="ladder" style="--src:${color}"><div class="rail"></div>` +
+      q.levels.map((_, i) => `<span class="tick" style="left:${i / (n - 1) * 100}%"></span>`).join('') +
+      `<span class="pin" style="left:${s / (n - 1) * 100}%"></span><div class="names">${q.levels.map(l => `<span>${esc(l)}</span>`).join('')}</div></div>`;
+    if (a.probabilities) {
+      viz += '<div style="margin-top:20px">' + q.levels.map((l, i) => {
+        const p = a.probabilities[String(i)] || 0;
+        return `<div class="row ${i === Math.round(s) ? 'pick' : ''}" style="--src:${color}"><span class="lbl">${esc(l)}</span><span class="track"><b style="width:${pct(p)}"></b></span><span class="pct">${pct(p)}</span></div>`;
+      }).join('') + '</div>';
+    } else viz += '<div style="height:18px"></div>';
+  } else {
+    const p = a.noul || 0;
+    val = `${pct(p)} yes`;
+    viz = `<div class="meter" style="--src:${color}"><span class="mid"></span><span class="pin" style="left:${pct(p)}"></span></div><div class="scale"><span>no</span><span>unsure</span><span>yes</span></div>`;
+  }
+  const c = certainty(a);
+  const cert = isLLM(dec) && q.type !== 'noul'
+    ? `<div class="cert">confidence ${(a.confidence || 0).toFixed(2)} as stated by the model — not calibrated, not gated</div>`
+    : `<div class="cert">certainty ${c.toFixed(2)} ${confbar(c, B.gate, c < B.gate ? 'var(--bad)' : color)}</div>`;
+  return `<div class="ans ${id === weakest ? 'weak' : ''}">
+    <div class="hd"><span class="qid">${esc(id)}</span><span class="type">${esc(q.type.toUpperCase())}</span><span class="val">${val}</span></div>
+    <div class="q">${esc(q.instructions)}</div>${viz}${cert}</div>`;
+}
+
+function answers(qs, dec) {
+  if (!dec || !dec.answers) return '<p class="empty">Not asked.</p>';
+  return '<div class="answers">' + Object.keys(qs).sort().map(id =>
+    answerCard(id, qs[id], dec.answers[id] || {}, dec, dec.weakest)).join('') + '</div>';
+}
+
+function renderDetail(m) {
+  if (!m) { $('#detail').innerHTML = '<p class="empty">Select a message.</p>'; return; }
+  let banner = '';
+  if (m.status === 'quarantined') {
+    banner = `<div class="banner q">Quarantined. The guard answered yes to a screening question, so no agent acts on this message and triage never sees it.</div>`;
+  } else if (isLLM(m.triage)) {
+    banner = `<div class="banner esc">Escalated. Jev answered first; its weakest answer fell below the ${B.gate.toFixed(2)} gate, so the same five questions went to <b>${esc(m.triage.model)}</b>, which answered under the same schema — a choice from the same queues, a score on the same rubric.</div>`;
+  } else {
+    banner = `<div class="banner ok">Answered by ${esc(m.triage.model)} in one call, five questions at once. Weakest answer: <b>${esc(m.triage.weakest)}</b> at ${(m.triage.confidence || 0).toFixed(2)} — above the ${B.gate.toFixed(2)} gate. Routed to <b>${esc(m.lane)}</b>.</div>`;
+  }
+  if (m.first) {
+    const ids = Object.keys(m.first.answers).sort();
+    banner += `<div class="first"><div class="t">What Jev said first · weakest ${esc(m.first.weakest)} at ${m.first.confidence.toFixed(2)}</div>` +
+      ids.map(id => {
+        const a = m.first.answers[id], c = certainty(a);
+        let said = a.type === 'choice' ? `${a.choice} ${pct((a.probabilities || {})[a.choice])}`
+          : a.type === 'score' ? `score ${(a.score || 0).toFixed(2)}` : `${pct(a.noul)} yes`;
+        if (a.type === 'choice' && a.probabilities) {
+          const top = Object.entries(a.probabilities).sort((x, y) => y[1] - x[1]).slice(0, 2);
+          said = top.map(([n, p]) => `${n} ${pct(p)}`).join(' / ');
+        }
+        return `<div class="row ${c < B.gate ? 'low' : ''}"><span class="lbl">${esc(id)}</span>` +
+          `<span class="track"><b style="width:${pct(c)};background:${c < B.gate ? 'var(--bad)' : 'var(--jev)'}"></b></span>` +
+          `<span class="pct">${esc(said)}</span></div>`;
+      }).join('') + `</div>`;
+  }
+  $('#detail').innerHTML = `
+    <h1>${esc(m.subject)}</h1>
+    <div class="from">${esc(m.id)} · ${esc(m.from)} · ${esc(m.plan)} plan</div>
+    <div class="body">${esc(m.body)}</div>
+    ${banner}
+    <h2>Guard <span class="note">${esc(m.guard && m.guard.model)} · runs on every message</span></h2>
+    ${answers(B.questions.guard, m.guard)}
+    <h2>Triage <span class="note">${m.triage ? esc(m.triage.model) + (isLLM(m.triage) ? ' · escalated, stated confidences' : ' · calibrated') : 'skipped'}</span></h2>
+    ${m.triage ? answers(B.questions.triage, m.triage) : '<p class="empty">Quarantined messages are not triaged.</p>'}`;
+}
+
+function renderFoot() {
+  const models = `<table><tr><th>model</th><th>calls</th><th>cost</th><th>p50</th></tr>` +
+    B.models.map(m => `<tr><td><span class="who ${m.model.startsWith('jev') ? 'jev' : 'llm'}"><i></i>${esc(m.model)}</span></td>
+      <td>${m.calls}</td><td>${usd(m.cost_usd)}</td><td>${m.p50_ms.toFixed(0)} ms</td></tr>`).join('') + '</table>';
+  const lanes = B.lanes || {};
+  const lmax = Math.max(1, ...Object.values(lanes));
+  const laneRows = Object.entries(lanes).sort((a, b) => b[1] - a[1]).map(([l, n]) =>
+    `<div class="row"><span class="lbl">${esc(l)}</span><span class="track"><b style="width:${n / lmax * 100}%;background:var(--infer)"></b></span><span class="pct">${n}</span></div>`).join('');
+  $('#foot').innerHTML = `
+    <section><h2>Models</h2>${models}</section>
+    <section class="lanes"><h2>Lanes <span class="note">a free fold over typed answers</span></h2>${laneRows}</section>
+    <section><h2>Shift brief <span class="note">the one piece of prose, written by the LLM</span></h2><p class="brief">${esc(B.brief || 'Nothing urgent.')}</p></section>`;
+}
+
+fetch('/api/board').then(r => r.json()).then(b => { B = b; render(); })
+  .catch(e => { $('#mode').textContent = 'failed to load: ' + e; });
+</script>
+</body>
+</html>

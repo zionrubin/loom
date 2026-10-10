@@ -11,6 +11,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"text/template"
 
@@ -192,6 +193,7 @@ func WithVersion(v string) Option { return func(o *StageOpts) { o.Version = v } 
 //
 //	{{broadcast "name"}}      the shared value (index it for structured data)
 //	{{broadcastJSON "name"}}  the shared value rendered as indented JSON
+//	{{json .}}                any value as compact JSON (map keys sorted)
 //
 // The implementations returned here are parse-time placeholders, so templates
 // can be validated at compile time before anything is provisioned. The
@@ -202,7 +204,18 @@ func TemplateFuncs() template.FuncMap {
 		return nil, fmt.Errorf("broadcast %q: not bound to this task "+
 			"(declare it with pipeline.WithBroadcast)", name)
 	}
-	return template.FuncMap{"broadcast": unbound, "broadcastJSON": unbound}
+	return template.FuncMap{"broadcast": unbound, "broadcastJSON": unbound, "json": toJSON}
+}
+
+// toJSON renders a value as compact JSON. encoding/json sorts map keys, so
+// the same record always renders to the same bytes — which is what keeps a
+// prompt built from it cacheable.
+func toJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // WithNoCache disables caching for this stage.
@@ -252,7 +265,87 @@ type InferSpec struct {
 	// Validate, if set, checks the produced record; errors are semantic
 	// failures.
 	Validate func(core.Record) error
+
+	// Questions, when set, makes this a decision stage: the rendered Prompt is
+	// the state being judged, and the model returns one typed answer per
+	// question instead of text. Declare one with Dataset.Decide rather than
+	// setting it here; see DecideSpec for what the stage does with them.
+	Questions model.Questions
+	// MinConfidence gates a decision stage's calibrated answers. See
+	// DecideSpec.MinConfidence.
+	MinConfidence float64
 }
+
+// DecideSpec declares a per-record decision: typed questions about each
+// record, answered by a decision model (TypeSafe's Jev, via package
+// providers/typesafe) or by any LLM on the same escalation ladder.
+//
+// For each question the record gains a field named for the question's ID
+// holding the answer's value — the chosen option for a Choice, the
+// probability of yes for a Noul, the weighted score for a Score — so a
+// downstream Filter or template reads {{.queue}} like any other field. The
+// full decision (every distribution, every confidence, which model answered,
+// whether the confidences were calibrated) goes in OutputField, readable with
+// model.ReadDecision.
+//
+// # Why this is an Infer and not a new operator
+//
+// A decision is a model call per record whose answer type is declared up
+// front. Everything Loom does to a model call — least-privilege envelopes,
+// egress allowlists, admission against rate limits, the result cache, budgets,
+// escalation, routing, the projection — applies unchanged, so Decide compiles
+// to an Infer stage carrying Questions, and all of that machinery is shared
+// rather than reimplemented.
+//
+// Declaring the answer type up front also buys two things free-form output
+// cannot. The projection knows the fields a decision adds, so a Filter below
+// one is counted rather than guessed (compare ParseJSON, which hides them).
+// And a rung that is not a decision model is held to the same schema: an LLM
+// that answers with an option nobody declared has produced a semantic failure,
+// and escalates, instead of putting the invention in the record.
+type DecideSpec struct {
+	// Binding is the decision ladder, typically a decision model escalating to
+	// an LLM: model.Binding{Model: typesafe.Jev, Escalation: []string{"claude-sonnet-5"}}.
+	Binding model.Binding
+	// System instructs generative rungs. A decision model has no system
+	// prompt — the state is the whole of what it judges — so anything the
+	// decision model must see belongs in Prefix or State.
+	System string
+	// Prefix is stage-wide context placed ahead of every record's state: a
+	// policy, a glossary, what the queues mean. The same text/template rules
+	// as InferSpec.Prefix.
+	Prefix string
+	// State is a text/template rendered against each record's Data to produce
+	// what the questions are asked about. Empty sends the whole record as
+	// JSON ({{json .}}).
+	State string
+	// Questions are the typed questions, keyed by ID. Build them with
+	// model.Noul, model.Choice and model.Score.
+	Questions model.Questions
+	// MinConfidence, when positive, is the least certainty (see
+	// model.Answer.Certainty) the weakest answer may have and still be
+	// accepted from a decision model. Below it the answers are a semantic
+	// failure and the record climbs the ladder — the "System 1 answers, System
+	// 2 reviews what System 1 was unsure of" cascade. It applies only to
+	// calibrated confidences: an LLM's stated confidence is its opinion of
+	// itself, not a probability, and is recorded but never gated on. On the
+	// last rung a low-confidence decision is accepted and marked
+	// "low_confidence" in OutputField, so a stage with no fallback can still
+	// route those records to review rather than fail them.
+	MinConfidence float64
+	// MaxTokens caps a generative rung's reply (default 48 per question + 64).
+	// A decision model's output is typed and free, so this caps nothing there.
+	MaxTokens int
+	// OutputField receives the full decision (default "decision").
+	OutputField string
+	// Validate, if set, checks the produced record; errors are semantic
+	// failures, exactly as in InferSpec.
+	Validate func(core.Record) error
+}
+
+// DefaultDecisionField is where a decision stage writes the full decision
+// when DecideSpec.OutputField is empty.
+const DefaultDecisionField = "decision"
 
 // ReduceAISpec declares a hierarchical AI aggregation: records are grouped
 // FanIn at a time, each group summarized by the model, and levels repeat
@@ -383,6 +476,34 @@ func (d Dataset) Infer(name string, spec InferSpec, opts ...Option) Dataset {
 // ReduceAI hierarchically aggregates all records into one via model calls.
 func (d Dataset) ReduceAI(name string, spec ReduceAISpec, opts ...Option) Dataset {
 	return d.p.add(&Stage{ID: name, Kind: KindReduceAI, Upstream: d.stage, Reduce: &spec, Opts: applyOpts(opts)})
+}
+
+// Decide asks typed questions about each record. See DecideSpec.
+func (d Dataset) Decide(name string, spec DecideSpec, opts ...Option) Dataset {
+	state := spec.State
+	if state == "" {
+		state = "{{json .}}"
+	}
+	maxTokens := spec.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 48*len(spec.Questions) + 64
+	}
+	field := spec.OutputField
+	if field == "" {
+		field = DefaultDecisionField
+	}
+	infer := &InferSpec{
+		Binding:       spec.Binding,
+		System:        spec.System,
+		Prefix:        spec.Prefix,
+		Prompt:        state,
+		MaxTokens:     maxTokens,
+		OutputField:   field,
+		Validate:      spec.Validate,
+		Questions:     spec.Questions,
+		MinConfidence: spec.MinConfidence,
+	}
+	return d.p.add(&Stage{ID: name, Kind: KindInfer, Upstream: d.stage, Infer: infer, Opts: applyOpts(opts)})
 }
 
 // Combine folds records pairwise with an associative function (no model).

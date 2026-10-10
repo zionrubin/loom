@@ -22,6 +22,7 @@
     --infer: #3987e5;
     --reduce: #9085e9;
     --loop: #fab219;
+    --decide: #e0823a;
     --plain: #898781;
     --bad: #d03b3b;
     --good: #0ca30c;
@@ -255,6 +256,7 @@
   .note-box.bad { border-style: solid; border-color: rgba(208,59,59,.35); background: rgba(208,59,59,.06); color: #e08585; }
   .note-box.warn { border-style: solid; border-color: rgba(250,178,25,.3); background: rgba(250,178,25,.05); color: #f0c46b; }
   .list { display: flex; flex-direction: column; gap: 6px; }
+  .qbox { display: flex; flex-direction: column; gap: 6px; padding: 9px; border: 1px solid var(--hairline); border-left: 2px solid var(--decide); border-radius: 5px; background: rgba(224,130,58,.03); }
   .mini { border: 0; background: transparent; color: var(--ink-4); cursor: pointer; font-size: 13px; padding: 0 4px; }
   .mini:hover { color: var(--ink); }
   .add { align-self: flex-start; border: 1px dashed var(--line); border-radius: 5px; background: transparent; padding: 6px 10px; font-size: 11px; color: var(--ink-3); cursor: pointer; }
@@ -371,6 +373,7 @@ const CARD_W = 210, CARD_H = 142;
 const KIND = {
   source: { label: "DATA IN",         color: "var(--source)", head: "rgba(255,255,255,.02)" },
   infer:  { label: "ONE PER RECORD",  color: "var(--infer)",  head: "rgba(57,135,229,.07)" },
+  decide: { label: "TYPED QUESTIONS", color: "var(--decide)", head: "rgba(224,130,58,.08)" },
   reduce: { label: "COMBINE MANY",    color: "var(--reduce)", head: "rgba(144,133,233,.08)" },
   loop:   { label: "REPEAT UNTIL DONE", color: "var(--loop)", head: "rgba(250,178,25,.07)" },
   filter: { label: "KEEP ONLY…",      color: "var(--plain)",  head: "rgba(255,255,255,.02)" },
@@ -379,7 +382,7 @@ const KIND = {
 };
 const PALETTE = [
   ["DATA IN", [["source", "Files by folder", { from: "folder" }], ["source", "A table", { from: "table" }], ["source", "Records in the document", { from: "records" }]]],
-  ["ASK A MODEL", [["infer", "One per record"], ["reduce", "Combine many into one"], ["loop", "Repeat until done"]]],
+  ["ASK A MODEL", [["infer", "One per record"], ["decide", "Typed questions"], ["reduce", "Combine many into one"], ["loop", "Repeat until done"]]],
   ["RESHAPE", [["filter", "Keep only…"], ["derive", "Add a field"], ["write", "Write files"]]],
 ];
 
@@ -531,6 +534,7 @@ function cardNote(s) {
       return `${(sp.records || []).length} records in the document`;
     }
     case "infer": return trim(s.infer?.system || s.infer?.prompt || "", 64);
+    case "decide": return trim("asks " + (s.decide?.questions || []).map((q) => q.id).join(", "), 64);
     case "reduce": return s.merge?.length ? `folds ${s.merge.join(", ")}` : `${s.reduce?.fan_in || 8} at a time, in a tree`;
     case "loop": return `until ${condText(s.loop?.until)}`;
     case "filter": return `keeps ${condText(s.keep)}`;
@@ -555,6 +559,12 @@ function cardTags(s) {
       tags.push(s.infer?.model || s.infer?.tier || "balanced");
       if (s.infer?.answer?.length) tags.push(`${s.infer.answer.length} fields`);
       if (s.infer?.escalate?.length) tags.push("escalates");
+      break;
+    case "decide":
+      tags.push(s.decide?.model || "jev-latest");
+      tags.push(`${(s.decide?.questions || []).length} questions`);
+      if (s.decide?.gate) tags.push(`gate ${s.decide.gate}`);
+      if (s.decide?.escalate?.length) tags.push("escalates");
       break;
     case "reduce":
       tags.push(s.reduce?.model || s.reduce?.tier || "balanced");
@@ -642,7 +652,7 @@ function renderCanvas() {
     },
       el("div", { class: "head", style: `background:${k.head}` },
         el("span", { class: "dot", style: `background:${k.color}` }),
-        el("span", { class: "kind", style: s.kind === "infer" ? "color:#9dc4f4" : (s.kind === "reduce" ? "color:#b6afef" : ""), text: s.merge?.length ? "SECOND PASS · COMBINE" : k.label }),
+        el("span", { class: "kind", style: s.kind === "infer" ? "color:#9dc4f4" : (s.kind === "reduce" ? "color:#b6afef" : (s.kind === "decide" ? "color:#f0b07e" : "")), text: s.merge?.length ? "SECOND PASS · COMBINE" : k.label }),
         p && p.expected_usd > 0 ? el("span", { class: "price", text: money(p.expected_usd) }) : null,
       ),
       el("div", { class: "pad" },
@@ -848,6 +858,7 @@ function stepPane(s) {
   switch (s.kind) {
     case "source": sourcePane(pane, s); break;
     case "infer": inferPane(pane, s, s.infer, "infer"); break;
+    case "decide": decidePane(pane, s); break;
     case "reduce": reducePane(pane, s); break;
     case "loop": loopPane(pane, s); break;
     case "filter": filterPane(pane, s); break;
@@ -1018,6 +1029,81 @@ function inferPane(pane, s, spec, prefix) {
   pane.append(field("AT ONCE", numIn(prefix + ".workers", () => spec.workers, (v) => { spec.workers = v; }, { min: "0" })));
 }
 
+const QTYPES = [["noul", "yes / no"], ["choice", "pick one"], ["score", "rate"]];
+
+function decidePane(pane, s) {
+  const d = s.decide;
+  pane.append(el("div", { class: "note-box", text:
+    "A decision model answers typed questions instead of writing text: every answer is one of the options you declare, with a probability and a confidence. It bills input only, so asking five questions costs about what asking one does." }));
+  pane.append(field("DECISION MODEL",
+    textIn("decide.model", () => d.model, (v) => { d.model = v; }, { placeholder: "jev-latest" }),
+    el("span", { class: "help", text: "TypeSafe's Jev by default. Any LLM also works — it answers the same questions through a rendered prompt." })));
+  pane.append(field("WHEN UNSURE, ASK",
+    textIn("decide.escalate", () => (d.escalate || []).join(", "),
+      (v) => { d.escalate = v.split(",").map((x) => x.trim()).filter(Boolean); }, { placeholder: "an LLM, e.g. claude-sonnet-5" })));
+
+  const gate = d.gate || 0;
+  const slider = el("input", { class: "slider", type: "range", min: "0", max: "0.95", step: "0.05", value: String(gate) });
+  const shown = el("b", { text: gate ? gate.toFixed(2) : "off" });
+  slider.addEventListener("input", () => {
+    d.gate = Number(slider.value); shown.textContent = d.gate ? d.gate.toFixed(2) : "off"; save();
+  });
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "CONFIDENCE GATE" }), el("div", { class: "row" }, slider, shown),
+    el("span", { class: "help", text: "A record whose least certain answer falls below this climbs to the model above. Calibrated confidences only: an LLM's own is recorded, never gated." })));
+
+  const stateBox = areaIn("decide.state", () => d.state, (v) => { d.state = v; }, { style: "min-height:80px", placeholder: "empty: the whole record" });
+  const chips = el("div", { class: "chips" });
+  for (const f of S.fields[s.from] || []) {
+    chips.append(el("button", { class: "chip", text: f, onclick: () => insert(stateBox, `{{.${f}}}`, (v) => { d.state = v; }) }));
+  }
+  pane.append(el("div", { class: "field" }, el("label", { text: "WHAT IS JUDGED" }), stateBox, chips));
+
+  const list = el("div", { class: "list" });
+  (d.questions || []).forEach((q, i) => {
+    const k = `decide.q${i}`;
+    const box = el("div", { class: "qbox" },
+      el("div", { class: "row" },
+        textIn(k + ".id", () => q.id, (v) => { q.id = v; }, { class: "in", style: "width:15ch;flex:none" }),
+        selIn(k + ".type", QTYPES, () => q.type, (v) => {
+          q.type = v;
+          if (v === "choice" && !(q.options || []).length) q.options = [{ name: "a" }, { name: "b" }];
+          if (v === "score" && !(q.levels || []).length) q.levels = ["low", "medium", "high"];
+          save({ now: true }); renderInspector();
+        }),
+        el("button", { class: "mini", text: "×", onclick: () => { d.questions.splice(i, 1); save({ now: true }); renderInspector(); } })),
+      textIn(k + ".ask", () => q.ask, (v) => { q.ask = v; }, { class: "in grow", placeholder: "the question" }));
+    if (q.type === "choice") {
+      (q.options || []).forEach((o, j) => {
+        box.append(el("div", { class: "row" },
+          textIn(`${k}.o${j}.name`, () => o.name, (v) => { o.name = v; }, { class: "in", style: "width:12ch;flex:none" }),
+          textIn(`${k}.o${j}.note`, () => o.note, (v) => { o.note = v; }, { class: "in grow", placeholder: "what it means" }),
+          el("button", { class: "mini", text: "×", onclick: () => { q.options.splice(j, 1); save({ now: true }); renderInspector(); } })));
+      });
+      box.append(el("button", { class: "add", text: "+ option", onclick: () => {
+        q.options = q.options || []; q.options.push({ name: "option" + (q.options.length + 1) }); save({ now: true }); renderInspector();
+      } }));
+    } else if (q.type === "score") {
+      box.append(textIn(k + ".levels", () => (q.levels || []).join(", "),
+        (v) => { q.levels = v.split(",").map((x) => x.trim()).filter(Boolean); },
+        { class: "in grow", placeholder: "lowest, …, highest (2 to 10)" }));
+    }
+    list.append(box);
+  });
+  pane.append(el("div", { class: "field" },
+    el("label", { text: "QUESTIONS" }), list,
+    el("button", { class: "add", text: "+ question", onclick: () => {
+      d.questions = d.questions || [];
+      d.questions.push({ id: "q" + (d.questions.length + 1), type: "noul", ask: "" });
+      save({ now: true }); renderInspector();
+    } }),
+    el("span", { class: "help", text: "Each answer lands in a field named for its question: the option chosen, the probability of yes, or the score. The full decision — every distribution and confidence — lands in \"decision\"." })));
+
+  pane.append(field("WHAT TO DO", areaIn("decide.system", () => d.system, (v) => { d.system = v; },
+    { style: "min-height:50px", placeholder: "instructions for the model above, when a record escalates" })));
+  pane.append(field("AT ONCE", numIn("decide.workers", () => d.workers, (v) => { d.workers = v; }, { min: "0" })));
+}
+
 function reducePane(pane, s) {
   const r = s.reduce;
   if (s.merge?.length) {
@@ -1169,6 +1255,12 @@ function blankStep(kind, label, extra, x, y) {
     case "source": s.source = { from: (extra && extra.from) || "folder", root: ".", records: [] }; break;
     case "infer": s.infer = { tier: "cheapest", prompt: "Read this and answer:\n\n{{.text}}", max_tokens: 400,
       answer: [{ name: "answer", kind: "text", note: "what you found", required: true }] }; break;
+    case "decide": s.decide = { model: "jev-latest", gate: 0.6, state: `{{.${(S.fields[s.from] || [])[0] || "text"}}}`,
+      questions: [
+        { id: "topic", type: "choice", ask: "What is this about?",
+          options: [{ name: "problem", note: "something is wrong" }, { name: "question", note: "they want to know something" }, { name: "request", note: "they want something new" }] },
+        { id: "urgent", type: "noul", ask: "Does this need attention today?" },
+      ] }; break;
     case "reduce": s.reduce = { tier: "balanced", cover: ["What happened", "What deserves attention"],
       words: 400, fan_in: 8, max_tokens: 900 }; break;
     case "loop": s.loop = { step: { tier: "balanced", prompt: "Improve this:\n\n{{.draft}}\n{{if .Inbox}}{{range .Inbox}}- {{.}}\n{{end}}{{end}}",

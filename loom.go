@@ -970,6 +970,26 @@ func stageDetail(s *pipeline.Stage) string {
 			line("  %s (%s)", sub.ID, sub.Kind)
 		}
 	case pipeline.KindInfer:
+		if qs := s.Infer.Questions; len(qs) > 0 {
+			line("per-record decision · %s", bindingDetail(s.Infer.Binding))
+			for _, id := range qs.IDs() {
+				q := qs[id]
+				switch q.Type {
+				case model.QuestionChoice:
+					line("  %s (choice of %s): %s", id, strings.Join(q.OptionNames(), " | "), q.Instructions)
+				case model.QuestionScore:
+					line("  %s (score %s): %s", id, strings.Join(q.Levels, " < "), q.Instructions)
+				default:
+					line("  %s (noul): %s", id, q.Instructions)
+				}
+			}
+			if s.Infer.MinConfidence > 0 {
+				line("confidence gate: calibrated answers below %.2f escalate", s.Infer.MinConfidence)
+			}
+			line("output: one field per question, full decision into %q", s.Infer.OutputField)
+			line("state template:\n%s", s.Infer.Prompt)
+			break
+		}
 		line("per-record inference · %s", bindingDetail(s.Infer.Binding))
 		if s.Infer.ParseJSON {
 			line("output: JSON parsed and merged into the record")

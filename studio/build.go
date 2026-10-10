@@ -181,6 +181,17 @@ func buildStep(up pipeline.Dataset, s *Step, dry bool) (pipeline.Dataset, error)
 		}
 		return up.Infer(s.ID, spec, opts...), nil
 
+	case KindDecide:
+		spec, err := s.Decide.compile(s.ID)
+		if err != nil {
+			return pipeline.Dataset{}, err
+		}
+		var opts []pipeline.Option
+		if s.Decide.Workers > 0 {
+			opts = append(opts, pipeline.WithParallelism(s.Decide.Workers))
+		}
+		return up.Decide(s.ID, spec, opts...), nil
+
 	case KindReduce:
 		r := s.Reduce
 		spec := pipeline.ReduceAISpec{
@@ -923,6 +934,11 @@ func (d *Doc) Fields(id string) []string {
 			if len(cur.Infer.Answer) == 0 {
 				add(field(cur.Infer.Output, "output"))
 			}
+		case KindDecide:
+			for _, q := range cur.Decide.Questions {
+				add(q.ID)
+			}
+			add(field(cur.Decide.Output, pipeline.DefaultDecisionField))
 		case KindLoop:
 			for _, a := range cur.Loop.Step.Answer {
 				add(a.Name)

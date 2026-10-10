@@ -35,8 +35,10 @@
 //
 // # What a step is
 //
-// Seven kinds, matching the palette in the UI. [KindSource] reads records off
-// the local disk; [KindInfer] calls a model once per record; [KindReduce]
+// Eight kinds, matching the palette in the UI. [KindSource] reads records off
+// the local disk; [KindInfer] calls a model once per record; [KindDecide] asks
+// typed questions about each record, answered by a decision model with an LLM
+// above it for the ones it is unsure of; [KindReduce]
 // folds many records into one through a tree of calls; [KindLoop] repeats a
 // model call over a record until it is good enough; [KindFilter] keeps the
 // records matching a condition; [KindDerive] adds a field computed from the
@@ -68,6 +70,10 @@ const (
 	KindSource Kind = "source"
 	// KindInfer is one model call per record (pipeline.Infer).
 	KindInfer Kind = "infer"
+	// KindDecide asks typed questions about each record — yes/no, pick one,
+	// rate on a rubric — answered by a decision model such as TypeSafe's Jev,
+	// escalating to an LLM below a confidence gate (pipeline.Decide).
+	KindDecide Kind = "decide"
 	// KindReduce folds every record into one through a tree of model calls
 	// (pipeline.ReduceAI).
 	KindReduce Kind = "reduce"
@@ -87,7 +93,7 @@ const (
 
 // Kinds lists every step kind in palette order.
 func Kinds() []Kind {
-	return []Kind{KindSource, KindInfer, KindReduce, KindLoop, KindFilter, KindDerive, KindWrite}
+	return []Kind{KindSource, KindInfer, KindDecide, KindReduce, KindLoop, KindFilter, KindDerive, KindWrite}
 }
 
 // Doc is a pipeline as the studio holds it: a name, the guardrails that bound
@@ -158,6 +164,7 @@ type Step struct {
 
 	Source *SourceSpec `json:"source,omitempty"`
 	Infer  *InferSpec  `json:"infer,omitempty"`
+	Decide *DecideSpec `json:"decide,omitempty"`
 	Reduce *ReduceSpec `json:"reduce,omitempty"`
 	Loop   *LoopSpec   `json:"loop,omitempty"`
 	Keep   *Cond       `json:"keep,omitempty"`
@@ -506,6 +513,11 @@ func (s *Step) validate() error {
 			return fmt.Errorf("studio: step %q: no model call declared", s.ID)
 		}
 		return s.Infer.validate(s.ID)
+	case KindDecide:
+		if s.Decide == nil {
+			return fmt.Errorf("studio: step %q: no questions declared", s.ID)
+		}
+		return s.Decide.validate(s.ID)
 	case KindReduce:
 		if s.Reduce == nil {
 			return fmt.Errorf("studio: step %q: no fold declared", s.ID)
@@ -896,6 +908,9 @@ func (s *Step) merge(n *Step) {
 	}
 	if n.Infer != nil {
 		s.Infer = n.Infer
+	}
+	if n.Decide != nil {
+		s.Decide = n.Decide
 	}
 	if n.Reduce != nil {
 		s.Reduce = n.Reduce

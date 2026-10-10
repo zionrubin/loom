@@ -80,6 +80,10 @@ go run ./examples/treasury
 # one pipeline, three deployment policies: the refused round makes zero calls
 go run ./examples/clearance
 
+# a support inbox on a decision model: Jev answers typed questions, an LLM reviews
+# only what Jev is unsure of — then open the decision board
+go run ./examples/reflex -serve :8079
+
 # the run as a monitoring system sees it: a scrape, and a trace off the wire
 go run ./examples/beacon
 
@@ -95,9 +99,9 @@ ANTHROPIC_API_KEY=sk-... go run ./examples/anthropic-review
 OPENAI_API_KEY=sk-...    go run ./examples/openai-review
 ```
 
-Twenty-five examples ship — fleets, streaming, serving, MCP, local inference,
-worker processes, iteration, routing, governance, telemetry, the studio — and
-all but five run offline against a deterministic mock provider.
+Twenty-six examples ship — fleets, streaming, serving, MCP, local inference,
+worker processes, iteration, routing, governance, telemetry, decision models,
+the studio — and all but five run offline against a deterministic mock provider.
 [docs/EXAMPLES.md](docs/EXAMPLES.md) is the catalog.
 
 ## What you get
@@ -106,6 +110,18 @@ all but five run offline against a deterministic mock provider.
   AI-native `Infer` (templated per-record inference, JSON parsing, validation)
   and `ReduceAI` (parallel tree aggregation). Branching builds DAGs; the planner
   fuses adjacent pure stages.
+- **Decisions — typed questions, and an LLM only when unsure** — most of what a
+  pipeline asks a model is not "write something" but *which queue*, *how angry*,
+  *is this an attack*. `Dataset.Decide` declares those questions and their types
+  — yes/no, pick one, rate on a rubric — and a **System One** decision model
+  (TypeSafe's Jev, `providers/typesafe`) answers each with a value of that type,
+  a probability distribution and a calibrated confidence, in milliseconds, for
+  input tokens only. Records whose weakest answer falls below `MinConfidence`
+  climb the ordinary escalation ladder to an LLM, which answers the *same
+  questions under the same schema* — an option nobody declared is a semantic
+  failure, not a field value. It compiles to an `Infer`, so caching, envelopes,
+  budgets, routing and `Explain` apply unchanged; the studio has a *Typed
+  questions* step. [docs/DECISIONS.md](docs/DECISIONS.md)
 - **Least-privilege task envelopes** — every task carries an explicit,
   serializable declaration of its model binding, capability grants, secret
   references, egress allowlist, context bundle, budget, and sandbox profile. The
